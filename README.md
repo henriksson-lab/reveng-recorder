@@ -1,3 +1,6 @@
+* **under development, not ready for use**
+* Before you reverse engineer anything, read up on the law. Especially [clean-room design](https://en.wikipedia.org/wiki/Clean-room_design). Law also differs EU vs US
+
 # reveng-recorder
 
 > **Handover note for an LLM/agent picking up this project.** Read this file first, then
