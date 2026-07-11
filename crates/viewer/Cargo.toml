@@ -1,0 +1,17 @@
+[package]
+name = "reveng-viewer"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "reveng-viewer: egui timeline / USB inspector / seek (DESIGN.md §9). GUI TBD."
+
+[[bin]]
+name = "reveng-viewer"
+path = "src/main.rs"
+
+[dependencies]
+reveng-core.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+# TODO: add eframe/egui + image once the GUI is implemented (kept out of the scaffold
+# to keep the build fast; see DESIGN.md §9).

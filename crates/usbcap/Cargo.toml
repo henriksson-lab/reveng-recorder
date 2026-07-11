@@ -1,0 +1,12 @@
+[package]
+name = "reveng-usbcap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "USB CaptureSource: drives USBPcap, parses frames, owns the frames.idx layout."
+
+[dependencies]
+reveng-core.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true

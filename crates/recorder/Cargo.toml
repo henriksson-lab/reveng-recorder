@@ -1,0 +1,22 @@
+[package]
+name = "reveng-recorder"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "reveng-rec: record sessions and query them (the LLM/CLI surface)."
+
+[[bin]]
+name = "reveng-rec"
+path = "src/main.rs"
+
+[dependencies]
+reveng-core.workspace = true
+reveng-usbcap.workspace = true
+reveng-pcicap.workspace = true
+reveng-winput.workspace = true
+reveng-winshot.workspace = true
+reveng-export.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+clap.workspace = true

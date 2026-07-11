@@ -1,0 +1,11 @@
+[package]
+name = "reveng-winput"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Global low-level mouse/keyboard hooks (Windows). InputEvent schema is portable."
+
+[dependencies]
+reveng-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true

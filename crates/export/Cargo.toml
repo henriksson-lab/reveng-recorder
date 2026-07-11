@@ -1,0 +1,11 @@
+[package]
+name = "reveng-export"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "pcapng slicing around checkpoints and Wireshark handoff (DESIGN.md §10)."
+
+[dependencies]
+reveng-core.workspace = true
+reveng-usbcap.workspace = true
+anyhow.workspace = true

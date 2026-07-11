@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/usbcap",
+    "crates/pcicap",
+    "crates/winput",
+    "crates/winshot",
+    "crates/export",
+    "crates/recorder",
+    "crates/viewer",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+reveng-core = { path = "crates/core" }
+reveng-usbcap = { path = "crates/usbcap" }
+reveng-pcicap = { path = "crates/pcicap" }
+reveng-winput = { path = "crates/winput" }
+reveng-winshot = { path = "crates/winshot" }
+reveng-export = { path = "crates/export" }

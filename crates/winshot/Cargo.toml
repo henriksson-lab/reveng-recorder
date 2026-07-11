@@ -1,0 +1,9 @@
+[package]
+name = "reveng-winshot"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Event-triggered screen capture (Windows: GDI default, DXGI optional)."
+
+[dependencies]
+anyhow.workspace = true

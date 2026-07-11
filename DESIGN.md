@@ -105,14 +105,20 @@ Channels: `crossbeam-channel`. Shutdown via a `CancellationToken`-style atomic +
 ```
 reveng-recorder/
   crates/
-    core/        # shared types, clock anchor, session schema, ndjson + sqlite IO
-    usbcap/      # spawn USBPcapCMD, parse USBPcap frames, pcapng writer w/ checkpoint comments
+    core/        # shared types, clock anchor, session schema, ndjson + sqlite IO, CaptureSource trait
+    usbcap/      # USB CaptureSource: spawn USBPcapCMD, parse frames, pcapng writer w/ comments
+    pcicap/      # PCIe CaptureSource: talks to reveng-hv, emits Mmio/Dma/Irq/Config events (§4a)
     winput/      # LL mouse/keyboard hooks, InputEvent
     winshot/     # screen capture (GDI default, DXGI Desktop Duplication optional) + PNG encode
     recorder/    # bin: orchestration, checkpoint engine, control/hotkey
     viewer/      # bin: egui app — timeline, inspector, seek, export
     export/      # pcapng slicing + Wireshark handoff (shared by viewer)
+  driver/
+    reveng-hv/   # kernel-mode: thin VT-x/EPT hypervisor + PCI/IRQ driver (PCIe capture only)
 ```
+
+All acquisition backends implement one `CaptureSource` trait (emit timestamped events onto the
+shared timeline); USB and PCIe differ only in acquisition, not in anything downstream.
 
 Key deps: `windows` (windows-rs) for hooks/capture/clock, `crossbeam-channel`, `rusqlite`,
 `serde`/`serde_json`, `image` (PNG), `eframe`/`egui` for the viewer, `clap` for the CLI.
@@ -146,6 +152,96 @@ Key deps: `windows` (windows-rs) for hooks/capture/clock, `crossbeam-channel`, `
   ```
 
   `byte_offset` = offset of the frame's block in `usb.pcapng`, enabling O(1) seek + partial reads.
+
+---
+
+## 4a. PCIe capture (software-only backend)
+
+USB and PCIe are both **capture sources** feeding the same timeline/checkpoint/decode machinery —
+only the acquisition differs. But **there is no USBPcap for PCIe**: a PCIe device talks to the host
+over several independent channels and the CPU isn't in the path for most of them. Target scope
+(chosen): **MMIO/BAR registers, DMA, and config/interrupts — software-only, no raw TLPs** (TLPs are
+hardware-analyzer-only and out of scope).
+
+### Acquisition: a thin hypervisor + cooperating kernel driver
+
+```
+    crates/pcicap/          # CaptureSource for PCIe; talks to the kernel component
+    driver/reveng-hv/       # kernel-mode: thin VT-x hypervisor (EPT) + PCI/IRQ driver
+```
+
+The kernel component puts the running Windows into VMX-root ("hyperjacks" the live OS, the standard
+research pattern — cf. SimpleVisor/hvpp/Bareflank) and uses **EPT** to trap access to the target
+device's memory. Events are pushed to user-mode `pcicap` over a lock-free ring buffer and land in
+the session exactly like USB frames.
+
+- **MMIO / BAR registers** — the primary, highest-fidelity software source. Mark the device's BAR
+  pages *not-present* in EPT; every CPU register access to those pages causes an EPT violation
+  (VM-exit). The handler logs `{bar, offset, width, value, dir}`, then executes the access **exactly
+  once** and resumes.
+  - **Read-side-effect registers** (read-to-clear, FIFO pops) make "trap → emulate → re-arm" the
+    only safe pattern — the real access must happen once and only once. This is the delicate core.
+  - **Perf is the constraint:** a VM-exit per register touch can be thousands/sec and can slow or
+    even time-out a busy device. Mitigations (config): trap only chosen register ranges
+    (`--mmio-ranges`), and/or enable tracing only **around checkpoints** rather than continuously.
+- **DMA** — the device writing/reading system RAM does **not** go through the CPU or EPT, so it is
+  invisible by default. Software-only DMA is therefore **descriptor-following, best-effort — not a
+  guaranteed complete wire capture:**
+  1. From the captured MMIO we learn descriptor-ring base addresses and doorbell writes.
+  2. On a doorbell/ring-update (an MMIO event we already trap), we read the descriptor ring from RAM
+     and snapshot the referenced buffers; interrupts mark completions.
+  3. Optional advanced mode: full DMA trapping via the **IOMMU (VT-d)** — mark the device's DMA
+     pages to fault. Complete but high-cost and can perturb timing; off by default (`--dma-mode`).
+- **Config space + interrupts** — config reads/writes go through I/O ports `0xCF8/0xCFC` or MMCONFIG,
+  both trappable (I/O bitmap / EPT); the driver also reads config space directly at attach. MSI/MSI-X
+  interrupts are captured by hooking the device ISR / trapping vector delivery, logged as events with
+  the same timestamps.
+
+### Lighter tier (no hypervisor)
+
+For an MMIO-only first cut, hook the HAL register accessors (`READ/WRITE_REGISTER_*`, `MmMapIoSpace`)
+via a kernel driver or **Windows DTrace** (`fbt` provider). Captures the driver's *intended* register
+access (not DMA), far less risk than a hypervisor. Good for bring-up; upgrade to EPT for completeness.
+
+### Storage, timeline, and what's reused
+
+- **Kernel timestamps** at trap time via `KeQueryPerformanceCounter` — the *same* QPC used everywhere
+  else, so PCIe events are on the unified timeline with **tighter** correlation than USB (no
+  wall-clock skew; stamped at the instant of access).
+- **No pcapng / no Wireshark** — there is no PCIe-MMIO link type or dissector. PCIe events go to a
+  binary log `pcie.bin` + a fixed-width `pcie.idx` (identical seek design to §8.2), decoded to text
+  on demand. Everything downstream is unchanged: checkpoints, screenshots, the seek index, the
+  decode harness (register maps are *more* natural to decode than raw USB — offset+width+value), and
+  the `(action, screenshot, bytes)` oracle all apply as-is.
+
+```rust
+enum PcieEvent {
+    Mmio  { ts_ns: i64, bar: u8, offset: u32, width: u8, value: u64, dir: Dir },
+    Dma   { ts_ns: i64, dir: Dir, dev_addr: u64, len: u32, data_ref: BlobRef },
+    Irq   { ts_ns: i64, vector: u16 },
+    Config{ ts_ns: i64, offset: u16, width: u8, value: u32, dir: Dir },
+}
+```
+
+### PCIe-specific CLI (composes with §11)
+
+```
+reveng-rec pci-devices --format json            # enumerate PCI(e) devices: BDF, VID:PID, BARs, class
+reveng-rec record --pci-vidpid 1234:abcd \      # or --pci-bdf 0000:03:00.0
+    --mmio-ranges bar0:0x40-0x80 \              # trap only these register windows (perf)
+    --trace-dma --dma-mode descriptor \         # descriptor (default) | iommu | off
+    --mmio-trace-mode around-checkpoints        # always | around-checkpoints
+```
+
+### Honest caveats
+
+- **VBS / HVCI / Hyper-V:** if Virtualization-Based Security or Hyper-V is active, Windows is already
+  the root partition and a custom hypervisor conflicts — VBS/HVCI must be off (or the design must
+  become a Hyper-V extension, out of scope). Detected at startup with a clear error.
+- **Signing + stability:** the kernel driver needs test-signing or a signed cert; a bug is a BSOD.
+  This is deep systems work, isolated in `driver/reveng-hv/` behind the `CaptureSource` seam.
+- **DMA is best-effort** in software-only mode (descriptor-following), not a complete bus capture;
+  IOMMU mode is the fuller-but-costly option. Raw TLPs remain hardware-only and out of scope.
 
 ---
 
@@ -201,7 +297,7 @@ screenshot(id PK, ts_ns, path, monitor_idx, width, height, trigger_checkpoint)
 
 ## 7. Checkpoints — the seek anchors
 
-A checkpoint is a marker on the unified timeline that also stores **where in the USB stream** it
+A checkpoint is a marker on the unified timeline that also stores **where in the traffic stream** it
 lands, so the viewer can jump straight there.
 
 ```rust
@@ -212,13 +308,21 @@ struct Checkpoint {
     ts_ns: i64,
     kind: CheckpointType,
     cause: String,               // "LButtonDown", "VK_RETURN", "interval", ...
-    usb_frame_index: Option<u64>,// nearest USB frame with ts <= ts_ns
-    usb_byte_offset: Option<u64>,
+    // Nearest preceding traffic event, kept SOURCE-AGNOSTIC so PCIe (or any future
+    // CaptureSource) populates the identical fields against its own index — adding a
+    // source is an addition, not a schema migration. See §4a / build-order note in §13.
+    anchor: Option<TrafficAnchor>,
     screenshot_id: Option<u64>,
     fg_process: Option<String>,  // context snapshot
     fg_window: Option<String>,
     cursor: (i32, i32),
     note: Option<String>,        // user-editable in the viewer
+}
+
+struct TrafficAnchor {
+    source: SourceId,   // Usb | Pcie | ...  (which CaptureSource / index this refers to)
+    event_index: u64,   // frame index (USB) or event index (PCIe) with ts <= checkpoint.ts_ns
+    byte_offset: u64,   // offset into that source's log (usb.pcapng / pcie.bin)
 }
 ```
 
@@ -610,18 +714,35 @@ reveng-rec record --device-vidpid 1234:abcd \
 - **This is, functionally, a keylogger + screen recorder.** It's legitimate RE/defensive tooling,
   but it must only be run on a machine the operator owns/is authorized to instrument. Sessions stay
   local; no network egress. Worth a consent banner + a visible "RECORDING" indicator.
-- **Non-goals (for now):** non-Windows platforms, hardware USB analyzers (the capture-source is a
-  clean seam to add later — see §4), live/real-time decode, automated protocol reverse-engineering.
+- **Non-goals (for now):** non-Windows platforms; **raw PCIe TLP / hardware analyzers** (the
+  `CaptureSource` seam could host one later, but software capture is TLP-free — see §4a); live
+  real-time decode; automated protocol reverse-engineering. PCIe DMA is best-effort in software.
 
 ---
 
 ## 13. Suggested build order
 
-1. **`core` + clock anchor + session schema** — the timeline foundation everything shares.
+1. **`core` + clock anchor + session schema + `CaptureSource` trait** — the timeline foundation.
 2. **`usbcap`** — spawn USBPcapCMD, parse frames, pcapng writer + index. Verify against Wireshark.
 3. **`winput`** — hooks + InputEvent; prove the latency budget holds.
 4. **Checkpoint engine + `winshot`** — clicks → checkpoint + screenshot; interval logic.
 5. **`recorder` bin** — wire the threads, stop hotkey, finalize + comment injection.
 6. **`viewer`** — timeline → screenshot + USB inspector → seek.
 7. **`export`** — slice + Wireshark handoff.
+
+**PCIe track (separate, later — much higher risk; USB path proves out the whole pipeline first).**
+Acquisition is a swappable leaf behind `CaptureSource`, so **postponing or cutting any one PCIe tier
+changes nothing above the seam** — provided the shared layers stay source-agnostic (see the
+`TrafficAnchor` in §7; keep the index/decode byte-oriented). If the DTrace tier (step 8) is
+postponed, add a trivial **replay `CaptureSource`** that emits a hand-authored `PcieEvent` JSONL, so
+storage/index/decode/viewer for PCIe can be built and validated with **zero kernel code** before the
+hypervisor exists.
+
+8. **`pcicap` MMIO-only via Windows DTrace / HAL hooks** *(optional / may be skipped)* — the lighter
+   tier (§4a): capture the driver's register accesses with no hypervisor. Cheap way to validate the
+   PCIe event schema + storage end-to-end; a replay source (above) substitutes if skipped.
+9. **`driver/reveng-hv`** — thin VT-x/EPT hypervisor for real MMIO trapping (read-side-effect-safe),
+   config/interrupt capture, `--mmio-ranges` scoping. VBS/HVCI-off precondition enforced at startup.
+10. **DMA descriptor-following** (then optional IOMMU mode) — reconstruct DMA from ring/doorbell
+    activity captured in steps 8–9.
 ```

@@ -1,0 +1,11 @@
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# session output produced during testing
+/sessions
+session_*/
+*.pcapng
+*.idx
+*.ndjson
+!crates/**

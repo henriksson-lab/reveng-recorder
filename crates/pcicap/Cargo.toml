@@ -1,0 +1,12 @@
+[package]
+name = "reveng-pcicap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "PCIe CaptureSource: replay source (portable) + hypervisor-backed source (Windows)."
+
+[dependencies]
+reveng-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
