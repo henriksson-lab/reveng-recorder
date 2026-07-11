@@ -167,3 +167,9 @@ reveng-recorder/
   driver/
     reveng-hv/         # kernel hypervisor driver (built/signed separately) — not started
 ```
+
+
+## License
+
+Code generated using agentic AI. Consider it MIT licensed, but be sure to review code for copyright infringement in case you wish
+to integrate it in another project.
