@@ -24,7 +24,7 @@ pub struct UsbFrameHeader {
     pub bus: u16,
     pub device: u16,
     pub endpoint: u8,
-    pub transfer: u8, // 0=control 1=iso 2=bulk 3=interrupt (USBPcap encoding)
+    pub transfer: u8, // 0=iso 1=interrupt 2=control 3=bulk (USBPcap encoding)
     pub status: u32,
     pub data_length: u32,
 }

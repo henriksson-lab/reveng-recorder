@@ -35,7 +35,7 @@ fn main() {
         hdr[17..19].copy_from_slice(&1u16.to_le_bytes()); // bus
         hdr[19..21].copy_from_slice(&5u16.to_le_bytes()); // device
         hdr[21] = 0x02; // endpoint (bulk OUT)
-        hdr[22] = 2; // transfer = bulk
+        hdr[22] = 3; // transfer = bulk (USBPcap: 0=iso 1=interrupt 2=control 3=bulk)
         hdr[23..27].copy_from_slice(&(payload.len() as u32).to_le_bytes());
         let mut packet = hdr;
         packet.extend_from_slice(&payload);

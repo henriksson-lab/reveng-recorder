@@ -49,7 +49,7 @@ mod tests {
         b[17..19].copy_from_slice(&1u16.to_le_bytes()); // bus
         b[19..21].copy_from_slice(&5u16.to_le_bytes()); // device
         b[21] = 0x81; // endpoint (IN)
-        b[22] = 2; // transfer = bulk
+        b[22] = 2; // transfer = control
         b[23..27].copy_from_slice(&64u32.to_le_bytes()); // dataLength
 
         let h = parse_packet_header(&b).unwrap();

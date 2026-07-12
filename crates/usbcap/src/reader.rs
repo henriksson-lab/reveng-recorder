@@ -25,7 +25,7 @@ pub struct UsbFrame {
     /// Endpoint address, e.g. `0x81`.
     pub ep: String,
     pub dir: &'static str, // "in" | "out"
-    pub xfer: &'static str, // "control" | "iso" | "bulk" | "interrupt"
+    pub xfer: &'static str, // "iso" | "interrupt" | "control" | "bulk"
     pub len: u32,
     pub status: u32,
     pub hex: String,
@@ -38,12 +38,13 @@ pub struct UsbFrame {
     pub endpoint: u8,
 }
 
+/// USBPcap transfer-type encoding (USBPcap.h: `USBPCAP_TRANSFER_*`).
 fn xfer_name(t: u8) -> &'static str {
     match t {
-        0 => "control",
-        1 => "iso",
-        2 => "bulk",
-        3 => "interrupt",
+        0 => "iso",
+        1 => "interrupt",
+        2 => "control",
+        3 => "bulk",
         _ => "unknown",
     }
 }
@@ -200,7 +201,7 @@ mod tests {
         let payload = [0xde, 0xad, 0xbe, 0xef];
         {
             let mut w = UsbWriter::create(&pcapng, &idx).unwrap();
-            let (i, _off) = w.append_packet(2_000_000, &packet(0x81, 2, &payload)).unwrap();
+            let (i, _off) = w.append_packet(2_000_000, &packet(0x81, 3, &payload)).unwrap();
             assert_eq!(i, 0);
             w.flush().unwrap();
         }
