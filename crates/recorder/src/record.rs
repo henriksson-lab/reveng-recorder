@@ -19,15 +19,49 @@ pub struct RecordSummary {
     pub checkpoints: u64,
 }
 
-/// Record a session from a replayed PCIe event stream.
-pub fn run_pcie_replay(
+/// Record a session from a replayed PCIe event stream (portable).
+pub fn run_pcie_replay(out: &Path, replay: &Path, cfg: &CheckpointConfig) -> Result<RecordSummary> {
+    let source = ReplayPcieSource::from_path(replay)?;
+    let extra = serde_json::json!({
+        "acquisition": "replay",
+        "replay_file": replay.display().to_string(),
+        "clock": "session-ns (replay timestamps)",
+    });
+    record_pcie(out, source, cfg, extra)
+}
+
+/// Record a live session from the `reveng-pcidrv` driver-only backend (DESIGN.md §4a lighter
+/// tier). Windows-only; opening `\\.\RevengPciCap` needs admin.
+#[cfg(windows)]
+pub fn run_pcie_live(
     out: &Path,
-    replay: &Path,
+    target: reveng_pcicap::drv::Bdf,
     cfg: &CheckpointConfig,
+) -> Result<RecordSummary> {
+    let clock = reveng_core::clock::Clock::start();
+    let source = reveng_pcicap::drv::DrvPcieSource::new(target, clock);
+    let extra = serde_json::json!({
+        "acquisition": "pcidrv",
+        "clock": "QPC-backed monotonic (session)",
+        "target": format!(
+            "{:04x}:{:02x}:{:02x}.{}",
+            target.segment, target.bus, target.device, target.function
+        ),
+    });
+    record_pcie(out, source, cfg, extra)
+}
+
+/// Shared PCIe record loop: drain a [`CaptureSource`] into `pcie.bin`/`pcie.idx`, emitting
+/// session-start/stop plus traffic-interval checkpoints (§7). `extra_meta` fields are merged
+/// into `meta.json` (acquisition/clock/source-specific).
+fn record_pcie(
+    out: &Path,
+    mut source: impl CaptureSource,
+    cfg: &CheckpointConfig,
+    extra_meta: serde_json::Value,
 ) -> Result<RecordSummary> {
     let mut session = SessionWriter::create(out)?;
     let mut log = PcieLog::create(session.pcie_bin(), session.pcie_idx())?;
-    let mut source = ReplayPcieSource::from_path(replay)?;
     source.start()?;
 
     let mut next_id = 0u64;
@@ -122,17 +156,19 @@ pub fn run_pcie_replay(
 
     source.stop()?;
 
-    let meta = serde_json::json!({
+    let mut meta = serde_json::json!({
         "tool": "reveng-rec",
         "version": env!("CARGO_PKG_VERSION"),
         "source": "pcie",
-        "acquisition": "replay",
-        "replay_file": replay.display().to_string(),
-        "clock": "session-ns (replay timestamps)",
         "events": events,
         "checkpoints": checkpoints,
         "checkpoint_config": cfg,
     });
+    if let (Some(obj), Some(extra)) = (meta.as_object_mut(), extra_meta.as_object()) {
+        for (k, v) in extra {
+            obj.insert(k.clone(), v.clone());
+        }
+    }
     session.write_meta(&meta)?;
 
     Ok(RecordSummary {

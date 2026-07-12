@@ -6,6 +6,8 @@
 //!   before the hypervisor exists (see the build-order note in DESIGN.md §13).
 //! - [`HvPcieSource`] — the real VT-x/EPT hypervisor-backed source (Windows only, stub).
 
+#[cfg(windows)]
+pub mod drv;
 pub mod log;
 pub mod pci;
 

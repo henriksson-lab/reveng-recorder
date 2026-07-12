@@ -376,20 +376,44 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
 
     match args.source {
         Source::Pcie => {
-            let replay = args.replay.as_ref().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "live PCIe capture needs the hypervisor driver (Windows); use --replay <events.jsonl> here"
+            if let Some(replay) = args.replay.as_ref() {
+                let out = args.out.clone().unwrap_or_else(|| default_out(replay));
+                let summary = record::run_pcie_replay(&out, replay, &cfg)?;
+                eprintln!(
+                    "recorded {} PCIe events, {} checkpoints -> {}",
+                    summary.events,
+                    summary.checkpoints,
+                    out.display()
+                );
+                return Ok(());
+            }
+            // Live capture via the reveng-pcidrv driver-only backend (§4a lighter tier).
+            #[cfg(windows)]
+            {
+                let target = resolve_pci_target(&args)?;
+                // Opening \\.\RevengPciCap needs admin — self-elevate like the USB path.
+                if !elevate::is_elevated() && std::env::var_os("REVENG_NO_ELEVATE").is_none() {
+                    eprintln!("PCIe capture needs administrator rights — requesting elevation…");
+                    let forward: Vec<String> = std::env::args().skip(1).collect();
+                    let code = elevate::relaunch_elevated(&forward)?;
+                    std::process::exit(code as i32);
+                }
+                let out = args.out.clone().unwrap_or_else(default_session_dir);
+                let summary = record::run_pcie_live(&out, target, &cfg)?;
+                eprintln!(
+                    "recorded {} PCIe events, {} checkpoints -> {}",
+                    summary.events,
+                    summary.checkpoints,
+                    out.display()
+                );
+                Ok(())
+            }
+            #[cfg(not(windows))]
+            {
+                anyhow::bail!(
+                    "live PCIe capture requires Windows + the reveng-pcidrv driver; use --replay <events.jsonl> here"
                 )
-            })?;
-            let out = args.out.clone().unwrap_or_else(|| default_out(replay));
-            let summary = record::run_pcie_replay(&out, replay, &cfg)?;
-            eprintln!(
-                "recorded {} events, {} checkpoints -> {}",
-                summary.events,
-                summary.checkpoints,
-                out.display()
-            );
-            Ok(())
+            }
         }
         Source::Usb => {
             // Passive USB capture opens \\.\USBPcapN, which needs admin. If we're not elevated,
@@ -491,6 +515,41 @@ fn build_usb_opts(
         min_interval_ms: args.screenshot_min_interval_ms,
         stop_vk: 0x13, // VK_PAUSE (Ctrl+Alt+Pause)
         max_duration: args.max_seconds.map(std::time::Duration::from_secs),
+    })
+}
+
+/// Resolve the live PCIe capture target (BDF) from `--pci-bdf` or `--pci-vidpid`.
+#[cfg(windows)]
+fn resolve_pci_target(args: &RecordArgs) -> anyhow::Result<reveng_pcicap::drv::Bdf> {
+    if let Some(bdf) = &args.pci_bdf {
+        return parse_bdf(bdf);
+    }
+    if let Some(vidpid) = &args.pci_vidpid {
+        let (wv, wp) = vidpid
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("--pci-vidpid must be VID:PID (hex)"))?;
+        for d in reveng_pcicap::list_pci_devices()? {
+            if d.vid.eq_ignore_ascii_case(wv) && d.pid.eq_ignore_ascii_case(wp) {
+                return parse_bdf(&d.bdf);
+            }
+        }
+        anyhow::bail!("no PCI device matching {vidpid}");
+    }
+    anyhow::bail!("live PCIe capture needs --pci-bdf <seg:bus:dev.func> or --pci-vidpid <vid:pid>")
+}
+
+/// Parse `SSSS:BB:DD.F` — segment/bus/device hex, function decimal (e.g. `0000:03:00.0`).
+#[cfg(windows)]
+fn parse_bdf(s: &str) -> anyhow::Result<reveng_pcicap::drv::Bdf> {
+    let err = || anyhow::anyhow!("bad BDF '{s}', expected SSSS:BB:DD.F (e.g. 0000:03:00.0)");
+    let (seg, rest) = s.split_once(':').ok_or_else(err)?;
+    let (bus, rest) = rest.split_once(':').ok_or_else(err)?;
+    let (dev, func) = rest.split_once('.').ok_or_else(err)?;
+    Ok(reveng_pcicap::drv::Bdf {
+        segment: u16::from_str_radix(seg.trim_start_matches("0x"), 16).map_err(|_| err())?,
+        bus: u8::from_str_radix(bus, 16).map_err(|_| err())?,
+        device: u8::from_str_radix(dev, 16).map_err(|_| err())?,
+        function: func.parse().map_err(|_| err())?,
     })
 }
 
