@@ -85,6 +85,16 @@ impl<W: Write> PcapngWriter<W> {
     pub fn into_inner(self) -> W {
         self.w
     }
+
+    /// Current byte length written (== the offset the next block will start at).
+    pub fn offset(&self) -> u64 {
+        self.offset
+    }
+
+    /// Flush the underlying writer.
+    pub fn flush(&mut self) -> std::io::Result<()> {
+        self.w.flush()
+    }
 }
 
 /// A parsed block descriptor.
@@ -177,9 +187,96 @@ pub fn slice(data: &[u8], start_frame: u64, end_frame: u64) -> anyhow::Result<Ve
     Ok(out)
 }
 
+/// Rewrite a pcapng, injecting an `opt_comment` into the Enhanced Packet Blocks named in
+/// `comments` (keyed by frame index). Checkpoint comments show up natively in Wireshark
+/// (DESIGN.md §4). Returns the new bytes and the new byte-offset of every frame (in order)
+/// so `frames.idx` can be updated — injecting a comment changes downstream offsets.
+pub fn inject_comments(data: &[u8], comments: &[(u64, String)]) -> anyhow::Result<(Vec<u8>, Vec<u64>)> {
+    use std::collections::HashMap;
+    let map: HashMap<u64, &str> = comments.iter().map(|(i, s)| (*i, s.as_str())).collect();
+
+    let blocks = scan_blocks(data)?;
+    let mut out = Vec::with_capacity(data.len() + 64 * comments.len());
+    let mut new_offsets = Vec::new();
+    let mut frame_index = 0u64;
+
+    for b in blocks {
+        if b.block_type != BT_EPB {
+            out.extend_from_slice(&data[b.offset..b.offset + b.len]);
+            continue;
+        }
+        let o = b.offset;
+        let caplen = u32::from_le_bytes(data[o + 20..o + 24].try_into().unwrap()) as usize;
+        let ts_high = u32::from_le_bytes(data[o + 12..o + 16].try_into().unwrap());
+        let ts_low = u32::from_le_bytes(data[o + 16..o + 20].try_into().unwrap());
+        let orig_len = u32::from_le_bytes(data[o + 24..o + 28].try_into().unwrap());
+        let pkt = &data[o + 28..o + 28 + caplen];
+
+        new_offsets.push(out.len() as u64);
+
+        match map.get(&frame_index) {
+            None => out.extend_from_slice(&data[o..o + b.len]), // unchanged
+            Some(comment) => {
+                let cbytes = comment.as_bytes();
+                let cpad = pad4(cbytes.len());
+                let data_pad = pad4(caplen);
+                // options: opt_comment (4 + clen + cpad) + opt_endofopt (4)
+                let opts_len = 4 + cbytes.len() + cpad + 4;
+                let total = 32 + caplen + data_pad + opts_len;
+
+                out.extend_from_slice(&BT_EPB.to_le_bytes());
+                out.extend_from_slice(&(total as u32).to_le_bytes());
+                out.extend_from_slice(&0u32.to_le_bytes()); // interface id
+                out.extend_from_slice(&ts_high.to_le_bytes());
+                out.extend_from_slice(&ts_low.to_le_bytes());
+                out.extend_from_slice(&(caplen as u32).to_le_bytes());
+                out.extend_from_slice(&orig_len.to_le_bytes());
+                out.extend_from_slice(pkt);
+                out.extend(std::iter::repeat(0u8).take(data_pad));
+                // opt_comment (code 1)
+                out.extend_from_slice(&1u16.to_le_bytes());
+                out.extend_from_slice(&(cbytes.len() as u16).to_le_bytes());
+                out.extend_from_slice(cbytes);
+                out.extend(std::iter::repeat(0u8).take(cpad));
+                // opt_endofopt (code 0, len 0)
+                out.extend_from_slice(&0u16.to_le_bytes());
+                out.extend_from_slice(&0u16.to_le_bytes());
+                out.extend_from_slice(&(total as u32).to_le_bytes());
+            }
+        }
+        frame_index += 1;
+    }
+    Ok((out, new_offsets))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inject_comment_preserves_packets_and_reports_offsets() {
+        let mut buf = Vec::new();
+        {
+            let mut w = PcapngWriter::new(&mut buf).unwrap();
+            for i in 0..3u8 {
+                w.write_packet((i as i64 + 1) * 1_000_000, &[i, i, i]).unwrap();
+            }
+        }
+        let (out, offsets) = inject_comments(&buf, &[(1, "CHECKPOINT #7 — click".into())]).unwrap();
+        // Same packets, same timestamps, intact order.
+        let pkts = packets(&out).unwrap();
+        assert_eq!(pkts.len(), 3);
+        assert_eq!(pkts[0].data, &[0, 0, 0]);
+        assert_eq!(pkts[1].data, &[1, 1, 1]);
+        assert_eq!(pkts[2].data, &[2, 2, 2]);
+        assert_eq!(pkts[1].ts_ns, 2_000_000);
+        // Reported offsets match the parser's block offsets (frames.idx contract).
+        assert_eq!(pkts[0].offset as u64, offsets[0]);
+        assert_eq!(pkts[1].offset as u64, offsets[1]);
+        assert_eq!(pkts[2].offset as u64, offsets[2]);
+        // The comment bytes are present.
+        assert!(out.windows(5).any(|w| w == b"click"));
+    }
 
     #[test]
     fn write_then_read_roundtrips() {

@@ -7,8 +7,10 @@
 //! - [`HvPcieSource`] — the real VT-x/EPT hypervisor-backed source (Windows only, stub).
 
 pub mod log;
+pub mod pci;
 
 pub use log::{PcieIdxRecord, PcieLog};
+pub use pci::{list_pci_devices, PciDevice};
 
 use reveng_core::event::{PcieEvent, SourceKind, TrafficKind, TrafficRecord};
 use reveng_core::source::CaptureSource;

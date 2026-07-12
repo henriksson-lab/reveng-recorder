@@ -20,3 +20,14 @@ anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 clap.workspace = true
+base64 = "0.22.1"
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

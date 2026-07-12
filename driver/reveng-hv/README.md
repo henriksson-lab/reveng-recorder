@@ -25,4 +25,15 @@ separately (WDK / test-signing), and a bug here is a BSOD.
 
 ## Status
 
-Not started. Prior art to study: SimpleVisor, hvpp, Bareflank, gbhv.
+Kernel driver **not started** — this is the last, highest-risk tier (see `DESIGN.md` §13).
+Prior art to study: SimpleVisor, hvpp, Bareflank, gbhv.
+
+The **user-mode half** of the PCIe surface already exists and needs no kernel code:
+- `reveng-rec pci-devices` — real SetupAPI enumeration (`crates/pcicap/src/pci.rs`): BDF,
+  VID:PID, class code, description — the device-selection input to a future `--pci-vidpid`.
+- `crates/pcicap::ReplayPcieSource` — feeds hand-authored `PcieEvent` JSONL through the exact
+  storage/index/checkpoint/decode/viewer path a real `HvPcieSource` will use, so everything
+  downstream of the `CaptureSource` seam is already built and validated.
+
+When the driver lands, it implements `HvPcieSource` (currently a stub) against the ring-buffer
+ABI described above; nothing above the seam should need to change.

@@ -10,3 +10,6 @@ reveng-core.workspace = true
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Devices_DeviceAndDriverInstallation"] }

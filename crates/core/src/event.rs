@@ -96,5 +96,9 @@ pub struct TrafficRecord {
 pub struct TrafficAnchor {
     pub source: SourceKind,
     pub event_index: u64,
+    /// Advisory offset into the raw log at record time. For USB, finalize may rewrite the
+    /// pcapng (checkpoint-comment injection) and shift offsets; the authoritative offset is
+    /// always re-derived from the index via `event_index`, so consumers should prefer that
+    /// and treat this field as a hint only.
     pub byte_offset: u64,
 }

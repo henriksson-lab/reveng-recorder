@@ -3,8 +3,10 @@
 //! This is the surface an LLM/agent drives (DESIGN.md §8a.1, §11). Handlers are stubs
 //! in this scaffold; the flag set is complete so `--help` documents the intended tool.
 
+mod elevate;
 mod query;
 mod record;
+mod record_usb;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use reveng_core::checkpoint::CheckpointConfig;
@@ -226,6 +228,11 @@ struct RecordArgs {
     #[arg(long, default_value_t = 0)]
     rotate_mb: u64,
 
+    /// Stop automatically after this many seconds (for automation; default: run until the
+    /// stop hotkey Ctrl+Alt+Pause).
+    #[arg(long)]
+    max_seconds: Option<u64>,
+
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -247,8 +254,8 @@ fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::Record(args) => run_record(args),
-        Cmd::Devices { .. } => not_impl("devices (requires Windows + USBPcap)"),
-        Cmd::PciDevices { .. } => not_impl("pci-devices (requires Windows)"),
+        Cmd::Devices { format } => run_devices(format),
+        Cmd::PciDevices { format } => run_pci_devices(format),
         Cmd::Ls { session } => query::ls(&session, false),
         Cmd::Show { session, checkpoint } => query::show(&session, checkpoint),
         Cmd::Frames {
@@ -259,10 +266,16 @@ fn run() -> anyhow::Result<()> {
             ep,
             format: _,
         } => query::frames(&session, around, window, range.as_deref(), parse_bar(ep.as_deref())),
-        Cmd::Stream { session, ep, .. } => {
-            query::frames(&session, None, 0, None, parse_bar(Some(&ep)))
-        }
-        Cmd::Payload { session, frame, .. } => query::payload(&session, frame),
+        Cmd::Stream {
+            session,
+            ep,
+            logical,
+        } => query::stream(&session, parse_bar(Some(&ep)), logical),
+        Cmd::Payload {
+            session,
+            frame,
+            format,
+        } => query::payload(&session, frame, payload_fmt(format)),
         Cmd::Diff { session, a, b } => query::diff(&session, a, b),
         Cmd::Decode {
             session,
@@ -273,8 +286,68 @@ fn run() -> anyhow::Result<()> {
         // note: Decode.with is a command string (see below)
         Cmd::Grep { session, pattern } => query::grep(&session, &pattern),
         Cmd::Reindex { session } => query::reindex(&session),
-        Cmd::Export { .. } => not_impl("export (pcapng slice / Wireshark)"),
+        Cmd::Export {
+            session,
+            checkpoint,
+            range,
+            out,
+            wireshark,
+        } => run_export(&session, checkpoint, range.as_deref(), out, wireshark),
     }
+}
+
+/// Export a pcapng slice around a checkpoint / range, or open Wireshark at that frame
+/// (DESIGN.md §10). USB-only — PCIe has no pcapng.
+fn run_export(
+    session: &std::path::Path,
+    checkpoint: Option<u64>,
+    range: Option<&str>,
+    out: Option<PathBuf>,
+    wireshark: bool,
+) -> anyhow::Result<()> {
+    use reveng_core::session::SessionReader;
+
+    /// Frames of context to include on each side of a single-checkpoint export.
+    const CONTEXT: u64 = 25;
+
+    let s = SessionReader::open(session)?;
+    let pcapng = s.usb_pcapng();
+    if !pcapng.exists() {
+        anyhow::bail!("export requires a USB session (usb.pcapng); PCIe sessions have no pcapng");
+    }
+
+    // Resolve the target frame range (and the primary frame, for the Wireshark jump).
+    let (start, end, primary) = if let Some(ckpt) = checkpoint {
+        let c = s.checkpoint(ckpt)?;
+        let anchor = c
+            .anchor
+            .map(|a| a.event_index)
+            .ok_or_else(|| anyhow::anyhow!("checkpoint {ckpt} has no traffic anchor"))?;
+        (anchor.saturating_sub(CONTEXT), anchor + CONTEXT, anchor)
+    } else if let Some(r) = range {
+        let (a, b) = r
+            .split_once(':')
+            .ok_or_else(|| anyhow::anyhow!("range must be A:B, e.g. 100:160"))?;
+        let a: u64 = a.trim().parse()?;
+        let b: u64 = b.trim().parse()?;
+        (a.min(b), a.max(b), a.min(b))
+    } else if wireshark {
+        (0, 0, 0) // open the whole capture at packet 1
+    } else {
+        anyhow::bail!("export needs --checkpoint <n> or --range <a:b> (or --wireshark)");
+    };
+
+    if wireshark {
+        // Wireshark packet numbers are 1-based; our frame indices are 0-based.
+        reveng_export::open_in_wireshark(&pcapng, primary + 1)?;
+        eprintln!("opened Wireshark on {} at packet {}", pcapng.display(), primary + 1);
+        return Ok(());
+    }
+
+    let out = out.unwrap_or_else(|| session.join(format!("export_{start}_{end}.pcapng")));
+    reveng_export::slice_pcapng(&pcapng, start, end, &out)?;
+    eprintln!("exported frames {start}..={end} -> {}", out.display());
+    Ok(())
 }
 
 fn run_record(args: RecordArgs) -> anyhow::Result<()> {
@@ -318,10 +391,165 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             );
             Ok(())
         }
-        Source::Usb => anyhow::bail!(
-            "USB capture requires Windows + USBPcap (not available on this machine)"
-        ),
+        Source::Usb => {
+            // Passive USB capture opens \\.\USBPcapN, which needs admin. If we're not elevated,
+            // relaunch ourselves through UAC (a consent/password prompt) rather than making the
+            // user open an elevated shell. `REVENG_NO_ELEVATE` opts out.
+            #[cfg(windows)]
+            {
+                if !elevate::is_elevated() && std::env::var_os("REVENG_NO_ELEVATE").is_none() {
+                    eprintln!("USB capture needs administrator rights — requesting elevation…");
+                    let forward: Vec<String> = std::env::args().skip(1).collect();
+                    let code = elevate::relaunch_elevated(&forward)?;
+                    std::process::exit(code as i32);
+                }
+            }
+
+            let out = args.out.clone().unwrap_or_else(default_session_dir);
+            let opts = build_usb_opts(&args, cfg)?;
+            let summary = record_usb::run_usb_capture(&out, opts)?;
+            eprintln!(
+                "recorded {} USB frames, {} checkpoints -> {}",
+                summary.events,
+                summary.checkpoints,
+                out.display()
+            );
+            Ok(())
+        }
     }
+}
+
+/// Assemble the live-USB recording options from CLI args, resolving VID:PID → address via
+/// device enumeration when only a VID:PID was given (DESIGN.md §11.1).
+fn build_usb_opts(
+    args: &RecordArgs,
+    cfg: CheckpointConfig,
+) -> anyhow::Result<record_usb::UsbRecordOpts> {
+    use reveng_usbcap::UsbSelection;
+
+    let mut address = args.device_address.clone();
+    let mut usbpcap_device = args.usbpcap_device.clone();
+
+    // Enumerate at most once, only if we actually need it (VID:PID resolution or
+    // control-device auto-pick), and reuse the result for both.
+    let need_resolve = address.is_empty() && !args.device_vidpid.is_empty();
+    let need_autopick = usbpcap_device.is_none();
+    if need_resolve || need_autopick {
+        if let Ok(devs) = reveng_usbcap::list_devices() {
+            if need_resolve {
+                for want in &args.device_vidpid {
+                    let (wv, wp) = want.split_once(':').unwrap_or((want.as_str(), ""));
+                    for d in &devs {
+                        if d.vid.eq_ignore_ascii_case(wv) && d.pid.eq_ignore_ascii_case(wp) {
+                            address.push(d.address);
+                            // Prefer the matched device's own control device — correct even
+                            // when several root hubs are present.
+                            if usbpcap_device.is_none() && !d.usbpcap.is_empty() {
+                                usbpcap_device = Some(d.usbpcap.clone());
+                            }
+                        }
+                    }
+                }
+            }
+            // Fall back to auto-picking when there's exactly one live root-hub filter.
+            if usbpcap_device.is_none() {
+                let hubs: std::collections::BTreeSet<_> = devs
+                    .iter()
+                    .map(|d| d.usbpcap.clone())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if hubs.len() == 1 {
+                    usbpcap_device = hubs.into_iter().next();
+                }
+            }
+        }
+    }
+
+    let selection = UsbSelection {
+        usbpcap_device,
+        vidpid: args.device_vidpid.clone(),
+        serial: args.device_serial.clone(),
+        address,
+        all_devices: args.all_devices,
+    };
+
+    Ok(record_usb::UsbRecordOpts {
+        selection,
+        cfg,
+        screenshot_on: match args.screenshot_on {
+            ScreenshotOn::Mousedown => record_usb::ScreenshotWhen::Mousedown,
+            ScreenshotOn::Mouseup => record_usb::ScreenshotWhen::Mouseup,
+            ScreenshotOn::Both => record_usb::ScreenshotWhen::Both,
+            ScreenshotOn::None => record_usb::ScreenshotWhen::None,
+        },
+        screenshot_on_keys: !args.no_screenshot_on_keys,
+        scope: match args.screenshot_scope {
+            ScreenshotScope::CursorMonitor => reveng_winshot::Scope::CursorMonitor,
+            ScreenshotScope::All => reveng_winshot::Scope::All,
+            ScreenshotScope::ForegroundWindow => reveng_winshot::Scope::ForegroundWindow,
+        },
+        min_interval_ms: args.screenshot_min_interval_ms,
+        stop_vk: 0x13, // VK_PAUSE (Ctrl+Alt+Pause)
+        max_duration: args.max_seconds.map(std::time::Duration::from_secs),
+    })
+}
+
+/// Default session directory: `./session_<unix_secs>`.
+fn default_session_dir() -> PathBuf {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    PathBuf::from(format!("session_{secs}"))
+}
+
+/// `devices` — enumerate the USB tree for picking a capture target (DESIGN.md §11.1).
+fn run_devices(format: OutFormat) -> anyhow::Result<()> {
+    let devs = reveng_usbcap::list_devices()?;
+    match format {
+        OutFormat::Json => {
+            for d in &devs {
+                println!("{}", serde_json::to_string(d)?);
+            }
+        }
+        _ => {
+            if devs.is_empty() {
+                eprintln!("(no USB devices reported by USBPcapCMD)");
+            }
+            for d in &devs {
+                println!(
+                    "{}  bus {} addr {}  {}:{}  {}",
+                    d.usbpcap, d.bus, d.address, d.vid, d.pid, d.product
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `pci-devices` — enumerate PCI(e) devices for picking a PCIe capture target (§4a/§11).
+fn run_pci_devices(format: OutFormat) -> anyhow::Result<()> {
+    let devs = reveng_pcicap::list_pci_devices()?;
+    match format {
+        OutFormat::Json => {
+            for d in &devs {
+                println!("{}", serde_json::to_string(d)?);
+            }
+        }
+        _ => {
+            for d in &devs {
+                println!(
+                    "{}  {}:{}  class {}  {}",
+                    d.bdf,
+                    if d.vid.is_empty() { "----" } else { &d.vid },
+                    if d.pid.is_empty() { "----" } else { &d.pid },
+                    if d.class.is_empty() { "------" } else { &d.class },
+                    d.description
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Default session dir for a replay: `<replay>.session`.
@@ -349,6 +577,12 @@ fn parse_bar(ep: Option<&str>) -> Option<u8> {
     Some(v)
 }
 
-fn not_impl(what: &str) -> anyhow::Result<()> {
-    anyhow::bail!("`{what}` not yet implemented on this platform (scaffold)")
+/// Map the CLI's output format onto the payload renderer.
+fn payload_fmt(f: OutFormat) -> query::PayloadFmt {
+    match f {
+        OutFormat::Hex => query::PayloadFmt::Hex,
+        OutFormat::Bin => query::PayloadFmt::Bin,
+        OutFormat::Base64 => query::PayloadFmt::Base64,
+        OutFormat::Json | OutFormat::Text => query::PayloadFmt::Json,
+    }
 }

@@ -13,5 +13,8 @@ path = "src/main.rs"
 reveng-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
-# TODO: add eframe/egui + image once the GUI is implemented (kept out of the scaffold
-# to keep the build fast; see DESIGN.md §9).
+reveng-usbcap.workspace = true
+reveng-pcicap.workspace = true
+serde_json.workspace = true
+image = { version = "0.25.10", default-features = false, features = ["png"] }
+eframe = "0.35.0"

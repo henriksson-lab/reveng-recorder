@@ -39,26 +39,45 @@ instant plus the USB frames around it, and can hand off to Wireshark at the exac
 
 ## Current state
 
-**A full platform-neutral slice works end-to-end; only OS-specific acquisition is stubbed.**
-`cargo build --workspace` and `cargo test --workspace` pass (13 tests). Windows-only code is
-`cfg`-gated so everything compiles and the non-Windows pieces run anywhere.
+**The entire USB path is implemented and verified end-to-end on Windows; the PCIe hypervisor
+is the only remaining tier.** `cargo build --workspace` and `cargo test --workspace` pass (20
+tests). Windows-only code is `cfg`-gated so everything still compiles on other OSes.
 
-- **Real, tested, and runnable on any OS:**
+- **Real, tested, cross-platform (any OS):**
   - `core` — clock, source-agnostic event schema (`TrafficRecord`/`PcieEvent`/`TrafficAnchor`),
     fixed-width `IndexFile` (O(1) get, binary-search-by-time), checkpoint + interval logic,
     session read/write.
   - **PCIe record→session→query pipeline** via the replay source: `reveng-rec record --source pcie
-    --replay <events.jsonl>` writes a real session (pcie.bin + pcie.idx + events.ndjson +
-    meta.json) with interval checkpoints anchored to traffic.
-  - **Query CLI:** `ls`, `show`, `frames`, `payload`, `diff`, `grep`, `stream`, `reindex`
-    (rebuilds the index byte-for-byte), and the **`decode` harness** (runs any stdin/stdout-JSONL
-    decoder — the LLM decode loop).
-  - **pcapng** writer/reader + **export slicing** (`reveng-export`) — the USB storage layer,
-    tested by roundtrip and slice.
-  - USBPcap header parsing; the USB `frames.idx` record.
-- **Stub — needs Windows (returns a clear error here):** live USB capture (`USBPcapCMD` spawn),
-  input hooks, screen capture, the hypervisor PCIe source, USB device enumeration, and the egui
-  viewer. The full CLI flag surface is wired, so `reveng-rec record --help` documents the tool.
+    --replay <events.jsonl>` writes a real session (pcie.bin + pcie.idx + events.ndjson + meta.json).
+  - **Query CLI over both USB and PCIe sessions:** `ls`, `show`, `frames`, `payload`
+    (hex/bin/base64), `diff`, `grep` (hex-pattern for USB), `stream --logical` (USB logical
+    reassembly), `reindex` (rebuilds `frames.idx`/`pcie.idx` from the raw truth), and the
+    **`decode` harness** (any stdin/stdout-JSONL decoder — the LLM decode loop).
+  - **pcapng** writer/reader, **checkpoint-comment injection**, and **export slicing**
+    (`reveng-export`) — the USB storage layer, tested by roundtrip/slice/inject.
+  - USBPcap header parsing + libpcap-stream parsing; the USB `frames.idx` record.
+- **Real, implemented for Windows (verified on this machine):**
+  - `winshot` — GDI `BitBlt` screen capture (cursor-monitor / all / foreground-window) → PNG.
+  - `winput` — `WH_MOUSE_LL`/`WH_KEYBOARD_LL` hooks on a dedicated message-loop thread, plus
+    foreground process/window context enrichment.
+  - `usbcap` live capture — spawns `USBPcapCMD.exe -o -`, parses its libpcap stream onto the
+    session timeline, writes `usb.pcapng` + `frames.idx`; best-effort device enumeration.
+  - `recorder` USB orchestration — the reader/hooks/screenshot-worker/checkpoint-engine threads,
+    the stop hotkey (Ctrl+Alt+Pause) and `--max-seconds`, and finalize with comment injection.
+  - `viewer` — the egui timeline / screenshot pane / traffic inspector with click + ←/→ seek.
+  - `export` Wireshark handoff (`wireshark.exe -r … -g <frame>`) and the `devices` command.
+
+  > The whole live USB pipeline (reader → checkpoints → screenshots → comment injection →
+  > query → viewer) is verified without real USBPcap hardware via a fake `USBPcapCMD` emitting
+  > the identical `DLT_USBPCAP` libpcap stream (see `crates/usbcap/examples/fake_usbpcapcmd.rs`).
+  > Set `USBPCAPCMD` to override the executable path/name.
+  - `pci-devices` — real user-mode PCI(e) enumeration via SetupAPI (BDF, VID:PID, class,
+    description); no driver needed, so it works today for picking a `--pci-vidpid`/`--pci-bdf`.
+- **Not implemented — the one remaining tier:** the PCIe **hypervisor** *capture* source
+  (`HvPcieSource` + `driver/reveng-hv`) — the actual EPT/MMIO/DMA trapping. This is the
+  highest-risk, explicitly-postponable kernel work (BSOD risk, driver signing, VBS/HVCI-off
+  precondition — DESIGN.md §4a/§13); the replay source stands in for it, and `pci-devices`
+  already provides the device-selection half of the PCIe surface.
 
 ## Building
 
@@ -112,10 +131,43 @@ Follow the build order in `DESIGN.md` §13. In short:
 Data model, schemas, config format, and the exact threading contract are all specified in
 `DESIGN.md` — treat it as the source of truth and update it if you change the design.
 
+### Installing USBPcap (the USB capture driver)
+
+USB capture needs the **USBPcap** kernel driver (`USBPcap.sys`). `reveng-rec` talks to that
+driver **directly over its IOCTL interface** (`crates/usbcap/src/ioctl.rs`) — it does *not* shell
+out to `USBPcapCMD.exe` — so all you need installed is the driver itself. Install it once, from the
+repo root, in any shell:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts/get-usbpcap.ps1           # interactive
+powershell -ExecutionPolicy Bypass -File scripts/get-usbpcap.ps1 -Silent   # no NSIS UI
+```
+
+The script downloads the official signed `USBPcapSetup-*.exe` from the `desowin/usbpcap` GitHub
+releases, verifies its size + Authenticode signature (Tomasz Moń), and runs it (the installer
+self-elevates via UAC). Useful flags: `-Silent`, `-DownloadOnly`, `-Version 1.5.4.0` (pin a
+release), `-NoEnv`. Then:
+
+1. **Reboot once after install.** USBPcap's filter driver only attaches to the USB root hubs at
+   boot, so the `\\.\USBPcap1..N` control devices — and therefore `reveng-rec devices` and capture
+   — do not exist until you reboot. Empty results before the first reboot are expected, not a bug.
+2. **Verify:** `reveng-rec devices --format json` lists USB devices with VID/PID, USB bus address,
+   and (when elevated) the `usbpcap` control-device path. Unelevated it still lists devices, but
+   `usbpcap`/`bus` are blank — reading the hub symlink needs admin.
+3. **No admin shell needed to capture.** `reveng-rec record` detects it isn't elevated and raises a
+   UAC prompt itself (`crates/recorder/src/elevate.rs`). Set `REVENG_NO_ELEVATE=1` to opt out (e.g.
+   automation that manages elevation). The legacy `USBPcapCMD.exe` subprocess path remains as a
+   fallback behind `REVENG_USBPCAP_CLI=1`.
+
+If the driver isn't installed (or you haven't rebooted), capture fails when opening `\\.\USBPcapN`.
+
 ### Things you'll need to know to run/test it
 
-- **Requires Administrator** — USBPcap is a kernel driver.
-- **USBPcap must be installed** (`USBPcapCMD.exe` on `PATH` or a configured location).
+- **USB capture needs Administrator** — USBPcap is a kernel driver — but `reveng-rec record`
+  self-elevates (UAC prompt), so you can launch it from an ordinary shell. See the install section
+  above.
+- **The USBPcap driver must be installed and the machine rebooted once** (see above). No
+  `USBPcapCMD.exe` on `PATH` is required — the tool drives the driver directly.
 - Discover targets with `reveng-rec devices --format json`, then pin the capture to the device of
   interest — `reveng-rec record --device-vidpid 1234:abcd` (preferred; stable across replug) — to
   keep volume down. Checkpoint behaviour is tunable via flags (`--checkpoint-on-any-key`,
@@ -157,15 +209,16 @@ reveng-recorder/
   Cargo.toml           # workspace
   crates/
     core/              # REAL: clock, event schema, CaptureSource, IndexFile, checkpoints, session
-    usbcap/            # USB source: real USBPcap parsing + frames.idx; capture spawn stubbed (win)
-    pcicap/            # PCIe source: real ReplayPcieSource; HvPcieSource stubbed
-    winput/            # input hooks (win) — schema real, hooks stubbed
-    winshot/           # screen capture (win) — stubbed
-    export/            # pcapng slicing + Wireshark handoff — stubbed
-    recorder/          # bin `reveng-rec`: full CLI surface, handlers stubbed
-    viewer/            # bin `reveng-viewer`: egui GUI — stubbed
+    usbcap/            # REAL: USBPcap/libpcap parsing, frames.idx, pcapng r/w + comment inject,
+                       #       live UsbCaptureSource (spawns USBPcapCMD), reader/writer, enumeration
+    pcicap/            # PCIe source: real ReplayPcieSource; HvPcieSource stubbed (hypervisor tier)
+    winput/            # REAL (win): WH_MOUSE_LL/WH_KEYBOARD_LL hooks + fg context enrichment
+    winshot/           # REAL (win): GDI BitBlt screen capture → PNG
+    export/            # REAL: pcapng slicing + Wireshark handoff
+    recorder/          # bin `reveng-rec`: full CLI + USB orchestration + query over USB/PCIe
+    viewer/            # bin `reveng-viewer`: REAL egui timeline / screenshot / inspector / seek
   driver/
-    reveng-hv/         # kernel hypervisor driver (built/signed separately) — not started
+    reveng-hv/         # kernel hypervisor driver (built/signed separately) — NOT started (last tier)
 ```
 
 
