@@ -96,6 +96,17 @@ enum Cmd {
         #[arg(long)]
         wireshark: bool,
     },
+    /// Install reveng-pcidrv as an upper filter on a PCI device and restart it (M2 interrupts).
+    PciAttach {
+        /// Target device, `SSSS:BB:DD.F` (e.g. 0000:0d:00.0).
+        #[arg(long)]
+        pci_bdf: String,
+    },
+    /// Remove reveng-pcidrv's upper filter from a PCI device and restart it.
+    PciDetach {
+        #[arg(long)]
+        pci_bdf: String,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -111,6 +122,14 @@ enum OutFormat {
 enum Source {
     Usb,
     Pcie,
+}
+
+/// Which live PCIe backend to drive (DESIGN.md §4a). `drv` = the reveng-pcidrv config-space
+/// driver (M1); `etw` = the NT Kernel Logger ISR consumer (M2 interrupts, no driver).
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum PciBackend {
+    Drv,
+    Etw,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -172,10 +191,21 @@ struct RecordArgs {
     endpoints: Option<String>,
 
     // ---- PCIe selection (§4a) ----
+    /// Live PCIe backend: `drv` (config-space driver, M1) or `etw` (interrupt/ISR capture, M2).
+    #[arg(long, value_enum, default_value_t = PciBackend::Drv)]
+    pci_backend: PciBackend,
+    /// ETW-only: restrict IRQ capture to these IDT vectors (comma-separated, hex `0x81` or
+    /// decimal). Empty = capture every ISR (histogram offline to find the device's vector).
+    #[arg(long)]
+    irq_vectors: Option<String>,
     #[arg(long)]
     pci_vidpid: Option<String>,
     #[arg(long)]
     pci_bdf: Option<String>,
+    /// M3: periodically snapshot the attached filter's MMIO BARs and emit register-change events
+    /// (needs `pci-attach` first; drv backend). Read-only register-state diff, not per-access.
+    #[arg(long)]
+    trace_mmio: bool,
     #[arg(long)]
     mmio_ranges: Option<String>,
     #[arg(long)]
@@ -293,6 +323,39 @@ fn run() -> anyhow::Result<()> {
             out,
             wireshark,
         } => run_export(&session, checkpoint, range.as_deref(), out, wireshark),
+        Cmd::PciAttach { pci_bdf } => run_pci_filter(&pci_bdf, true),
+        Cmd::PciDetach { pci_bdf } => run_pci_filter(&pci_bdf, false),
+    }
+}
+
+/// Install or remove the reveng-pcidrv upper filter on a PCI device (M2). Needs admin; the
+/// SetClassInstaller restart re-enumerates the device so PnP (un)loads our filter.
+fn run_pci_filter(bdf: &str, attach: bool) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        if !elevate::is_elevated() && std::env::var_os("REVENG_NO_ELEVATE").is_none() {
+            eprintln!("filter (un)install needs administrator rights — requesting elevation…");
+            let forward: Vec<String> = std::env::args().skip(1).collect();
+            let code = elevate::relaunch_elevated(&forward)?;
+            std::process::exit(code as i32);
+        }
+        let t = parse_bdf(bdf)?;
+        if attach {
+            reveng_pcicap::filter::attach(t.bus, t.device, t.function)?;
+            eprintln!(
+                "attached reveng-pcidrv as upper filter on {bdf} and restarted it — capture IRQs \
+                 with `record --source pcie` (ReadFile drains the ISR ring)"
+            );
+        } else {
+            reveng_pcicap::filter::detach(t.bus, t.device, t.function)?;
+            eprintln!("removed reveng-pcidrv filter from {bdf} and restarted it");
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (bdf, attach);
+        anyhow::bail!("PCI filter (un)install requires Windows")
     }
 }
 
@@ -387,11 +450,10 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                 );
                 return Ok(());
             }
-            // Live capture via the reveng-pcidrv driver-only backend (§4a lighter tier).
+            // Live capture (§4a lighter tier). Both backends open kernel facilities that need
+            // admin — self-elevate like the USB path.
             #[cfg(windows)]
             {
-                let target = resolve_pci_target(&args)?;
-                // Opening \\.\RevengPciCap needs admin — self-elevate like the USB path.
                 if !elevate::is_elevated() && std::env::var_os("REVENG_NO_ELEVATE").is_none() {
                     eprintln!("PCIe capture needs administrator rights — requesting elevation…");
                     let forward: Vec<String> = std::env::args().skip(1).collect();
@@ -399,7 +461,20 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                     std::process::exit(code as i32);
                 }
                 let out = args.out.clone().unwrap_or_else(default_session_dir);
-                let summary = record::run_pcie_live(&out, target, &cfg)?;
+                let summary = match args.pci_backend {
+                    PciBackend::Drv => {
+                        let target = resolve_pci_target(&args)?;
+                        let max = args.max_seconds.map(std::time::Duration::from_secs);
+                        record::run_pcie_live(
+                            &out, target, max, args.trace_mmio, args.trace_dma, &cfg,
+                        )?
+                    }
+                    PciBackend::Etw => {
+                        let vectors = parse_irq_vectors(args.irq_vectors.as_deref())?;
+                        let max = args.max_seconds.map(std::time::Duration::from_secs);
+                        record::run_pcie_etw(&out, vectors, max, &cfg)?
+                    }
+                };
                 eprintln!(
                     "recorded {} PCIe events, {} checkpoints -> {}",
                     summary.events,
@@ -551,6 +626,25 @@ fn parse_bdf(s: &str) -> anyhow::Result<reveng_pcicap::drv::Bdf> {
         device: u8::from_str_radix(dev, 16).map_err(|_| err())?,
         function: func.parse().map_err(|_| err())?,
     })
+}
+
+/// Parse `--irq-vectors` (comma-separated IDT vectors, hex `0x81` or decimal). None/empty → [].
+#[cfg(windows)]
+fn parse_irq_vectors(s: Option<&str>) -> anyhow::Result<Vec<u16>> {
+    let Some(s) = s else {
+        return Ok(Vec::new());
+    };
+    let mut out = Vec::new();
+    for tok in s.split(',').map(str::trim).filter(|t| !t.is_empty()) {
+        let v = if let Some(hex) = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")) {
+            u16::from_str_radix(hex, 16)
+        } else {
+            tok.parse::<u16>()
+        }
+        .map_err(|_| anyhow::anyhow!("bad --irq-vectors entry '{tok}' (use hex 0x81 or decimal)"))?;
+        out.push(v);
+    }
+    Ok(out)
 }
 
 /// Default session directory: `./session_<unix_secs>`.

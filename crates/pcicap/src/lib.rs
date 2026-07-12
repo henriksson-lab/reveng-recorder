@@ -8,6 +8,10 @@
 
 #[cfg(windows)]
 pub mod drv;
+#[cfg(windows)]
+pub mod etw;
+#[cfg(windows)]
+pub mod filter;
 pub mod log;
 pub mod pci;
 

@@ -20,12 +20,36 @@ returns a stream of fixed 32-byte `REVENG_PCI_EVENT` records → `core::event::P
   stores the BDF; the driver reads full PCI config space via `HalGetBusData`/MMCONFIG and emits
   `CONFIG` events. No device attach, no trapping — near-zero risk. Proves build→sign→load→stream
   →session→query on real hardware. Load with `sc create`/`sc start`.
-- **M2 — interrupts.** Attach as an upper filter in the device stack (or `IoConnectInterruptEx`
-  sharing) → `IRQ` events on each ISR.
-- **M3 — MMIO.** The fragile part with no hypervisor: hook the HAL register accessors
-  (`READ/WRITE_REGISTER_*`, `MmMapIoSpace`) or Windows DTrace `fbt`. Catches the driver's
-  *intended* register access; misses inlined accesses. Upgrade path is the `reveng-hv` EPT tier.
-- **M4 — DMA (best-effort).** Follow descriptor rings learned from M3 MMIO; snapshot buffers.
+- **M2 — interrupts.** *Attempted two ways; blocked for MSI.* (1) ETW NT-Kernel-Logger ISR
+  consumer (`crates/pcicap::etw`, `--pci-backend etw`): works but this machine collapses every ISR
+  to one funnel vector — no per-device attribution (DPC routines do differ, but that's per-driver).
+  (2) PnP upper-filter + `IoConnectInterruptEx` sharing (this driver's filter role): the filter
+  attaches cleanly and M1 config capture works through it, but connecting to the target's
+  interrupt returns **`STATUS_INVALID_PARAMETER`** — a filter cannot share a device's dedicated
+  **MSI/MSI-X** messages (the function driver owns them). Verified against the xHCI/DualSense at
+  `0000:00:14.0`: filter in-stack, connect FAILED, zero interrupts. Would only work for legacy
+  *line-based* shareable interrupts. **Real MSI interrupt capture needs the hypervisor tier below.**
+  Reusable infra shipped: `pci-attach`/`pci-detach` (SetupAPI UpperFilters + restart),
+  `DrvPcieSource::new_live` poll capture, a connect-diagnostic marker (`REVENG_DRV_DEBUG`).
+- **M3 — MMIO. DONE (read-only BAR snapshotting).** Rather than hook register accessors (patching
+  = PatchGuard/HVCI-hostile) the filter maps the device's memory BARs (from its START resources)
+  and `IOCTL_REVENG_PCI_MMIO_SNAP` reads them, emitting an `MMIO` event per *changed* dword
+  (baseline on first call, deltas after). `record --pci-backend drv --pci-bdf … --trace-mmio`
+  snapshots every 100 ms; window is runtime-tunable (default 16 KB/BAR, `REVENG_MMIO_BYTES`, cap
+  64 KB). Verified on the xHCI/DualSense at `0000:00:14.0`: baseline read genuine cap registers
+  (HCIVERSION 0x0120, RTSOFF 0x2000, DBOFF 0x3000) and under USB traffic captured **MFINDEX**
+  (microframe counter) and **ERDP** (event-ring dequeue pointer) changing. Captures register
+  *state changes*, not individual accesses (that needs EPT); xHCI keeps transfer payloads in DMA
+  rings (system memory), so MMIO shows control/status + ring pointers — DMA (M4) is the complement.
+- **M4 — DMA. DONE (best-effort, worked here).** Follow the xHCI **Event Ring** in system memory:
+  read the interrupter's ERSTBA/ERSTSZ (MMIO), then ERST entry → ring segment base, then emit a
+  `Dma` event per Event TRB that changed (`record … --trace-dma`). Reads physical memory with
+  **`MmCopyMemory(MM_COPY_MEMORY_PHYSICAL)`** (no cache-alias BSOD; errors instead of faulting) +
+  a `MmGetPhysicalMemoryRanges` guard. Defeated by IOMMU/VT-d if the DMA addresses are IOVAs —
+  diagnostic markers report that (stage 9/10 = "not in RAM"). Verified on the xHCI/DualSense at
+  `0000:00:14.0` **with VBS running**: ERSTBA/segment were identity-mapped (no IOMMU), and 256
+  genuine Transfer Event TRBs were captured — 245 Success + 9 Short-Packet completions with real
+  transfer lengths (64B/46B). This gets the actual USB transfer completions the MMIO tier can't.
 
 ## Toolchain setup (needed before building M1)
 
@@ -89,4 +113,12 @@ vcxproj settings that made it build on this toolchain:
   RevengPciCap`. `reveng-rec record --source pcie --pci-bdf 0000:00:00.0` produced 64 CONFIG
   events (full 256-byte config space); decoded offset 0 = `0x46218086` (Intel 8086:4621 host
   bridge), offset 8 = `0x06000002` (class 060000, host bridge) — genuine config space.
-- ⏳ Next: M2 (interrupts via `IoConnectInterruptEx`), then M3 (MMIO hooks), M4 (DMA follow).
+- ⚠️ **M2 (interrupts): blocked for MSI.** ETW ISR = one funnel vector (no attribution); PnP
+  filter `IoConnectInterruptEx` = `STATUS_INVALID_PARAMETER` (a filter can't share dedicated MSI
+  messages). Real MSI interrupt capture needs the hypervisor tier.
+- ✅ **M3 (MMIO): DONE.** Read-only BAR snapshot/diff via the filter; captured live MFINDEX + ERDP
+  on the xHCI at `0000:00:14.0`. Runtime-tunable window (`REVENG_MMIO_BYTES`).
+- ✅ **M4 (DMA): DONE.** Followed the xHCI Event Ring in system memory (`MmCopyMemory`); captured
+  256 real Transfer Event TRBs (Success + Short-Packet completions) under USB traffic, with VBS on.
+- ⏳ Only the `reveng-hv` hypervisor tier remains — for MSI interrupts (M2) and per-access (not
+  just state-diff) MMIO. Everything else in the driver-only tier is done.

@@ -36,17 +36,56 @@ pub fn run_pcie_replay(out: &Path, replay: &Path, cfg: &CheckpointConfig) -> Res
 pub fn run_pcie_live(
     out: &Path,
     target: reveng_pcicap::drv::Bdf,
+    max_duration: Option<std::time::Duration>,
+    trace_mmio: bool,
+    trace_dma: bool,
     cfg: &CheckpointConfig,
 ) -> Result<RecordSummary> {
     let clock = reveng_core::clock::Clock::start();
-    let source = reveng_pcicap::drv::DrvPcieSource::new(target, clock);
+    // A bounded run polls the ring for live interrupts / MMIO / DMA snapshots (M2/M3/M4 filter);
+    // an unbounded run drains the finite config-space snapshot and stops (M1).
+    let source = if max_duration.is_some() || trace_mmio || trace_dma {
+        reveng_pcicap::drv::DrvPcieSource::new_live(target, clock, max_duration, trace_mmio, trace_dma)
+    } else {
+        reveng_pcicap::drv::DrvPcieSource::new(target, clock)
+    };
     let extra = serde_json::json!({
         "acquisition": "pcidrv",
         "clock": "QPC-backed monotonic (session)",
+        "trace_mmio": trace_mmio,
+        "trace_dma": trace_dma,
         "target": format!(
             "{:04x}:{:02x}:{:02x}.{}",
             target.segment, target.bus, target.device, target.function
         ),
+    });
+    record_pcie(out, source, cfg, extra)
+}
+
+/// Record a live session of PCIe interrupts via the ETW NT-Kernel-Logger backend (DESIGN.md
+/// §4a M2). Windows-only; the kernel logger needs admin. `vectors` (empty = all) filters ISRs
+/// to a device's IDT vector(s); `max_duration` bounds the otherwise-unbounded stream.
+#[cfg(windows)]
+pub fn run_pcie_etw(
+    out: &Path,
+    vectors: Vec<u16>,
+    max_duration: Option<std::time::Duration>,
+    cfg: &CheckpointConfig,
+) -> Result<RecordSummary> {
+    let clock = reveng_core::clock::Clock::start();
+    let opts = reveng_pcicap::etw::EtwIrqOpts {
+        vectors: vectors.clone(),
+        max_duration,
+    };
+    let source = reveng_pcicap::etw::EtwIrqSource::new(clock, opts);
+    let extra = serde_json::json!({
+        "acquisition": "etw-isr",
+        "clock": "QPC-backed monotonic (session)",
+        "irq_vectors": if vectors.is_empty() {
+            serde_json::Value::String("all".into())
+        } else {
+            serde_json::json!(vectors)
+        },
     });
     record_pcie(out, source, cfg, extra)
 }

@@ -13,8 +13,9 @@
 use reveng_core::clock::Clock;
 use reveng_core::event::{Dir, PcieEvent, SourceKind, TrafficKind, TrafficRecord};
 use reveng_core::source::CaptureSource;
-use std::io::{self, BufReader, Read};
+use std::io::{self, Read};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
@@ -31,6 +32,13 @@ const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> 
 }
 const FILE_DEVICE_UNKNOWN: u32 = 0x0000_0022;
 const IOCTL_REVENG_PCI_SET_TARGET: u32 = ctl_code(FILE_DEVICE_UNKNOWN, 0x800, 0, 0);
+const IOCTL_REVENG_PCI_MMIO_SNAP: u32 = ctl_code(FILE_DEVICE_UNKNOWN, 0x801, 0, 0);
+const IOCTL_REVENG_PCI_DMA_SNAP: u32 = ctl_code(FILE_DEVICE_UNKNOWN, 0x802, 0, 0);
+
+/// How often live mode triggers an MMIO BAR snapshot (bounds out-of-band register reads).
+const MMIO_SNAP_INTERVAL: Duration = Duration::from_millis(100);
+/// Default bytes/BAR to snapshot; override with `REVENG_MMIO_BYTES`. Covers xHCI runtime+doorbells.
+const DEFAULT_MMIO_BYTES: u32 = 16384;
 
 const KIND_CONFIG: u8 = 0;
 const KIND_MMIO: u8 = 1;
@@ -113,20 +121,70 @@ impl Read for DeviceReader {
 // --- the source -------------------------------------------------------------------------
 
 /// PCIe capture source backed by the `reveng-pcidrv` KMDF driver (config/IRQ/MMIO/DMA events).
+///
+/// Two modes: **snapshot** ([`new`]) drains whatever is queued (e.g. the M1 config-space dump)
+/// and stops at the first empty read — used when the driver produces a finite burst. **live**
+/// ([`new_live`]) keeps polling an empty ring until an optional deadline — used for the M2
+/// interrupt filter, where events stream in over time and an empty read just means "not yet".
 pub struct DrvPcieSource {
     target: Bdf,
     clock: Clock,
-    reader: Option<BufReader<DeviceReader>>,
+    reader: Option<DeviceReader>,
+    handle: Option<Arc<OwnedHandle>>,
     killer: Option<Killer>,
+    poll: bool,
+    trace_mmio: bool,
+    trace_dma: bool,
+    mmio_bytes: u32,
+    max_duration: Option<Duration>,
+    deadline: Option<Instant>,
+    last_snap: Option<Instant>,
 }
 
 impl DrvPcieSource {
+    /// Snapshot mode: stop at the first empty read (M1 config-space dump).
     pub fn new(target: Bdf, clock: Clock) -> Self {
         Self {
             target,
             clock,
             reader: None,
+            handle: None,
             killer: None,
+            poll: false,
+            trace_mmio: false,
+            trace_dma: false,
+            mmio_bytes: DEFAULT_MMIO_BYTES,
+            max_duration: None,
+            deadline: None,
+            last_snap: None,
+        }
+    }
+
+    /// Live mode: keep polling the ring until `max_duration` elapses (M2 interrupt stream). With
+    /// `trace_mmio`, also periodically snapshot the attached filter's MMIO BARs (M3).
+    pub fn new_live(
+        target: Bdf,
+        clock: Clock,
+        max_duration: Option<Duration>,
+        trace_mmio: bool,
+        trace_dma: bool,
+    ) -> Self {
+        Self {
+            target,
+            clock,
+            reader: None,
+            handle: None,
+            killer: None,
+            poll: true,
+            trace_mmio,
+            trace_dma,
+            mmio_bytes: std::env::var("REVENG_MMIO_BYTES")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(DEFAULT_MMIO_BYTES),
+            max_duration,
+            deadline: None,
+            last_snap: None,
         }
     }
 
@@ -181,23 +239,44 @@ impl CaptureSource for DrvPcieSource {
         .map_err(|e| anyhow::anyhow!("SET_TARGET failed: {e}"))?;
 
         self.killer = Some(Killer(owned.clone()));
-        self.reader = Some(BufReader::with_capacity(
-            64 * EVENT_SIZE,
-            DeviceReader { handle: owned },
-        ));
+        self.reader = Some(DeviceReader {
+            handle: owned.clone(),
+        });
+        self.handle = Some(owned);
+        self.deadline = self.max_duration.map(|d| Instant::now() + d);
+        self.last_snap = None;
         Ok(())
     }
 
     fn next(&mut self) -> anyhow::Result<Option<TrafficRecord>> {
-        let reader = match self.reader.as_mut() {
-            Some(r) => r,
-            None => return Ok(None),
-        };
+        if self.reader.is_none() {
+            return Ok(None);
+        }
         loop {
+            // In live mode, periodically ask the driver to snapshot the BARs (M3) and/or follow
+            // the Event Ring (M4) so changed registers/TRBs land in the ring we're about to read.
+            if self.trace_mmio || self.trace_dma {
+                let due = self
+                    .last_snap
+                    .map(|t| t.elapsed() >= MMIO_SNAP_INTERVAL)
+                    .unwrap_or(true);
+                if due {
+                    if self.trace_mmio {
+                        ioctl_snap(&self.handle, IOCTL_REVENG_PCI_MMIO_SNAP, self.mmio_bytes);
+                    }
+                    if self.trace_dma {
+                        ioctl_snap(&self.handle, IOCTL_REVENG_PCI_DMA_SNAP, 0);
+                    }
+                    self.last_snap = Some(Instant::now());
+                }
+            }
             let mut buf = [0u8; EVENT_SIZE];
-            match read_full(reader, &mut buf)? {
-                false => return Ok(None), // clean EOF at a record boundary
-                true => {}
+            let got = {
+                let reader = self.reader.as_mut().unwrap();
+                read_event(reader, &mut buf, self.poll, self.deadline)?
+            };
+            if !got {
+                return Ok(None); // EOF (snapshot) or deadline reached (live)
             }
             // TODO(M3+): convert ts_qpc against the shared QPC origin for tight timing. For now
             // (config/IRQ bring-up) stamp at receipt on the session clock.
@@ -219,20 +298,54 @@ impl CaptureSource for DrvPcieSource {
             k.kill();
         }
         self.reader = None;
+        self.handle = None;
         Ok(())
     }
 }
 
-/// Read exactly `buf.len()` bytes, or return `Ok(false)` on a clean EOF at a record boundary.
-fn read_full(r: &mut impl Read, buf: &mut [u8]) -> anyhow::Result<bool> {
+/// Trigger one snapshot IOCTL (M3 MMIO or M4 DMA), which pushes change events into the driver's
+/// ring. `arg` is passed as the IOCTL input (e.g. MMIO snapshot length); 0 sends no input.
+fn ioctl_snap(handle: &Option<Arc<OwnedHandle>>, code: u32, arg: u32) {
+    if let Some(h) = handle {
+        let mut returned = 0u32;
+        let inbuf = arg.to_le_bytes();
+        let (in_ptr, in_len) = if arg != 0 {
+            (Some(inbuf.as_ptr() as *const _), inbuf.len() as u32)
+        } else {
+            (None, 0)
+        };
+        unsafe {
+            let _ = DeviceIoControl(h.0, code, in_ptr, in_len, None, 0, Some(&mut returned), None);
+        }
+    }
+}
+
+/// Read exactly one event. Returns `Ok(false)` to signal end-of-stream:
+/// - snapshot mode (`poll == false`): an empty read at a record boundary is a clean EOF.
+/// - live mode (`poll == true`): an empty read means "ring momentarily empty" — sleep briefly
+///   and retry until `deadline` (if any) passes, then end.
+fn read_event(
+    r: &mut impl Read,
+    buf: &mut [u8],
+    poll: bool,
+    deadline: Option<Instant>,
+) -> anyhow::Result<bool> {
     let mut filled = 0;
     while filled < buf.len() {
         match r.read(&mut buf[filled..]) {
             Ok(0) => {
-                if filled == 0 {
-                    return Ok(false);
+                if filled != 0 {
+                    anyhow::bail!("reveng-pcidrv stream ended mid-event");
                 }
-                anyhow::bail!("reveng-pcidrv stream ended mid-event");
+                if !poll {
+                    return Ok(false); // snapshot: clean EOF
+                }
+                if let Some(dl) = deadline {
+                    if Instant::now() >= dl {
+                        return Ok(false); // live: capture window elapsed
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1)); // ring empty; poll again
             }
             Ok(n) => filled += n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
@@ -250,6 +363,38 @@ fn decode_event(b: &[u8; EVENT_SIZE], ts_ns: i64) -> Option<PcieEvent> {
     let offset = u32::from_le_bytes([b[12], b[13], b[14], b[15]]);
     let value = u64::from_le_bytes(b[16..24].try_into().unwrap());
     let addr = u64::from_le_bytes(b[24..32].try_into().unwrap());
+    // Diagnostic: the driver's connect marker (IRQ with width sentinel 0xFF) carries the full
+    // IoConnectInterruptEx outcome — status in `value`, mode in `bar` (1=msg,2=line,0=fail),
+    // message count in `offset`, line vector in `addr`.
+    if kind == KIND_IRQ && width == 0xFF && std::env::var_os("REVENG_DRV_DEBUG").is_some() {
+        let mode = match bar {
+            1 => "message-based",
+            2 => "line-based",
+            _ => "FAILED",
+        };
+        eprintln!(
+            "[drv] CONNECT marker: status=0x{:08X} mode={mode} msg_count={offset} line_vec=0x{addr:X}",
+            value as u32
+        );
+    }
+    // M3 MMIO snapshot marker (kind=MMIO, width=0xFF): how many BARs mapped + first snap length.
+    if kind == KIND_MMIO && width == 0xFF && std::env::var_os("REVENG_DRV_DEBUG").is_some() {
+        eprintln!("[drv] MMIO marker: bars_mapped={value} bar0_snaplen={offset}");
+    }
+    // M4 DMA marker (kind=DMA, width=0xFF): `offset` is the stage — 0=read ERSTBA, 1=ring mapped,
+    // 7/8=map failed, 9=ERST not in RAM, 10=segment not in RAM (both = likely IOMMU translation).
+    if kind == KIND_DMA && width == 0xFF && std::env::var_os("REVENG_DRV_DEBUG").is_some() {
+        let stage = match offset {
+            0 => "erstba",
+            1 => "ring-mapped-ok",
+            7 => "seg-map-failed",
+            8 => "erst-map-failed",
+            9 => "erst-not-in-ram(IOMMU?)",
+            10 => "seg-not-in-ram(IOMMU?)",
+            _ => "?",
+        };
+        eprintln!("[drv] DMA marker[{stage}]: addr=0x{addr:X} value=0x{value:X}");
+    }
     match kind {
         KIND_CONFIG => Some(PcieEvent::Config {
             ts_ns,

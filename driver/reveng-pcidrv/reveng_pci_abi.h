@@ -25,6 +25,21 @@
 #define IOCTL_REVENG_PCI_SET_TARGET \
     CTL_CODE(FILE_DEVICE_UNKNOWN, REVENG_PCI_SET_TARGET_CODE, METHOD_BUFFERED, FILE_ANY_ACCESS)
 
+/* Snapshot the attached filter's mapped MMIO BARs and emit an MMIO event per changed dword
+ * (M3, DESIGN.md §4a). No input; the caller (DrvPcieSource live mode) issues this periodically
+ * and drains the resulting events via ReadFile. Read-only: captures register *state changes*,
+ * not individual driver accesses (that needs the hypervisor/EPT tier). */
+#define REVENG_PCI_MMIO_SNAP_CODE 0x801
+#define IOCTL_REVENG_PCI_MMIO_SNAP \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, REVENG_PCI_MMIO_SNAP_CODE, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
+/* Follow the attached xHCI's Event Ring in system memory and emit a DMA event per newly-written
+ * Event TRB (M4, DESIGN.md §4a — best-effort; may be defeated by IOMMU/VT-d address translation).
+ * No input. Read-only; every physical address is validated against RAM ranges before mapping. */
+#define REVENG_PCI_DMA_SNAP_CODE 0x802
+#define IOCTL_REVENG_PCI_DMA_SNAP \
+    CTL_CODE(FILE_DEVICE_UNKNOWN, REVENG_PCI_DMA_SNAP_CODE, METHOD_BUFFERED, FILE_ANY_ACCESS)
+
 /* Input to IOCTL_REVENG_PCI_SET_TARGET: the PCIe device to capture, by address. */
 #pragma pack(push, 1)
 typedef struct _REVENG_PCI_TARGET {
