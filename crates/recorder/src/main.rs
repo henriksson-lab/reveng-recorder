@@ -4,12 +4,16 @@
 //! in this scaffold; the flag set is complete so `--help` documents the intended tool.
 
 mod elevate;
+mod hv;
+#[cfg(windows)]
+mod notes_ui;
 mod query;
 mod record;
 mod record_usb;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use reveng_core::checkpoint::CheckpointConfig;
+use reveng_core::clock::Clock;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -35,6 +39,8 @@ enum Cmd {
     },
     /// List checkpoints (the manifest — read this first).
     Ls { session: PathBuf },
+    /// List notes typed during recording (elapsed time + anchored frame + text).
+    Notes { session: PathBuf },
     /// Show one checkpoint's full card.
     Show { session: PathBuf, checkpoint: u64 },
     /// Decoded traffic frames near a checkpoint or by range.
@@ -107,6 +113,14 @@ enum Cmd {
         #[arg(long)]
         pci_bdf: String,
     },
+    /// Probe VT-x capability via the reveng-hv driver (hypervisor tier bring-up; read-only).
+    HvProbe,
+    /// VMXON+VMXOFF on every CPU via reveng-hv (no VMLAUNCH yet) — proves VMX entry works.
+    HvVmxtest,
+    /// H1 hyperjack self-test: VMLAUNCH on CPU 0, verify via CPUID backdoor, then devirtualize.
+    HvSelftest,
+    /// Read reveng-hv's diagnostic record (last devirtualize reason/RIP, secondary-ctls status).
+    HvDiag,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -251,6 +265,12 @@ struct RecordArgs {
     #[arg(long, value_enum, default_value_t = ScreenshotFormat::Png)]
     screenshot_format: ScreenshotFormat,
 
+    /// Run the recording window without opening a USB capture (input + screenshots + notes
+    /// only). Lets you exercise the UI, or take a note/input-only recording, with no USB
+    /// device / no USBPcap / no admin.
+    #[arg(long)]
+    no_capture: bool,
+
     #[arg(long)]
     out: Option<PathBuf>,
     #[arg(long)]
@@ -287,6 +307,7 @@ fn run() -> anyhow::Result<()> {
         Cmd::Devices { format } => run_devices(format),
         Cmd::PciDevices { format } => run_pci_devices(format),
         Cmd::Ls { session } => query::ls(&session, false),
+        Cmd::Notes { session } => query::notes(&session),
         Cmd::Show { session, checkpoint } => query::show(&session, checkpoint),
         Cmd::Frames {
             session,
@@ -325,6 +346,29 @@ fn run() -> anyhow::Result<()> {
         } => run_export(&session, checkpoint, range.as_deref(), out, wireshark),
         Cmd::PciAttach { pci_bdf } => run_pci_filter(&pci_bdf, true),
         Cmd::PciDetach { pci_bdf } => run_pci_filter(&pci_bdf, false),
+        Cmd::HvProbe => run_hv_op(hv::probe),
+        Cmd::HvVmxtest => run_hv_op(hv::vmxtest),
+        Cmd::HvSelftest => run_hv_op(hv::selftest),
+        Cmd::HvDiag => run_hv_op(hv::diag),
+    }
+}
+
+/// Run a reveng-hv control op, self-elevating first (the control device needs admin).
+#[allow(unused_variables)]
+fn run_hv_op(op: fn() -> anyhow::Result<()>) -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        if !elevate::is_elevated() && std::env::var_os("REVENG_NO_ELEVATE").is_none() {
+            eprintln!("reveng-hv control needs administrator rights — requesting elevation…");
+            let forward: Vec<String> = std::env::args().skip(1).collect();
+            let code = elevate::relaunch_elevated(&forward)?;
+            std::process::exit(code as i32);
+        }
+        op()
+    }
+    #[cfg(not(windows))]
+    {
+        anyhow::bail!("reveng-hv control requires Windows")
     }
 }
 
@@ -491,12 +535,19 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             }
         }
         Source::Usb => {
-            // Passive USB capture opens \\.\USBPcapN, which needs admin. If we're not elevated,
-            // relaunch ourselves through UAC (a consent/password prompt) rather than making the
-            // user open an elevated shell. `REVENG_NO_ELEVATE` opts out.
+            let out = args.out.clone().unwrap_or_else(default_session_dir);
+            let opts = build_usb_opts(&args, cfg)?;
+
+            // Passive USB capture opens \\.\USBPcapN, which needs admin. Only elevate when we
+            // actually have a source to open — a window-only run (no matching device, or
+            // --no-capture) needs no admin. If not elevated, relaunch through UAC rather than
+            // making the user open an elevated shell. `REVENG_NO_ELEVATE` opts out.
             #[cfg(windows)]
             {
-                if !elevate::is_elevated() && std::env::var_os("REVENG_NO_ELEVATE").is_none() {
+                if !opts.selections.is_empty()
+                    && !elevate::is_elevated()
+                    && std::env::var_os("REVENG_NO_ELEVATE").is_none()
+                {
                     eprintln!("USB capture needs administrator rights — requesting elevation…");
                     let forward: Vec<String> = std::env::args().skip(1).collect();
                     let code = elevate::relaunch_elevated(&forward)?;
@@ -504,9 +555,37 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                 }
             }
 
-            let out = args.out.clone().unwrap_or_else(default_session_dir);
-            let opts = build_usb_opts(&args, cfg)?;
-            let summary = record_usb::run_usb_capture(&out, opts)?;
+            if opts.selections.is_empty() && !args.no_capture {
+                eprintln!(
+                    "no matching USB device/hub found — recording input + screenshots + notes only"
+                );
+            } else if opts.selections.len() > 1 {
+                eprintln!("capturing {} USB hubs in parallel", opts.selections.len());
+            }
+
+            let clock = Clock::start();
+
+            // Interactive runs get the Slint notes window; automation (`--max-seconds`) and
+            // `REVENG_NO_NOTES_UI=1` run headless (no window, capture on this thread).
+            let headless =
+                opts.max_duration.is_some() || std::env::var_os("REVENG_NO_NOTES_UI").is_some();
+
+            let summary = if headless {
+                record_usb::run_usb_capture(clock, &out, opts, None)?
+            } else {
+                #[cfg(windows)]
+                {
+                    let worker_clock = clock.clone();
+                    let out2 = out.clone();
+                    notes_ui::run_recording_window(clock, move |ui| {
+                        record_usb::run_usb_capture(worker_clock, &out2, opts, Some(ui))
+                    })?
+                }
+                #[cfg(not(windows))]
+                {
+                    record_usb::run_usb_capture(clock, &out, opts, None)?
+                }
+            };
             eprintln!(
                 "recorded {} USB frames, {} checkpoints -> {}",
                 summary.events,
@@ -518,62 +597,13 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
     }
 }
 
-/// Assemble the live-USB recording options from CLI args, resolving VID:PID → address via
-/// device enumeration when only a VID:PID was given (DESIGN.md §11.1).
+/// Assemble the live-USB recording options from CLI args.
 fn build_usb_opts(
     args: &RecordArgs,
     cfg: CheckpointConfig,
 ) -> anyhow::Result<record_usb::UsbRecordOpts> {
-    use reveng_usbcap::UsbSelection;
-
-    let mut address = args.device_address.clone();
-    let mut usbpcap_device = args.usbpcap_device.clone();
-
-    // Enumerate at most once, only if we actually need it (VID:PID resolution or
-    // control-device auto-pick), and reuse the result for both.
-    let need_resolve = address.is_empty() && !args.device_vidpid.is_empty();
-    let need_autopick = usbpcap_device.is_none();
-    if need_resolve || need_autopick {
-        if let Ok(devs) = reveng_usbcap::list_devices() {
-            if need_resolve {
-                for want in &args.device_vidpid {
-                    let (wv, wp) = want.split_once(':').unwrap_or((want.as_str(), ""));
-                    for d in &devs {
-                        if d.vid.eq_ignore_ascii_case(wv) && d.pid.eq_ignore_ascii_case(wp) {
-                            address.push(d.address);
-                            // Prefer the matched device's own control device — correct even
-                            // when several root hubs are present.
-                            if usbpcap_device.is_none() && !d.usbpcap.is_empty() {
-                                usbpcap_device = Some(d.usbpcap.clone());
-                            }
-                        }
-                    }
-                }
-            }
-            // Fall back to auto-picking when there's exactly one live root-hub filter.
-            if usbpcap_device.is_none() {
-                let hubs: std::collections::BTreeSet<_> = devs
-                    .iter()
-                    .map(|d| d.usbpcap.clone())
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if hubs.len() == 1 {
-                    usbpcap_device = hubs.into_iter().next();
-                }
-            }
-        }
-    }
-
-    let selection = UsbSelection {
-        usbpcap_device,
-        vidpid: args.device_vidpid.clone(),
-        serial: args.device_serial.clone(),
-        address,
-        all_devices: args.all_devices,
-    };
-
     Ok(record_usb::UsbRecordOpts {
-        selection,
+        selections: build_usb_selections(args)?,
         cfg,
         screenshot_on: match args.screenshot_on {
             ScreenshotOn::Mousedown => record_usb::ScreenshotWhen::Mousedown,
@@ -591,6 +621,86 @@ fn build_usb_opts(
         stop_vk: 0x13, // VK_PAUSE (Ctrl+Alt+Pause)
         max_duration: args.max_seconds.map(std::time::Duration::from_secs),
     })
+}
+
+/// Resolve the CLI device selection into one [`UsbSelection`] per USBPcap control device
+/// (root hub) to capture in parallel (DESIGN.md §11.1). Devices are grouped by their hub so
+/// a match spanning several root hubs opens several sources. Returns empty for `--no-capture`
+/// or when nothing matches — the recorder then runs window-only (input + notes, no capture).
+fn build_usb_selections(args: &RecordArgs) -> anyhow::Result<Vec<reveng_usbcap::UsbSelection>> {
+    use reveng_usbcap::UsbSelection;
+    use std::collections::{BTreeMap, BTreeSet};
+
+    if args.no_capture {
+        return Ok(Vec::new());
+    }
+
+    /// Accumulated request for one control device.
+    #[derive(Default)]
+    struct Hub {
+        addresses: BTreeSet<u16>,
+        all: bool,
+    }
+    let mut hubs: BTreeMap<String, Hub> = BTreeMap::new();
+
+    // Explicit control device: honor --device-address on it, else capture the whole hub.
+    if let Some(dev) = &args.usbpcap_device {
+        let h = hubs.entry(dev.clone()).or_default();
+        for a in &args.device_address {
+            h.addresses.insert(*a);
+        }
+        if args.all_devices || (args.device_address.is_empty() && args.device_vidpid.is_empty()) {
+            h.all = true;
+        }
+    }
+
+    // Enumerate once when we must resolve VID:PID → (hub, address), honor --all-devices, or
+    // auto-pick a lone hub.
+    let need_enum = !args.device_vidpid.is_empty() || args.all_devices || hubs.is_empty();
+    if need_enum {
+        if let Ok(devs) = reveng_usbcap::list_devices() {
+            for want in &args.device_vidpid {
+                let (wv, wp) = want.split_once(':').unwrap_or((want.as_str(), ""));
+                for d in &devs {
+                    if d.vid.eq_ignore_ascii_case(wv)
+                        && d.pid.eq_ignore_ascii_case(wp)
+                        && !d.usbpcap.is_empty()
+                    {
+                        hubs.entry(d.usbpcap.clone()).or_default().addresses.insert(d.address);
+                    }
+                }
+            }
+            if args.all_devices {
+                for d in &devs {
+                    if !d.usbpcap.is_empty() {
+                        hubs.entry(d.usbpcap.clone()).or_default().all = true;
+                    }
+                }
+            }
+            // Nothing requested → auto-pick the single hub if there's exactly one.
+            if hubs.is_empty() {
+                let set: BTreeSet<_> = devs
+                    .iter()
+                    .map(|d| d.usbpcap.clone())
+                    .filter(|s| !s.is_empty())
+                    .collect();
+                if set.len() == 1 {
+                    hubs.entry(set.into_iter().next().unwrap()).or_default().all = true;
+                }
+            }
+        }
+    }
+
+    Ok(hubs
+        .into_iter()
+        .map(|(dev, h)| UsbSelection {
+            usbpcap_device: Some(dev),
+            vidpid: args.device_vidpid.clone(),
+            serial: args.device_serial.clone(),
+            address: h.addresses.into_iter().collect(),
+            all_devices: h.all,
+        })
+        .collect())
 }
 
 /// Resolve the live PCIe capture target (BDF) from `--pci-bdf` or `--pci-vidpid`.

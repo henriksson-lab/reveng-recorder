@@ -1,0 +1,102 @@
+import { LineEdit, Button, ListView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+
+// One entered note: elapsed time (mm:ss) + the text. Filled from Rust.
+struct NoteRow {
+    time: string,
+    text: string,
+}
+
+// The live "recording" window: a red REC indicator + elapsed clock, a scrollback log of
+// notes already entered, and an input box that stamps a note onto the capture on Enter.
+export component RecordWindow inherits Window {
+    title: "reveng-rec — recording";
+    preferred-width: 460px;
+    preferred-height: 420px;
+    min-width: 360px;
+    min-height: 260px;
+
+    in property <string> elapsed: "00:00";
+    in property <string> status: "RECORDING";
+    in property <bool> recording: true;
+    in property <[NoteRow]> notes;
+
+    // Enter pressed in the input box, with the note text.
+    callback submit(string);
+    // Stop button / window close.
+    callback stop();
+
+    VerticalBox {
+        padding: 10px;
+        spacing: 8px;
+
+        // Header: ● REC ......... mm:ss
+        HorizontalBox {
+            spacing: 8px;
+            Rectangle {
+                width: 12px;
+                height: 12px;
+                border-radius: 6px;
+                background: root.recording ? #e01b1b : #888888;
+            }
+            Text {
+                text: root.status;
+                font-weight: 700;
+                color: root.recording ? #e01b1b : #888888;
+                vertical-alignment: center;
+            }
+            Rectangle { horizontal-stretch: 1; }
+            Text {
+                text: root.elapsed;
+                font-family: "monospace";
+                vertical-alignment: center;
+            }
+        }
+
+        // Consent / what-is-recorded banner (kept visible per project policy).
+        Text {
+            text: "Recording keyboard, mouse, screen and device traffic on this machine. Notes you type here are timestamped onto the capture for later correlation.";
+            wrap: word-wrap;
+            font-size: 11px;
+            color: #999999;
+        }
+
+        // Scrollback log of notes already entered.
+        ListView {
+            vertical-stretch: 1;
+            for row in root.notes: HorizontalBox {
+                spacing: 8px;
+                padding: 2px;
+                Text {
+                    text: row.time;
+                    font-family: "monospace";
+                    color: #66aa99;
+                    min-width: 52px;
+                }
+                Text {
+                    text: row.text;
+                    wrap: word-wrap;
+                    horizontal-stretch: 1;
+                }
+            }
+        }
+
+        // Note input: Enter submits and clears.
+        input := LineEdit {
+            placeholder-text: "type a note and press Enter…";
+            accepted(text) => {
+                root.submit(text);
+                self.text = "";
+            }
+        }
+
+        HorizontalBox {
+            alignment: end;
+            Button {
+                text: "Stop recording";
+                clicked => {
+                    root.stop();
+                }
+            }
+        }
+    }
+}

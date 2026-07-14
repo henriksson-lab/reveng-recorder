@@ -145,3 +145,45 @@ impl SessionReader {
             .ok_or_else(|| anyhow::anyhow!("no checkpoint with id {id}"))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::checkpoint::{Checkpoint, CheckpointType};
+    use crate::event::{SourceKind, TrafficAnchor};
+
+    /// A live note is stored as a `Manual` checkpoint carrying the text + the anchor to the
+    /// frame that was live when it was entered — the note-vs-wire correlation the feature
+    /// exists for. Guard that it survives the `events.ndjson` round-trip.
+    #[test]
+    fn manual_note_round_trips_through_ndjson() {
+        let c = Checkpoint {
+            id: 7,
+            ts_ns: 5_000_000_000,
+            kind: CheckpointType::Manual,
+            cause: "note".into(),
+            anchor: Some(TrafficAnchor {
+                source: SourceKind::Usb,
+                event_index: 42,
+                byte_offset: 0,
+            }),
+            screenshot_id: None,
+            fg_process: None,
+            fg_window: None,
+            cursor: (0, 0),
+            note: Some("clicked connect".into()),
+        };
+        let line = serde_json::to_string(&SessionRecord::Checkpoint(c)).unwrap();
+        assert!(line.contains(r#""rec":"checkpoint""#));
+        assert!(line.contains(r#""kind":"manual""#));
+
+        match serde_json::from_str::<SessionRecord>(&line).unwrap() {
+            SessionRecord::Checkpoint(d) => {
+                assert_eq!(d.kind, CheckpointType::Manual);
+                assert_eq!(d.note.as_deref(), Some("clicked connect"));
+                assert_eq!(d.anchor.unwrap().event_index, 42);
+            }
+            _ => panic!("expected a checkpoint record"),
+        }
+    }
+}

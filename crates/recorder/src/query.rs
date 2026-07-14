@@ -96,21 +96,62 @@ pub fn ls(session_dir: &Path, json: bool) -> Result<()> {
                 "cause": c.cause,
                 "anchor_index": anchor_idx,
                 "screenshot": c.screenshot_id,
+                "note": c.note,
             });
             writeln!(w, "{line}")?;
         } else {
+            let note = c
+                .note
+                .as_deref()
+                .map(|n| format!("  note=\"{n}\""))
+                .unwrap_or_default();
             writeln!(
                 w,
-                "#{:<4} t={:>12}ns  {:<14} {:<16} anchor={}",
+                "#{:<4} t={:>12}ns  {:<14} {:<16} anchor={}{}",
                 c.id,
                 c.ts_ns,
                 format!("{:?}", c.kind),
                 c.cause,
                 anchor_idx.map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
+                note,
             )?;
         }
     }
     Ok(())
+}
+
+/// `notes` — the user notes typed during recording (Manual checkpoints), each as a JSON
+/// line with its elapsed time and the traffic frame live when it was entered. This is the
+/// "when did I say what, and what was on the wire then" view an agent correlates against.
+pub fn notes(session_dir: &Path) -> Result<()> {
+    use reveng_core::checkpoint::CheckpointType;
+    let s = SessionReader::open(session_dir)?;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    for c in s.checkpoints()? {
+        if c.kind != CheckpointType::Manual {
+            continue;
+        }
+        let Some(note) = c.note.as_deref() else {
+            continue;
+        };
+        let line = serde_json::json!({
+            "checkpoint": c.id,
+            "ts_ns": c.ts_ns,
+            "elapsed": fmt_elapsed(c.ts_ns),
+            "anchor_index": c.anchor.map(|a| a.event_index),
+            "note": note,
+        });
+        writeln!(w, "{line}")?;
+    }
+    Ok(())
+}
+
+/// Session-relative `ns` → `mm:ss.mmm`.
+fn fmt_elapsed(ns: i64) -> String {
+    let secs = (ns / 1_000_000_000).max(0);
+    let ms = (ns / 1_000_000).max(0) % 1000;
+    format!("{:02}:{:02}.{:03}", secs / 60, secs % 60, ms)
 }
 
 /// `show` — a checkpoint card, including the anchored traffic event.

@@ -81,6 +81,21 @@ pub fn foreground_context() -> (Option<String>, Option<String>) {
     }
 }
 
+/// Is the current process's own window the foreground window? Used by the recorder to
+/// suppress checkpoint generation while the user is typing into our own notes window —
+/// otherwise those keystrokes would be logged and would trip the Return/Tab/Esc
+/// checkpoint triggers. Always `false` off Windows.
+pub fn foreground_is_self() -> bool {
+    #[cfg(windows)]
+    {
+        imp::foreground_is_self()
+    }
+    #[cfg(not(windows))]
+    {
+        false
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use super::{InputEvent, InputKind};
@@ -248,6 +263,22 @@ mod imp {
                 let _ = join.join();
                 anyhow::bail!("hook thread exited before reporting status")
             }
+        }
+    }
+
+    pub fn foreground_is_self() -> bool {
+        use windows::Win32::System::Threading::GetCurrentProcessId;
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GetForegroundWindow, GetWindowThreadProcessId,
+        };
+        unsafe {
+            let hwnd = GetForegroundWindow();
+            if hwnd.0.is_null() {
+                return false;
+            }
+            let mut pid = 0u32;
+            GetWindowThreadProcessId(hwnd, Some(&mut pid));
+            pid != 0 && pid == GetCurrentProcessId()
         }
     }
 

@@ -18,10 +18,11 @@ use reveng_core::event::{SourceKind, TrafficAnchor};
 use reveng_core::index::IndexFile;
 use reveng_core::session::{SessionRecord, SessionWriter};
 use reveng_core::source::CaptureSource;
-use reveng_usbcap::{UsbCaptureSource, UsbIdxRecord, UsbSelection, UsbWriter};
+use reveng_usbcap::{Killer, UsbCaptureSource, UsbIdxRecord, UsbSelection, UsbWriter};
 use reveng_winput::{InputEvent, InputKind};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,7 +36,11 @@ pub enum ScreenshotWhen {
 }
 
 pub struct UsbRecordOpts {
-    pub selection: UsbSelection,
+    /// One capture per USBPcap control device (root hub) to record in parallel — each gets
+    /// its own reader thread folding frames into the one `usb.pcapng` on the shared clock.
+    /// Empty = no capture at all: the pipeline still records input + screenshots + notes and
+    /// shows the window, so the UI runs with no USB device / no USBPcap / no admin.
+    pub selections: Vec<UsbSelection>,
     pub cfg: CheckpointConfig,
     pub screenshot_on: ScreenshotWhen,
     pub screenshot_on_keys: bool,
@@ -47,37 +52,91 @@ pub struct UsbRecordOpts {
     pub max_duration: Option<Duration>,
 }
 
-/// Shared, reader→engine traffic state (the `bytes_since_ckpt` counter + latest frame).
+/// Wiring from the live "recording" note window (`notes_ui`) into the capture loop.
+/// The window runs on the main thread; the capture pipeline runs on a worker and drains
+/// these. Absent for headless/automation runs (`--max-seconds`, `REVENG_NO_NOTES_UI`).
+pub struct NotesUi {
+    /// `(ts_ns stamped at Enter, note text)`, one per submitted note.
+    pub note_rx: Receiver<(i64, String)>,
+    /// Set by the window's Stop button / close; a stop condition for the capture loop.
+    pub stop_flag: Arc<AtomicBool>,
+}
+
+/// Shared, readers→engine traffic state (the `bytes_since_ckpt` counter + latest frame).
+/// One instance is shared across all parallel reader threads, so it also serializes the
+/// merged frame index: `last_ts` clamps arrival-order timestamps non-decreasing (frames
+/// from different hubs interleave) so `frames.idx` stays binary-searchable.
 #[derive(Default)]
 struct TrafficState {
     latest_index: Option<u64>,
     latest_offset: u64,
     total_frames: u64,
     bytes_since: u64,
+    /// Highest timestamp written so far (merged-index monotonicity clamp).
+    last_ts: i64,
+    /// Reader threads still running; when it reaches 0 (all sources ended) the session is done.
+    active_sources: usize,
     done: bool,
 }
 
-pub fn run_usb_capture(out: &Path, opts: UsbRecordOpts) -> Result<RecordSummary> {
-    let clock = Clock::start();
+pub fn run_usb_capture(
+    clock: Clock,
+    out: &Path,
+    opts: UsbRecordOpts,
+    ui: Option<NotesUi>,
+) -> Result<RecordSummary> {
+    // The clock is created by the caller so the notes window shares this exact origin.
+    let (note_rx, ui_stop) = match ui {
+        Some(u) => (Some(u.note_rx), Some(u.stop_flag)),
+        None => (None, None),
+    };
     let session = SessionWriter::create(out)?;
-    let pcapng_path = session.usb_pcapng();
-    let idx_path = session.frames_idx();
     let shots_dir = session.screenshots_dir();
-
-    // --- reader: start the capture up front so spawn/DLT errors surface here ---
-    let mut source = UsbCaptureSource::new(opts.selection.clone(), clock.clone());
-    source.start()?;
-    let killer = source.killer();
 
     let state = Arc::new(Mutex::new(TrafficState::default()));
     let reader_stop = Arc::new(AtomicBool::new(false));
-    let reader = {
-        let state = state.clone();
-        let reader_stop = reader_stop.clone();
-        std::thread::Builder::new()
-            .name("usbcap-reader".into())
-            .spawn(move || reader_loop(source, pcapng_path, idx_path, state, reader_stop))?
+
+    // --- readers: one per selected control device (root hub), captured in parallel and
+    // folded into the single shared `usb.pcapng`/`frames.idx`. Start them up front so
+    // spawn/open errors surface here. Empty `selections` = no capture at all (the window
+    // still runs: input + screenshots + notes only, no USB source, no admin needed).
+    let mut killers: Vec<Killer> = Vec::new();
+    let mut readers = Vec::new();
+
+    // Start each selected control device, skipping (not aborting on) any that fail — one hub
+    // that won't open must not take down the others. Collect the survivors, then create the
+    // shared writer only if at least one opened (else it's the no-capture case).
+    let mut sources = Vec::new();
+    for selection in &opts.selections {
+        let mut source = UsbCaptureSource::new(selection.clone(), clock.clone());
+        match source.start() {
+            Ok(()) => sources.push(source),
+            Err(e) => eprintln!(
+                "usb capture skipped for {}: {e}",
+                selection.usbpcap_device.as_deref().unwrap_or("?")
+            ),
+        }
+    }
+    let writer = if sources.is_empty() {
+        None
+    } else {
+        let w = UsbWriter::create(session.usb_pcapng(), session.frames_idx())?;
+        Some(Arc::new(Mutex::new(w)))
     };
+    if let Some(writer) = &writer {
+        state.lock().unwrap().active_sources = sources.len();
+        for (i, source) in sources.into_iter().enumerate() {
+            killers.push(source.killer());
+            let writer = writer.clone();
+            let state = state.clone();
+            let reader_stop = reader_stop.clone();
+            readers.push(
+                std::thread::Builder::new()
+                    .name(format!("usbcap-reader-{i}"))
+                    .spawn(move || reader_loop(source, writer, state, reader_stop))?,
+            );
+        }
+    }
 
     // --- screenshot worker ---
     let (shot_tx, shot_rx) = std::sync::mpsc::channel::<(u64, reveng_winshot::Scope)>();
@@ -100,7 +159,7 @@ pub fn run_usb_capture(out: &Path, opts: UsbRecordOpts) -> Result<RecordSummary>
 
     // --- the checkpoint engine ---
     let mut engine = Engine::new(session, &opts, shot_tx, clock.clone());
-    engine.emit(CheckpointType::SessionStart, "session_start", 0, None, false, (0, 0))?;
+    engine.emit(CheckpointType::SessionStart, "session_start", 0, None, false, (0, 0), None)?;
 
     let start = Instant::now();
     let interval_ns = (opts.cfg.interval_ms as i64).saturating_mul(1_000_000);
@@ -109,6 +168,16 @@ pub fn run_usb_capture(out: &Path, opts: UsbRecordOpts) -> Result<RecordSummary>
             Ok(ev) => engine.on_input(&ev, &state)?,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        // Notes typed into the recording window become Manual checkpoints, anchored to the
+        // frame live at the moment the user pressed Enter (the note-vs-wire correlation).
+        if let Some(rx) = &note_rx {
+            while let Ok((ts, text)) = rx.try_recv() {
+                let anchor = anchor_of(&state.lock().unwrap());
+                engine.emit(CheckpointType::Manual, "note", ts, anchor, false, (0, 0), Some(text))?;
+                state.lock().unwrap().bytes_since = 0;
+            }
         }
 
         // Interval checkpoint: only during sustained traffic with no user action (§7).
@@ -120,14 +189,15 @@ pub fn run_usb_capture(out: &Path, opts: UsbRecordOpts) -> Result<RecordSummary>
                     (s.bytes_since >= opts.cfg.interval_bytes, anchor_of(&s))
                 };
                 if fire {
-                    engine.emit(CheckpointType::Interval, "interval", now, anchor, false, (0, 0))?;
+                    engine.emit(CheckpointType::Interval, "interval", now, anchor, false, (0, 0), None)?;
                     state.lock().unwrap().bytes_since = 0;
                 }
             }
         }
 
-        // Stop conditions: hotkey, reader EOF, or bounded duration.
+        // Stop conditions: hotkey, notes-window Stop/close, reader EOF, or bounded duration.
         if engine.stop_requested
+            || ui_stop.as_ref().map(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
             || state.lock().unwrap().done
             || opts.max_duration.map(|d| start.elapsed() >= d).unwrap_or(false)
         {
@@ -138,14 +208,22 @@ pub fn run_usb_capture(out: &Path, opts: UsbRecordOpts) -> Result<RecordSummary>
     // --- finalize: tear down threads, then inject checkpoint comments (§4) ---
     hooks.stop();
     reader_stop.store(true, Ordering::Relaxed);
-    killer.kill(); // unblock a reader parked in a blocking pipe read
-    let _ = reader.join();
+    for k in &killers {
+        k.kill(); // unblock readers parked in a blocking pipe read
+    }
+    for r in readers {
+        let _ = r.join();
+    }
+    if let Some(w) = writer {
+        w.lock().unwrap().flush()?;
+        drop(w); // close the pcapng file before finalize reads/rewrites it
+    }
     drop(engine.shot_tx.take());
     let _ = shot_worker.join();
 
     let final_ts = clock.now_ns();
     let stop_anchor = anchor_of(&state.lock().unwrap());
-    engine.emit(CheckpointType::SessionStop, "session_stop", final_ts, stop_anchor, false, (0, 0))?;
+    engine.emit(CheckpointType::SessionStop, "session_stop", final_ts, stop_anchor, false, (0, 0), None)?;
 
     let total_frames = state.lock().unwrap().total_frames;
     engine.finalize(&clock, &opts, total_frames)?;
@@ -164,42 +242,55 @@ fn anchor_of(s: &TrafficState) -> Option<TrafficAnchor> {
     })
 }
 
-/// The reader thread: drain the source into `usb.pcapng` + `frames.idx`, bump the counter.
+/// A reader thread: drain one source into the shared `usb.pcapng` + `frames.idx`, bumping
+/// the shared counter. Runs one per selected control device; the writer is shared so all
+/// hubs merge into one ordered index.
 fn reader_loop(
     mut source: UsbCaptureSource,
-    pcapng_path: std::path::PathBuf,
-    idx_path: std::path::PathBuf,
+    writer: Arc<Mutex<UsbWriter>>,
     state: Arc<Mutex<TrafficState>>,
     reader_stop: Arc<AtomicBool>,
 ) -> Result<()> {
-    let mut writer = UsbWriter::create(&pcapng_path, &idx_path)?;
     loop {
         if reader_stop.load(Ordering::Relaxed) {
             break;
         }
         match source.next() {
             Ok(Some(rec)) => {
-                let (idx, off) = writer.append_packet(rec.ts_ns, &rec.payload)?;
+                // Hold `state` across the append so the merged index stays ordered: clamp the
+                // arrival timestamp non-decreasing (hubs interleave), then append under the
+                // writer lock. Serializes writes across readers — correct, since it's one file.
                 let mut s = state.lock().unwrap();
+                let ts = rec.ts_ns.max(s.last_ts);
+                s.last_ts = ts;
+                let (idx, off) = writer.lock().unwrap().append_packet(ts, &rec.payload)?;
                 s.latest_index = Some(idx);
                 s.latest_offset = off;
                 s.total_frames = idx + 1;
                 s.bytes_since = s.bytes_since.saturating_add(rec.payload.len() as u64);
             }
             Ok(None) => {
-                state.lock().unwrap().done = true;
+                mark_source_ended(&state);
                 break;
             }
             Err(e) => {
                 eprintln!("usb reader stopped: {e}");
-                state.lock().unwrap().done = true;
+                mark_source_ended(&state);
                 break;
             }
         }
     }
-    writer.flush()?;
     let _ = source.stop();
     Ok(())
+}
+
+/// A source ended; when the last one does, the session is done.
+fn mark_source_ended(state: &Arc<Mutex<TrafficState>>) {
+    let mut s = state.lock().unwrap();
+    s.active_sources = s.active_sources.saturating_sub(1);
+    if s.active_sources == 0 {
+        s.done = true;
+    }
 }
 
 struct Engine {
@@ -253,6 +344,8 @@ impl Engine {
     }
 
     /// Emit a checkpoint: enrich context, optionally request a screenshot, persist it.
+    /// `note` carries a user-supplied annotation (Manual checkpoints); it is preserved
+    /// unless a coalesced screenshot needs to record why it was skipped.
     fn emit(
         &mut self,
         kind: CheckpointType,
@@ -261,6 +354,7 @@ impl Engine {
         anchor: Option<TrafficAnchor>,
         want_screenshot: bool,
         cursor: (i32, i32),
+        note: Option<String>,
     ) -> Result<()> {
         let id = self.next_id;
         self.next_id += 1;
@@ -273,7 +367,7 @@ impl Engine {
 
         // Screenshot with burst coalescing (§6): skip if within the min-interval floor.
         let mut screenshot_id = None;
-        let mut note = None;
+        let mut note = note;
         if want_screenshot {
             let ok = self
                 .last_shot_ts
@@ -315,10 +409,8 @@ impl Engine {
     }
 
     fn on_input(&mut self, ev: &InputEvent, state: &Arc<Mutex<TrafficState>>) -> Result<()> {
-        // Every input event is truth — persist it (§8).
-        self.session.append_record(&SessionRecord::Input(ev.clone()))?;
-
-        // Track modifiers + detect the stop hotkey (Ctrl+Alt+<stop_vk>).
+        // Track modifiers + detect the stop hotkey (Ctrl+Alt+<stop_vk>) first, so it still
+        // fires even when our own notes window happens to be focused.
         if let Some(vk) = ev.vk {
             let down = matches!(ev.kind, InputKind::KeyDown);
             match vk {
@@ -332,6 +424,16 @@ impl Engine {
             }
         }
 
+        // While the user is typing into our own notes window, ignore input entirely: don't
+        // log the keystrokes (the note itself is the record) and don't let Return/Tab/Esc
+        // trip a spurious checkpoint. The stop hotkey above still works.
+        if reveng_winput::foreground_is_self() {
+            return Ok(());
+        }
+
+        // Every input event is truth — persist it (§8).
+        self.session.append_record(&SessionRecord::Input(ev.clone()))?;
+
         let cfg = self.cfg.clone();
         let anchor = anchor_of(&state.lock().unwrap());
         match ev.kind {
@@ -339,7 +441,7 @@ impl Engine {
                 if let Some(btn) = &ev.button {
                     if cfg.mouse_triggers(btn) {
                         let want = matches!(self.shot_when, ScreenshotWhen::Mousedown | ScreenshotWhen::Both);
-                        self.emit(CheckpointType::Click, &format!("{btn}ButtonDown"), ev.ts_ns, anchor, want, (ev.x, ev.y))?;
+                        self.emit(CheckpointType::Click, &format!("{btn}ButtonDown"), ev.ts_ns, anchor, want, (ev.x, ev.y), None)?;
                         state.lock().unwrap().bytes_since = 0;
                     }
                 }
@@ -348,14 +450,14 @@ impl Engine {
                 if let Some(btn) = &ev.button {
                     if cfg.on_mouseup && cfg.mouse_triggers(btn) {
                         let want = matches!(self.shot_when, ScreenshotWhen::Mouseup | ScreenshotWhen::Both);
-                        self.emit(CheckpointType::Click, &format!("{btn}ButtonUp"), ev.ts_ns, anchor, want, (ev.x, ev.y))?;
+                        self.emit(CheckpointType::Click, &format!("{btn}ButtonUp"), ev.ts_ns, anchor, want, (ev.x, ev.y), None)?;
                         state.lock().unwrap().bytes_since = 0;
                     }
                 }
             }
             InputKind::Wheel => {
                 if cfg.on_wheel {
-                    self.emit(CheckpointType::Click, "Wheel", ev.ts_ns, anchor, false, (ev.x, ev.y))?;
+                    self.emit(CheckpointType::Click, "Wheel", ev.ts_ns, anchor, false, (ev.x, ev.y), None)?;
                     state.lock().unwrap().bytes_since = 0;
                 }
             }
@@ -366,7 +468,7 @@ impl Engine {
                         || name.map(|n| cfg.key_triggers(n)).unwrap_or(false);
                     if triggers {
                         let label = name.map(|s| s.to_string()).unwrap_or_else(|| format!("VK_0x{vk:02X}"));
-                        self.emit(CheckpointType::KeyDown, &label, ev.ts_ns, anchor, self.shot_on_keys, (ev.x, ev.y))?;
+                        self.emit(CheckpointType::KeyDown, &label, ev.ts_ns, anchor, self.shot_on_keys, (ev.x, ev.y), None)?;
                         state.lock().unwrap().bytes_since = 0;
                     }
                 }

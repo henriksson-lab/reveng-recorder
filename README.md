@@ -183,6 +183,9 @@ You do **not** read `usb.pcapng` (binary) — you *query* the session and let yo
 binary. The loop for reverse-engineering a proprietary protocol:
 
 1. `reveng-rec ls` — read the manifest (one line per checkpoint). Pick the action you care about.
+   `reveng-rec notes` — just the free-text notes the operator typed live while recording (each with
+   its elapsed time + the frame that was on the wire when they pressed Enter). Great orientation for
+   "what was the human doing here?"
 2. `reveng-rec show <ckpt>` — get the checkpoint card; `Read` the referenced screenshot (vision).
 3. `reveng-rec stream --ep <n> --logical` — pull reassembled logical messages as base64/hex text.
 4. Form a hypothesis, write a decoder (any language; stdin/stdout JSONL contract, or a Kaitai `.ksy`).
@@ -198,7 +201,9 @@ The full contract (CLI, file formats, decoder interface, reassembly) is in `DESI
 This is, functionally, a keylogger plus screen recorder combined with a USB sniffer. It is
 legitimate reverse-engineering / defensive tooling, but it must **only** be run on a machine the
 operator owns or is authorized to instrument. All data stays local — no network egress. A visible
-"RECORDING" indicator and a consent banner are part of the design.
+"RECORDING" indicator and a consent banner are part of the design — the USB `record` path shows
+them in a live Slint window that doubles as the note-taking surface (headless with
+`REVENG_NO_NOTES_UI=1` or `--max-seconds`).
 
 ## Layout
 

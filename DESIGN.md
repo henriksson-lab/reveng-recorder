@@ -462,6 +462,7 @@ only slices are ever materialized.
 
 ```
 reveng-rec ls                        # manifest — one line per checkpoint (read FIRST)
+reveng-rec notes                     # just the live notes typed while recording (JSONL: elapsed + anchored frame + text)
 reveng-rec show <ckpt>               # full checkpoint card (JSON)
 reveng-rec frames --around <ckpt> -w 20   # decoded frames near a checkpoint
 reveng-rec frames --range 10400:10460
@@ -571,7 +572,22 @@ byte 4 is `0x50`." That correlation is what makes the decode loop converge inste
 - **USB inspector** — the frames in a window around the checkpoint (±K frames or ±T ms, from the
   index). Decoded header (dev/endpoint/transfer/dir/len/status) + hex/ASCII payload (seeked from
   `byte_offset` in the pcapng). Filter by endpoint/direction/transfer type.
-- **Notes** — annotate a checkpoint; persisted back to `events.ndjson`/sqlite.
+- **Notes** — captured live during recording, not after. The `record` USB path opens a small
+  Slint window (the primary recording surface: red REC indicator, elapsed clock, scrollback log of
+  notes, input box, Stop button). Typing a note + Enter stamps it on the master clock the instant
+  the key is pressed and stores it as a `Manual` checkpoint (`note` field) anchored to the frame
+  live at that moment — so an agent can later correlate "what I said" against "what was on the wire"
+  (`reveng-rec notes` / `ls`). While the notes window is focused, the global input hook suppresses
+  keystroke/click checkpoints (the note itself is the record; Return/Tab/Esc don't trip triggers).
+  Headless automation (`--max-seconds`, `REVENG_NO_NOTES_UI=1`) skips the window. The viewer renders
+  the stored `note` on its checkpoint card.
+- **Parallel multi-device capture.** The USB `record` path opens one capture per USBPcap control
+  device (root hub), each on its own reader thread, all folding into the single `usb.pcapng` on the
+  shared clock (arrival-order merged index, timestamps clamped non-decreasing so `frames.idx` stays
+  binary-searchable). A VID:PID / `--all-devices` selection that spans several root hubs opens
+  several sources at once. **Zero sources is just the empty case:** `--no-capture` (or no matching
+  device) runs the whole pipeline — input, screenshots, notes, the window — with no USB capture and
+  no admin, e.g. to exercise the UI or take an input/note-only recording.
 - **Diff aid** — select two click checkpoints and diff the USB frames between them (great for
   "what's different between pressing button A vs button B").
 

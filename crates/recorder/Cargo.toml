@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "reveng-rec: record sessions and query them (the LLM/CLI surface)."
+build = "build.rs"
 
 [[bin]]
 name = "reveng-rec"
@@ -22,10 +23,20 @@ serde_json.workspace = true
 clap.workspace = true
 base64 = "0.22.1"
 
+# Compiles ui/record.slint (only when targeting Windows; see build.rs). Kept as a plain
+# build-dependency so the build script itself compiles on any host.
+[build-dependencies]
+slint-build = "1"
+
 [target."cfg(windows)".dependencies]
+# The live "recording" note-taking window (record_usb path). Windows-only, matching the
+# rest of the live-capture stack.
+slint = "1"
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_Registry",
     "Win32_System_Threading",
     "Win32_UI_Shell",
