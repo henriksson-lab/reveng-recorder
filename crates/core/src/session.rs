@@ -167,6 +167,7 @@ mod tests {
                 event_index: 42,
                 byte_offset: 0,
             }),
+            anchors: Vec::new(),
             screenshot_id: None,
             fg_process: None,
             fg_window: None,

@@ -17,6 +17,13 @@ pub mod writer;
 pub use reader::{UsbFrame, UsbReader};
 pub use writer::UsbWriter;
 
+/// USBPcap transfer-type codes, as stored in [`reveng_core::event::UsbFrameHeader::transfer`]
+/// (USBPcap.h `USBPCAP_TRANSFER_*`). Used by capture-side transfer-type filtering.
+pub const XFER_ISO: u8 = 0;
+pub const XFER_INTERRUPT: u8 = 1;
+pub const XFER_CONTROL: u8 = 2;
+pub const XFER_BULK: u8 = 3;
+
 use reveng_core::clock::Clock;
 use reveng_core::event::{SourceKind, TrafficKind, TrafficRecord, UsbFrameHeader};
 use reveng_core::index::FixedRecord;
@@ -165,6 +172,12 @@ pub struct UsbCaptureSource {
     child: std::sync::Arc<std::sync::Mutex<Option<Child>>>,
     killer: Killer,
     reader: Option<PcapStream>,
+    /// Driver snaplen (bytes captured per transfer); `0` = the default (unlimited). Small
+    /// control/interrupt transfers are unaffected; a modest cap truncates bulk/isoc firehoses
+    /// (camera/audio) in the kernel while the index keeps the original on-wire length.
+    snaplen: u32,
+    /// Driver kernel buffer size in bytes; `0` = the default. Larger tolerates bursts.
+    buffer: u32,
 }
 
 impl UsbCaptureSource {
@@ -175,7 +188,15 @@ impl UsbCaptureSource {
             child: std::sync::Arc::new(std::sync::Mutex::new(None)),
             killer: Killer::noop(),
             reader: None,
+            snaplen: 0,
+            buffer: 0,
         }
+    }
+
+    /// Set the driver snaplen / buffer size (bytes) before `start`. `0` keeps the default.
+    pub fn set_capture_opts(&mut self, snaplen: u32, buffer: u32) {
+        self.snaplen = snaplen;
+        self.buffer = buffer;
     }
 
     /// A handle that can stop the capture from another thread (valid after `start`).
@@ -196,20 +217,14 @@ impl UsbCaptureSource {
         let dev = self.require_device()?.to_string();
         // No explicit address filter → capture the whole hub; else filter to the resolved set.
         let filter_all = self.selection.all_devices || self.selection.address.is_empty();
-        let cap = ioctl::open_capture(
-            &dev,
-            &self.selection.address,
-            filter_all,
-            ioctl::DEFAULT_SNAPLEN,
-            ioctl::DEFAULT_BUFFER,
-        )?;
+        let snaplen = if self.snaplen == 0 { ioctl::DEFAULT_SNAPLEN } else { self.snaplen };
+        let buffer = if self.buffer == 0 { ioctl::DEFAULT_BUFFER } else { self.buffer };
+        let cap = ioctl::open_capture(&dev, &self.selection.address, filter_all, snaplen, buffer)?;
         let k = cap.killer;
         self.killer = Killer(std::sync::Arc::new(move || k.kill()));
         // Buffer at the driver's granularity so each ReadFile drains a full kernel buffer.
-        let stream: Box<dyn std::io::Read + Send> = Box::new(std::io::BufReader::with_capacity(
-            ioctl::DEFAULT_BUFFER as usize,
-            cap.reader,
-        ));
+        let stream: Box<dyn std::io::Read + Send> =
+            Box::new(std::io::BufReader::with_capacity(buffer as usize, cap.reader));
         self.set_reader(stream)
     }
 

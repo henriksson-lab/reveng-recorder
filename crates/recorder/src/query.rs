@@ -8,7 +8,7 @@
 //! source-agnostic — exactly the property DESIGN.md §7/§8 calls for.
 
 use anyhow::{Context, Result};
-use reveng_core::event::PcieEvent;
+use reveng_core::event::{PcieEvent, SourceKind};
 use reveng_core::session::SessionReader;
 use reveng_pcicap::PcieLog;
 use reveng_usbcap::UsbReader;
@@ -18,10 +18,33 @@ use std::path::Path;
 /// How to render raw payload bytes for `payload`.
 #[derive(Copy, Clone)]
 pub enum PayloadFmt {
+    /// xxd-style hex + ASCII gutter.
     Hex,
     Bin,
     Base64,
     Json,
+    /// UTF-8 (lossy) text.
+    Text,
+    /// Auto: text if the payload classifies as texty, else hex.
+    Auto,
+}
+
+/// xxd-style hex dump: `offset  hex bytes  |ascii gutter|`.
+fn hexdump(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    for (row, chunk) in bytes.chunks(16).enumerate() {
+        let mut hex = String::new();
+        let mut asc = String::new();
+        for (j, &b) in chunk.iter().enumerate() {
+            if j == 8 {
+                hex.push(' ');
+            }
+            hex.push_str(&format!("{b:02x} "));
+            asc.push(if (0x20..=0x7e).contains(&b) { b as char } else { '.' });
+        }
+        out.push_str(&format!("{:08x}  {hex:<49}|{asc}|\n", row * 16));
+    }
+    out
 }
 
 /// A session's traffic log, of whichever source produced it.
@@ -41,6 +64,17 @@ impl Log {
             ))
         } else {
             anyhow::bail!("session has no traffic log (usb.pcapng or pcie.bin)")
+        }
+    }
+
+    /// Open a specific source's log — needed for co-logged (USB + PCIe) sessions where an
+    /// anchor names which wire it points into.
+    fn open_source(s: &SessionReader, source: SourceKind) -> Result<Log> {
+        match source {
+            SourceKind::Usb => Ok(Log::Usb(UsbReader::open(s.usb_pcapng(), s.frames_idx())?)),
+            SourceKind::Pcie => Ok(Log::Pcie(
+                PcieLog::open(s.pcie_bin(), s.pcie_idx()).context("opening pcie.bin/pcie.idx")?,
+            )),
         }
     }
 
@@ -88,6 +122,12 @@ pub fn ls(session_dir: &Path, json: bool) -> Result<()> {
     let mut w = out.lock();
     for c in s.checkpoints()? {
         let anchor_idx = c.anchor.map(|a| a.event_index);
+        // Co-logged PCIe anchor, if this is a USB + PCIe session.
+        let pcie_idx = c
+            .anchors
+            .iter()
+            .find(|a| a.source == SourceKind::Pcie)
+            .map(|a| a.event_index);
         if json {
             let line = serde_json::json!({
                 "checkpoint": c.id,
@@ -95,11 +135,13 @@ pub fn ls(session_dir: &Path, json: bool) -> Result<()> {
                 "type": c.kind,
                 "cause": c.cause,
                 "anchor_index": anchor_idx,
+                "pcie_anchor_index": pcie_idx,
                 "screenshot": c.screenshot_id,
                 "note": c.note,
             });
             writeln!(w, "{line}")?;
         } else {
+            let pcie = pcie_idx.map(|i| format!(" pcie={i}")).unwrap_or_default();
             let note = c
                 .note
                 .as_deref()
@@ -107,12 +149,13 @@ pub fn ls(session_dir: &Path, json: bool) -> Result<()> {
                 .unwrap_or_default();
             writeln!(
                 w,
-                "#{:<4} t={:>12}ns  {:<14} {:<16} anchor={}{}",
+                "#{:<4} t={:>12}ns  {:<14} {:<16} anchor={}{}{}",
                 c.id,
                 c.ts_ns,
                 format!("{:?}", c.kind),
                 c.cause,
                 anchor_idx.map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
+                pcie,
                 note,
             )?;
         }
@@ -158,14 +201,27 @@ fn fmt_elapsed(ns: i64) -> String {
 pub fn show(session_dir: &Path, id: u64) -> Result<()> {
     let s = SessionReader::open(session_dir)?;
     let c = s.checkpoint(id)?;
-    let anchored = match c.anchor {
-        Some(a) => {
-            let mut log = open_log(&s)?;
-            Some(log.event_json(a.event_index)?)
-        }
+    // Resolve the primary anchor against its own source's log.
+    let anchored = match &c.anchor {
+        Some(a) => Log::open_source(&s, a.source)
+            .and_then(|mut log| log.event_json(a.event_index))
+            .ok(),
         None => None,
     };
-    let card = serde_json::json!({
+    // Secondary anchors (co-logged sources, e.g. the PCIe event when USB + PCIe are recorded
+    // together), each decoded from its own log — one checkpoint, both wires.
+    let extra: Vec<serde_json::Value> = c
+        .anchors
+        .iter()
+        .map(|a| {
+            let event = Log::open_source(&s, a.source)
+                .and_then(|mut log| log.event_json(a.event_index))
+                .ok();
+            serde_json::json!({ "anchor": a, "event": event })
+        })
+        .collect();
+
+    let mut card = serde_json::json!({
         "checkpoint": c.id,
         "ts_ns": c.ts_ns,
         "type": c.kind,
@@ -178,6 +234,9 @@ pub fn show(session_dir: &Path, id: u64) -> Result<()> {
         "anchor_event": anchored,
         "note": c.note,
     });
+    if !extra.is_empty() {
+        card["extra_anchors"] = serde_json::Value::Array(extra);
+    }
     println!("{}", serde_json::to_string_pretty(&card)?);
     Ok(())
 }
@@ -226,12 +285,19 @@ pub fn frames(
 
 /// `stream` — reassembled logical messages on an endpoint (USB, DESIGN.md §8b). Without
 /// `--logical` it is the raw per-endpoint frame view. PCIe falls back to filtered events.
-pub fn stream(session_dir: &Path, ep: Option<u8>, logical: bool) -> Result<()> {
+pub fn stream(session_dir: &Path, ep: Option<u8>, logical: bool, text: bool) -> Result<()> {
     let s = SessionReader::open(session_dir)?;
     let mut log = open_log(&s)?;
     let total = log.len();
     if total == 0 {
         return Ok(());
+    }
+    // Text reassembly (USB): concatenate the endpoint and split on newlines — the natural
+    // shape for CDC-ACM serial / NMEA / AT-command / debug-log endpoints.
+    if text {
+        if let Log::Usb(reader) = &mut log {
+            return stream_text(reader, total, ep);
+        }
     }
     // Non-logical, or non-USB: just the filtered frames.
     if !logical || matches!(log, Log::Pcie(_)) {
@@ -288,6 +354,46 @@ pub fn stream(session_dir: &Path, ep: Option<u8>, logical: bool) -> Result<()> {
     Ok(())
 }
 
+/// Text reassembly for a USB endpoint: concatenate frames per endpoint and emit one record
+/// per newline-delimited line (trailing `\r` trimmed). Partial trailing data is flushed.
+fn stream_text(reader: &mut UsbReader, total: u64, ep: Option<u8>) -> Result<()> {
+    use std::collections::BTreeMap;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    let emit = |w: &mut dyn Write, endpoint: u8, line: &[u8]| -> Result<()> {
+        let dir = if endpoint & 0x80 != 0 { "in" } else { "out" };
+        let text = String::from_utf8_lossy(line);
+        let line = serde_json::json!({
+            "ep": format!("0x{:02x}", endpoint),
+            "dir": dir,
+            "text": text.trim_end_matches('\r'),
+        });
+        writeln!(w, "{line}")?;
+        Ok(())
+    };
+    let mut buf: BTreeMap<u8, Vec<u8>> = BTreeMap::new();
+    for i in 0..total {
+        let f = reader.frame_at(i)?;
+        if let Some(sel) = ep {
+            if f.endpoint != sel {
+                continue;
+            }
+        }
+        let b = buf.entry(f.endpoint).or_default();
+        b.extend_from_slice(&f.payload);
+        while let Some(pos) = b.iter().position(|&c| c == b'\n') {
+            let line: Vec<u8> = b.drain(..=pos).collect();
+            emit(&mut w, f.endpoint, &line[..line.len() - 1])?;
+        }
+    }
+    for (endpoint, b) in buf {
+        if !b.is_empty() {
+            emit(&mut w, endpoint, &b)?;
+        }
+    }
+    Ok(())
+}
+
 /// `payload` — raw bytes of one frame, rendered per `fmt`.
 pub fn payload(session_dir: &Path, frame: u64, fmt: PayloadFmt) -> Result<()> {
     let s = SessionReader::open(session_dir)?;
@@ -309,14 +415,28 @@ pub fn payload(session_dir: &Path, frame: u64, fmt: PayloadFmt) -> Result<()> {
         }
         (_, PayloadFmt::Hex) => {
             let bytes = log.payload_bytes(frame)?;
-            let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-            println!("{}", hex.join(" "));
+            print!("{}", hexdump(&bytes));
             Ok(())
         }
         (_, PayloadFmt::Base64) => {
             use base64::Engine;
             let bytes = log.payload_bytes(frame)?;
             println!("{}", base64::engine::general_purpose::STANDARD.encode(&bytes));
+            Ok(())
+        }
+        (_, PayloadFmt::Text) => {
+            let bytes = log.payload_bytes(frame)?;
+            print!("{}", String::from_utf8_lossy(&bytes));
+            Ok(())
+        }
+        // Auto: text endpoints (serial/logs) render as text; binary as hex+ASCII.
+        (_, PayloadFmt::Auto) => {
+            let bytes = log.payload_bytes(frame)?;
+            if reveng_core::text::is_texty(&bytes) {
+                print!("{}", String::from_utf8_lossy(&bytes));
+            } else {
+                print!("{}", hexdump(&bytes));
+            }
             Ok(())
         }
     }
@@ -335,7 +455,7 @@ pub fn diff(session_dir: &Path, a: u64, b: u64) -> Result<()> {
 
 /// `grep` — USB: frames whose payload contains a hex byte pattern; PCIe: events whose
 /// JSON line contains a substring.
-pub fn grep(session_dir: &Path, pattern: &str) -> Result<()> {
+pub fn grep(session_dir: &Path, pattern: &str, text: bool) -> Result<()> {
     let s = SessionReader::open(session_dir)?;
     let mut log = open_log(&s)?;
     let out = std::io::stdout();
@@ -343,13 +463,23 @@ pub fn grep(session_dir: &Path, pattern: &str) -> Result<()> {
 
     match &mut log {
         Log::Usb(reader) => {
-            let needle = parse_hex_pattern(pattern)
-                .context("USB grep pattern must be hex bytes, e.g. `12 01` or `1201`")?;
             let total = reader.len();
-            for i in 0..total {
-                // Scan raw payload cheaply; only fully decode the frames that match.
-                if contains_subslice(&reader.payload_at(i)?, &needle) {
-                    writeln!(w, "{}", serde_json::to_value(reader.frame_at(i)?)?)?;
+            if text {
+                // Text substring over the (UTF-8 lossy) payload.
+                for i in 0..total {
+                    let payload = reader.payload_at(i)?;
+                    if String::from_utf8_lossy(&payload).contains(pattern) {
+                        writeln!(w, "{}", serde_json::to_value(reader.frame_at(i)?)?)?;
+                    }
+                }
+            } else {
+                let needle = parse_hex_pattern(pattern)
+                    .context("USB grep pattern must be hex bytes, e.g. `12 01` or `1201`")?;
+                for i in 0..total {
+                    // Scan raw payload cheaply; only fully decode the frames that match.
+                    if contains_subslice(&reader.payload_at(i)?, &needle) {
+                        writeln!(w, "{}", serde_json::to_value(reader.frame_at(i)?)?)?;
+                    }
                 }
             }
         }

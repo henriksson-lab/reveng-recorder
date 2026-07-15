@@ -461,9 +461,9 @@ only slices are ever materialized.
 ### 8a.1 Query CLI (the agent's interface)
 
 ```
-reveng-rec ls                        # manifest — one line per checkpoint (read FIRST)
+reveng-rec ls                        # manifest — one line per checkpoint (read FIRST; co-logged sessions also show pcie=<idx>)
 reveng-rec notes                     # just the live notes typed while recording (JSONL: elapsed + anchored frame + text)
-reveng-rec show <ckpt>               # full checkpoint card (JSON)
+reveng-rec show <ckpt>               # full checkpoint card (JSON); co-logged sessions add extra_anchors (PCIe event decoded)
 reveng-rec frames --around <ckpt> -w 20   # decoded frames near a checkpoint
 reveng-rec frames --range 10400:10460
 reveng-rec diff <ckptA> <ckptB>      # frames that differ between two checkpoints
@@ -471,7 +471,13 @@ reveng-rec payload <frame> --format hex   # raw payload bytes of one frame
 reveng-rec grep <hexpattern>         # frames whose payload contains a byte pattern
 ```
 
-Output is bounded, decoded text (add `--format json|text|hex`). These commands are backed by
+**Text vs binary.** `payload` defaults to `--format auto`: endpoints that classify as text
+(`reveng_core::text::is_texty`, printable-ratio ≥ 0.85 — CDC-ACM serial, NMEA, AT commands, debug
+logs) render as text; binary renders as an `xxd`-style hex + ASCII gutter. `stream --text`
+reassembles an endpoint by newlines (the serial shape) instead of the binary logical framing, and
+`grep --text` matches a UTF-8 substring instead of a hex byte pattern.
+
+Output is bounded, decoded text (add `--format json|text|hex|auto`). These commands are backed by
 `index.sqlite` + byte-offset seeks into `usb.pcapng`, so they're O(1)-ish and never stream the whole
 capture. The viewer and the CLI share the same `export`/decode code path.
 
@@ -573,14 +579,25 @@ byte 4 is `0x50`." That correlation is what makes the decode loop converge inste
   index). Decoded header (dev/endpoint/transfer/dir/len/status) + hex/ASCII payload (seeked from
   `byte_offset` in the pcapng). Filter by endpoint/direction/transfer type.
 - **Notes** — captured live during recording, not after. The `record` USB path opens a small
-  Slint window (the primary recording surface: red REC indicator, elapsed clock, scrollback log of
-  notes, input box, Stop button). Typing a note + Enter stamps it on the master clock the instant
+  Slint window (the primary recording surface: red REC indicator, elapsed clock + growing session
+  size, a live **per-source rate/volume dashboard** — USB frames/s + PCIe events/s, MB, with a
+  "hot"/size warning so a PCIe firehose is visible and can't fill the disk unnoticed — a scrollback
+  log of notes, input box, Stop button). The dashboard shows *aggregates only, never contents*: the
+  window samples shared counters every 250 ms; the raw events stay in the logs, queried offline.
+  Each logged note also records where in the stream it landed (`usb <n> · pcie <n>`). Typing a note + Enter stamps it on the master clock the instant
   the key is pressed and stores it as a `Manual` checkpoint (`note` field) anchored to the frame
   live at that moment — so an agent can later correlate "what I said" against "what was on the wire"
   (`reveng-rec notes` / `ls`). While the notes window is focused, the global input hook suppresses
   keystroke/click checkpoints (the note itself is the record; Return/Tab/Esc don't trip triggers).
   Headless automation (`--max-seconds`, `REVENG_NO_NOTES_UI=1`) skips the window. The viewer renders
   the stored `note` on its checkpoint card.
+- **Device picker.** `record` launched with no device specified (and interactively) opens a Slint
+  checkbox picker listing enumerated USB + PCIe devices. The user ticks targets and clicks Start;
+  the recorder then relaunches itself (elevated via UAC if needed) with the chosen devices as
+  explicit args (`--device-vidpid …`, `--with-pcie --pci-bdf …`), so the relaunched process skips
+  the picker and records normally. Leaving everything unchecked records input + notes only. One
+  PCIe device can be co-logged. Bypass with an explicit device flag, `--no-capture`, headless mode
+  (`--max-seconds`/`REVENG_NO_NOTES_UI`), or `REVENG_NO_PICKER`.
 - **Parallel multi-device capture.** The USB `record` path opens one capture per USBPcap control
   device (root hub), each on its own reader thread, all folding into the single `usb.pcapng` on the
   shared clock (arrival-order merged index, timestamps clamped non-decreasing so `frames.idx` stays
@@ -588,6 +605,24 @@ byte 4 is `0x50`." That correlation is what makes the decode loop converge inste
   several sources at once. **Zero sources is just the empty case:** `--no-capture` (or no matching
   device) runs the whole pipeline — input, screenshots, notes, the window — with no USB capture and
   no admin, e.g. to exercise the UI or take an input/note-only recording.
+- **USB data-volume reduction (default lossless).** A camera's isochronous video endpoint (or a
+  bulk mass-storage stream) is a firehose, while the *protocol* lives on tiny control/interrupt
+  endpoints. Reduction is per-transfer-type/endpoint, opt-in: `--usb-snaplen <bytes>` truncates big
+  transfers in the kernel (control/interrupt untouched; the index keeps the original on-wire
+  length); `--drop-isoc`/`--drop-bulk` skip those transfer types entirely (the checkpoint
+  screenshots already capture a camera's output); `--endpoints 0x81,0x02` restricts to an
+  endpoint allow-list (direction-agnostic); `--usb-bufsize` enlarges the kernel buffer for bursts.
+  Dropped packets are counted and reported — never silent. Default (no flags) is byte-exact.
+- **USB + PCIe co-logging.** `record --with-pcie` captures a PCIe device *concurrently* with USB in
+  one session: a PCIe reader thread writes `pcie.bin`/`pcie.idx` on the same clock while the USB
+  hubs write `usb.pcapng`. Every checkpoint then gets a **secondary anchor** — `Checkpoint.anchors`
+  (a `Vec<TrafficAnchor>`, each source-tagged) holds the nearest preceding PCIe event, while
+  `anchor` stays the USB frame — so one click/note reaches *both* wires. `reveng-rec show` decodes
+  each anchor against its own log; `ls` hints the PCIe anchor; the viewer renders the co-logged
+  PCIe event under the checkpoint card. The secondary source is a live device (`--pci-backend drv`,
+  `--pci-bdf`/`--pci-vidpid`) or, portably, `--pcie-replay <events.jsonl>`. PCIe traffic also drives
+  interval checkpoints, and `--max-bytes` caps total captured bytes.
+  Single-source sessions serialize identically to before (`anchors` omitted when empty).
 - **Diff aid** — select two click checkpoints and diff the USB frames between them (great for
   "what's different between pressing button A vs button B").
 

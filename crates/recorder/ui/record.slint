@@ -1,24 +1,119 @@
-import { LineEdit, Button, ListView, VerticalBox, HorizontalBox } from "std-widgets.slint";
+import { LineEdit, Button, CheckBox, ListView, VerticalBox, HorizontalBox } from "std-widgets.slint";
 
-// One entered note: elapsed time (mm:ss) + the text. Filled from Rust.
+// One selectable device row in the picker.
+struct DevItem {
+    label: string,
+}
+
+// Shown when `record` is launched with no device specified: pick USB + PCIe capture targets.
+export component DevicePicker inherits Window {
+    title: "reveng-rec — select devices";
+    preferred-width: 580px;
+    preferred-height: 460px;
+    min-width: 420px;
+    min-height: 320px;
+
+    in property <[DevItem]> usb_devices;
+    in property <[DevItem]> pci_devices;
+    in property <string> usb_note; // e.g. "USBPcap not installed — …" (shown when set)
+    // (index, checked) reported to Rust as the user ticks boxes.
+    callback usb_toggled(int, bool);
+    callback pci_toggled(int, bool);
+    callback start();
+
+    VerticalBox {
+        padding: 10px;
+        spacing: 6px;
+
+        Text { text: "Select devices to capture"; font-weight: 700; font-size: 15px; }
+        Text {
+            text: "Recording keyboard, mouse, screen + the selected device traffic on this machine. Leave all unchecked to record input + notes only.";
+            wrap: word-wrap;
+            font-size: 11px;
+            color: #999999;
+        }
+
+        Text { text: "USB"; font-weight: 700; color: #6a9bd0; }
+        Text {
+            visible: root.usb_note != "";
+            text: root.usb_note;
+            wrap: word-wrap;
+            font-size: 11px;
+            color: #e0a020;
+        }
+        Rectangle {
+            vertical-stretch: 1;
+            background: #00000014;
+            border-radius: 4px;
+            ListView {
+                for it[idx] in root.usb_devices: CheckBox {
+                    text: it.label;
+                    toggled => {
+                        root.usb_toggled(idx, self.checked);
+                    }
+                }
+            }
+        }
+
+        Text { text: "PCIe (one device co-logged)"; font-weight: 700; color: #b58cd0; }
+        Rectangle {
+            vertical-stretch: 1;
+            background: #00000014;
+            border-radius: 4px;
+            ListView {
+                for it[idx] in root.pci_devices: CheckBox {
+                    text: it.label;
+                    toggled => {
+                        root.pci_toggled(idx, self.checked);
+                    }
+                }
+            }
+        }
+
+        HorizontalBox {
+            alignment: end;
+            Button {
+                text: "Start recording";
+                clicked => {
+                    root.start();
+                }
+            }
+        }
+    }
+}
+
+// One entered note: elapsed time (mm:ss), the text, and where in the stream it landed
+// (e.g. "usb 8.9k · pcie 900k"). Filled from Rust.
 struct NoteRow {
     time: string,
     text: string,
+    pos: string,
 }
 
-// The live "recording" window: a red REC indicator + elapsed clock, a scrollback log of
+// The live "recording" window: a red REC indicator + elapsed clock + session size, a
+// per-source rate/volume dashboard (essential once PCIe is firehosing), a scrollback log of
 // notes already entered, and an input box that stamps a note onto the capture on Enter.
 export component RecordWindow inherits Window {
     title: "reveng-rec — recording";
-    preferred-width: 460px;
-    preferred-height: 420px;
-    min-width: 360px;
-    min-height: 260px;
+    preferred-width: 520px;
+    preferred-height: 440px;
+    min-width: 380px;
+    min-height: 280px;
 
     in property <string> elapsed: "00:00";
     in property <string> status: "RECORDING";
     in property <bool> recording: true;
     in property <[NoteRow]> notes;
+
+    // Live capture-health dashboard (sampled by a Rust timer).
+    in property <string> size_text: "0 B";
+    in property <bool> size_warn: false;
+    in property <bool> usb_active: false;
+    in property <string> usb_stats: "";
+    in property <string> usb_endpoints: ""; // top endpoints by volume ("0x81 iso 1.2M · …")
+    in property <bool> pcie_active: false;
+    in property <string> pcie_stats: "";
+    in property <bool> pcie_hot: false; // PCIe rate high → warn colour
 
     // Enter pressed in the input box, with the note text.
     callback submit(string);
@@ -29,7 +124,7 @@ export component RecordWindow inherits Window {
         padding: 10px;
         spacing: 8px;
 
-        // Header: ● REC ......... mm:ss
+        // Header: ● REC ......... mm:ss · size
         HorizontalBox {
             spacing: 8px;
             Rectangle {
@@ -49,6 +144,51 @@ export component RecordWindow inherits Window {
                 text: root.elapsed;
                 font-family: "monospace";
                 vertical-alignment: center;
+            }
+            Text {
+                text: "·";
+                color: #888888;
+                vertical-alignment: center;
+            }
+            Text {
+                text: root.size_text;
+                font-family: "monospace";
+                color: root.size_warn ? #e0a020 : #999999;
+                vertical-alignment: center;
+            }
+        }
+
+        // Per-source rate / volume meters (aggregates only — never contents).
+        Rectangle {
+            visible: root.usb_active || root.pcie_active;
+            background: #00000014;
+            border-radius: 4px;
+            VerticalBox {
+                padding: 6px;
+                spacing: 2px;
+                HorizontalBox {
+                    visible: root.usb_active;
+                    spacing: 6px;
+                    Text { text: "USB"; font-weight: 700; color: #6a9bd0; min-width: 40px; }
+                    Text { text: root.usb_stats; font-family: "monospace"; }
+                }
+                Text {
+                    visible: root.usb_active && root.usb_endpoints != "";
+                    text: root.usb_endpoints;
+                    font-family: "monospace";
+                    font-size: 11px;
+                    color: #888888;
+                }
+                HorizontalBox {
+                    visible: root.pcie_active;
+                    spacing: 6px;
+                    Text { text: "PCIe"; font-weight: 700; color: #b58cd0; min-width: 40px; }
+                    Text {
+                        text: root.pcie_stats;
+                        font-family: "monospace";
+                        color: root.pcie_hot ? #e0a020 : #ffffff;
+                    }
+                }
             }
         }
 
@@ -76,6 +216,12 @@ export component RecordWindow inherits Window {
                     text: row.text;
                     wrap: word-wrap;
                     horizontal-stretch: 1;
+                }
+                Text {
+                    text: row.pos;
+                    font-family: "monospace";
+                    font-size: 11px;
+                    color: #888888;
                 }
             }
         }

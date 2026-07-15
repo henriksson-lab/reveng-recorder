@@ -51,6 +51,7 @@ fn main() -> anyhow::Result<()> {
                 event_index: ei,
                 byte_offset: bo,
             }),
+            anchors: Vec::new(),
             screenshot_id: None,
             fg_process: Some("Vendor.exe".into()),
             fg_window: Some("Device Config".into()),

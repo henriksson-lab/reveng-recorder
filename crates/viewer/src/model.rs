@@ -4,6 +4,7 @@
 
 use anyhow::Result;
 use reveng_core::checkpoint::{Checkpoint, CheckpointType};
+use reveng_core::event::SourceKind;
 use reveng_core::session::SessionReader;
 use reveng_pcicap::PcieLog;
 use reveng_usbcap::UsbReader;
@@ -28,6 +29,9 @@ pub struct SessionModel {
     pub checkpoints: Vec<Checkpoint>,
     pub total_frames: u64,
     backend: Backend,
+    /// Co-logged PCIe log (present when USB is primary but a `pcie.bin` exists too), used to
+    /// resolve a checkpoint's secondary anchors (`Checkpoint.anchors`).
+    secondary_pcie: Option<PcieLog>,
 }
 
 impl SessionModel {
@@ -51,13 +55,42 @@ impl SessionModel {
             Backend::None => 0,
         };
 
+        // Co-logged session: USB is primary, but PCIe events were recorded alongside. Open
+        // the PCIe log too so secondary anchors can be resolved.
+        let secondary_pcie = if matches!(backend, Backend::Usb(_)) && reader.pcie_bin().exists() {
+            PcieLog::open(reader.pcie_bin(), reader.pcie_idx()).ok()
+        } else {
+            None
+        };
+
         Ok(Self {
             root,
             source,
             checkpoints,
             total_frames,
             backend,
+            secondary_pcie,
         })
+    }
+
+    /// Decoded secondary anchors — the co-logged PCIe events referenced by a checkpoint's
+    /// `anchors` — so one checkpoint shows both wires (DESIGN.md §7 co-logging).
+    pub fn secondary_rows(&mut self, ckpt: &Checkpoint) -> Result<Vec<InspectorRow>> {
+        let Some(log) = &mut self.secondary_pcie else {
+            return Ok(Vec::new());
+        };
+        let mut rows = Vec::new();
+        for a in &ckpt.anchors {
+            if a.source == SourceKind::Pcie {
+                let ev = log.event_at(a.event_index)?;
+                rows.push(InspectorRow {
+                    index: a.event_index,
+                    header: format!("pcie #{} {}", a.event_index, serde_json::to_string(&ev)?),
+                    hex: String::new(),
+                });
+            }
+        }
+        Ok(rows)
     }
 
     /// Absolute path to a checkpoint's screenshot, if it has one and the file exists.
@@ -176,6 +209,7 @@ mod tests {
                     event_index: 2,
                     byte_offset: offs[2],
                 }),
+                anchors: Vec::new(),
                 screenshot_id: None,
                 fg_process: None,
                 fg_window: None,
@@ -195,6 +229,55 @@ mod tests {
         assert_eq!(rows[1].index, 2);
         assert_eq!(rows[2].index, 3);
         assert!(rows[1].hex.contains("02 02 02"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn model_resolves_secondary_pcie_anchor() {
+        use reveng_core::event::PcieEvent;
+
+        let dir = std::env::temp_dir().join("reveng_viewer_secondary_test");
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut session = SessionWriter::create(&dir).unwrap();
+
+        // USB primary (one frame) + a co-logged PCIe event.
+        let mut usb = UsbWriter::create(session.usb_pcapng(), session.frames_idx()).unwrap();
+        usb.append_packet(1_000_000, &packet(0x81, &[9, 9, 9])).unwrap();
+        usb.flush().unwrap();
+        let mut pl = PcieLog::create(session.pcie_bin(), session.pcie_idx()).unwrap();
+        pl.append(&PcieEvent::Irq { ts_ns: 500_000, vector: 129 }).unwrap();
+
+        session
+            .append_record(&SessionRecord::Checkpoint(Checkpoint {
+                id: 0,
+                ts_ns: 900_000,
+                kind: CheckpointType::Manual,
+                cause: "note".into(),
+                anchor: Some(TrafficAnchor {
+                    source: SourceKind::Usb,
+                    event_index: 0,
+                    byte_offset: 0,
+                }),
+                anchors: vec![TrafficAnchor {
+                    source: SourceKind::Pcie,
+                    event_index: 0,
+                    byte_offset: 0,
+                }],
+                screenshot_id: None,
+                fg_process: None,
+                fg_window: None,
+                cursor: (0, 0),
+                note: Some("n".into()),
+            }))
+            .unwrap();
+
+        let mut m = SessionModel::open(&dir).unwrap();
+        assert_eq!(m.source, "usb"); // USB stays primary
+        let ck = m.checkpoints[0].clone();
+        let rows = m.secondary_rows(&ck).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].header.contains("irq") && rows[0].header.contains("129"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

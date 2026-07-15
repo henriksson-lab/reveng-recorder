@@ -64,12 +64,15 @@ enum Cmd {
         ep: String,
         #[arg(long)]
         logical: bool,
+        /// Reassemble as text: concatenate the endpoint and split on newlines (serial/logs).
+        #[arg(long)]
+        text: bool,
     },
     /// Raw payload bytes of one frame.
     Payload {
         session: PathBuf,
         frame: u64,
-        #[arg(long, value_enum, default_value_t = OutFormat::Hex)]
+        #[arg(long, value_enum, default_value_t = OutFormat::Auto)]
         format: OutFormat,
     },
     /// Frames that differ between two checkpoints.
@@ -86,8 +89,14 @@ enum Cmd {
         #[arg(long)]
         ep: Option<String>,
     },
-    /// Find frames whose payload contains a byte pattern.
-    Grep { session: PathBuf, pattern: String },
+    /// Find frames whose payload contains a byte pattern (or text substring with --text).
+    Grep {
+        session: PathBuf,
+        pattern: String,
+        /// Match the pattern as a text substring instead of hex bytes.
+        #[arg(long)]
+        text: bool,
+    },
     /// Rebuild index.sqlite / *.idx from the raw truth.
     Reindex { session: PathBuf },
     /// Export a pcapng slice / open Wireshark at a frame.
@@ -130,6 +139,8 @@ enum OutFormat {
     Hex,
     Base64,
     Bin,
+    /// Text if the payload classifies as texty, else hex (payload default).
+    Auto,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -271,6 +282,36 @@ struct RecordArgs {
     #[arg(long)]
     no_capture: bool,
 
+    // ---- USB data-volume reduction (default lossless; opt-in) ----
+    /// Driver snaplen: bytes captured per USB transfer (0 = unlimited, lossless). A small cap
+    /// (e.g. 256) truncates bulk/isoc firehoses (camera/audio) in the kernel while keeping
+    /// control/interrupt intact; the index still records the original on-wire length.
+    #[arg(long, default_value_t = 0)]
+    usb_snaplen: u32,
+    /// Driver kernel buffer size in bytes (0 = default). Larger tolerates bursts.
+    #[arg(long, default_value_t = 0)]
+    usb_bufsize: u32,
+    /// Drop isochronous transfers (camera/audio streaming payload) before writing.
+    #[arg(long)]
+    drop_isoc: bool,
+    /// Drop bulk transfers before writing.
+    #[arg(long)]
+    drop_bulk: bool,
+    /// Opt-in adaptive reduction: keep everything lossless except apply a header-only snaplen
+    /// (256 B if unset) and drop isochronous transfers — for high-bandwidth devices (cameras).
+    #[arg(long)]
+    auto_truncate: bool,
+
+    /// Also capture PCIe concurrently with USB, co-logged into the same session — both wires on
+    /// one timeline, each checkpoint anchored to both. Uses the PCIe selection flags
+    /// (`--pci-backend drv`, `--pci-bdf`/`--pci-vidpid`, `--trace-mmio`/`--trace-dma`), or
+    /// `--pcie-replay <file>` for a portable replayed PCIe stream.
+    #[arg(long)]
+    with_pcie: bool,
+    /// Co-log a replayed PCIe event JSONL (with `--with-pcie`) instead of a live PCIe device.
+    #[arg(long)]
+    pcie_replay: Option<PathBuf>,
+
     #[arg(long)]
     out: Option<PathBuf>,
     #[arg(long)]
@@ -282,6 +323,10 @@ struct RecordArgs {
     /// stop hotkey Ctrl+Alt+Pause).
     #[arg(long)]
     max_seconds: Option<u64>,
+
+    /// Stop once total captured traffic (USB + PCIe) reaches this many bytes (size budget).
+    #[arg(long)]
+    max_bytes: Option<u64>,
 
     #[arg(long)]
     config: Option<PathBuf>,
@@ -321,7 +366,8 @@ fn run() -> anyhow::Result<()> {
             session,
             ep,
             logical,
-        } => query::stream(&session, parse_bar(Some(&ep)), logical),
+            text,
+        } => query::stream(&session, parse_bar(Some(&ep)), logical, text),
         Cmd::Payload {
             session,
             frame,
@@ -335,7 +381,11 @@ fn run() -> anyhow::Result<()> {
             ep,
         } => query::decode(&session, with.as_deref(), ksy.as_deref(), parse_bar(ep.as_deref())),
         // note: Decode.with is a command string (see below)
-        Cmd::Grep { session, pattern } => query::grep(&session, &pattern),
+        Cmd::Grep {
+            session,
+            pattern,
+            text,
+        } => query::grep(&session, &pattern, text),
         Cmd::Reindex { session } => query::reindex(&session),
         Cmd::Export {
             session,
@@ -535,20 +585,47 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             }
         }
         Source::Usb => {
+            // Launched with no device specified (and interactive)? Show a checkbox picker of USB +
+            // PCIe devices, then relaunch with the chosen ones as explicit args (elevated if
+            // needed) — the relaunched process has explicit devices and skips the picker.
+            #[cfg(windows)]
+            {
+                let bare = args.usbpcap_device.is_none()
+                    && args.device_vidpid.is_empty()
+                    && args.device_address.is_empty()
+                    && !args.all_devices
+                    && !args.no_capture
+                    && !args.with_pcie
+                    && args.pcie_replay.is_none();
+                let interactive = args.max_seconds.is_none()
+                    && std::env::var_os("REVENG_NO_NOTES_UI").is_none()
+                    && std::env::var_os("REVENG_NO_PICKER").is_none();
+                if bare && interactive {
+                    if let Some(code) = run_device_picker_and_relaunch()? {
+                        std::process::exit(code);
+                    }
+                    // (no devices to pick → fall through to the window-only path)
+                }
+            }
+
             let out = args.out.clone().unwrap_or_else(default_session_dir);
             let opts = build_usb_opts(&args, cfg)?;
 
-            // Passive USB capture opens \\.\USBPcapN, which needs admin. Only elevate when we
-            // actually have a source to open — a window-only run (no matching device, or
-            // --no-capture) needs no admin. If not elevated, relaunch through UAC rather than
-            // making the user open an elevated shell. `REVENG_NO_ELEVATE` opts out.
+            // A live PCIe co-capture (drv backend, not replay) also opens a kernel device that
+            // needs admin.
+            let pcie_live = args.with_pcie && args.pcie_replay.is_none();
+
+            // USBPcap + the PCIe driver open kernel devices that need admin. Only elevate when we
+            // actually have something live to open — a window-only run (no matching device, or
+            // --no-capture) with no live PCIe needs no admin. If not elevated, relaunch through
+            // UAC rather than making the user open an elevated shell. `REVENG_NO_ELEVATE` opts out.
             #[cfg(windows)]
             {
-                if !opts.selections.is_empty()
+                if (!opts.selections.is_empty() || pcie_live)
                     && !elevate::is_elevated()
                     && std::env::var_os("REVENG_NO_ELEVATE").is_none()
                 {
-                    eprintln!("USB capture needs administrator rights — requesting elevation…");
+                    eprintln!("capture needs administrator rights — requesting elevation…");
                     let forward: Vec<String> = std::env::args().skip(1).collect();
                     let code = elevate::relaunch_elevated(&forward)?;
                     std::process::exit(code as i32);
@@ -564,6 +641,11 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             }
 
             let clock = Clock::start();
+            let pcie = build_pcie_capture(&args, &clock)?;
+            let pcie_active = pcie.is_some();
+            if pcie_active {
+                eprintln!("co-logging PCIe into the same session");
+            }
 
             // Interactive runs get the Slint notes window; automation (`--max-seconds`) and
             // `REVENG_NO_NOTES_UI=1` run headless (no window, capture on this thread).
@@ -571,19 +653,26 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                 opts.max_duration.is_some() || std::env::var_os("REVENG_NO_NOTES_UI").is_some();
 
             let summary = if headless {
-                record_usb::run_usb_capture(clock, &out, opts, None)?
+                record_usb::run_usb_capture(clock, &out, opts, None, pcie)?
             } else {
                 #[cfg(windows)]
                 {
                     let worker_clock = clock.clone();
                     let out2 = out.clone();
-                    notes_ui::run_recording_window(clock, move |ui| {
-                        record_usb::run_usb_capture(worker_clock, &out2, opts, Some(ui))
-                    })?
+                    let usb_active = !opts.selections.is_empty();
+                    notes_ui::run_recording_window(
+                        clock,
+                        out.clone(),
+                        usb_active,
+                        pcie_active,
+                        move |ui| {
+                            record_usb::run_usb_capture(worker_clock, &out2, opts, Some(ui), pcie)
+                        },
+                    )?
                 }
                 #[cfg(not(windows))]
                 {
-                    record_usb::run_usb_capture(clock, &out, opts, None)?
+                    record_usb::run_usb_capture(clock, &out, opts, None, pcie)?
                 }
             };
             eprintln!(
@@ -597,11 +686,112 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
     }
 }
 
+/// Enumerate USB + PCIe devices, show the picker, and relaunch with the chosen devices as
+/// explicit args (elevated if not already). Returns `Some(exit_code)` when the picker ran (the
+/// caller should exit with it), or `None` when there was nothing to pick (fall through to the
+/// window-only path). Opt out with `REVENG_NO_PICKER`.
+#[cfg(windows)]
+fn run_device_picker_and_relaunch() -> anyhow::Result<Option<i32>> {
+    let usb: Vec<(String, String)> = reveng_usbcap::list_devices()
+        .unwrap_or_default()
+        .iter()
+        .filter(|d| !d.usbpcap.is_empty())
+        .map(|d| {
+            (
+                format!("{}:{} {}  (bus {} addr {})", d.vid, d.pid, d.product, d.bus, d.address),
+                format!("{}:{}", d.vid, d.pid),
+            )
+        })
+        .collect();
+    let pci: Vec<(String, String)> = reveng_pcicap::list_pci_devices()
+        .unwrap_or_default()
+        .iter()
+        .filter(|d| !d.vid.is_empty())
+        .map(|d| (format!("{}  {}:{}  {}", d.bdf, d.vid, d.pid, d.description), d.bdf.clone()))
+        .collect();
+
+    if usb.is_empty() && pci.is_empty() {
+        return Ok(None); // nothing to pick — caller records input + notes only
+    }
+
+    // If there are no USB capture devices, tell the user why — most often USBPcap isn't installed
+    // (or it is, but the post-install reboot is still pending).
+    let usb_note = if !usb.is_empty() {
+        ""
+    } else if usbpcap_installed() {
+        "USBPcap is installed but no capture devices are attached yet — reboot to enable USB capture."
+    } else {
+        "USBPcap driver not installed — USB capture unavailable. Install it (PowerShell: \
+         scripts/get-usbpcap.ps1, or https://desowin.org/usbpcap/), reboot, then relaunch."
+    };
+
+    let choice = match notes_ui::run_device_picker(usb, pci, usb_note)? {
+        Some(c) => c,
+        None => return Ok(Some(0)), // user closed the picker
+    };
+
+    // Preserve any other flags the user passed; append the chosen devices.
+    let mut fwd: Vec<String> = std::env::args().skip(1).collect();
+    if choice.usb_vidpids.is_empty() && choice.pci_bdf.is_none() {
+        fwd.push("--no-capture".into());
+    } else {
+        for vp in &choice.usb_vidpids {
+            fwd.push("--device-vidpid".into());
+            fwd.push(vp.clone());
+        }
+        if let Some(bdf) = &choice.pci_bdf {
+            fwd.push("--with-pcie".into());
+            fwd.push("--pci-bdf".into());
+            fwd.push(bdf.clone());
+        }
+    }
+
+    // Relaunch with explicit devices (elevated if we aren't already) → the child skips the picker.
+    if !elevate::is_elevated() && std::env::var_os("REVENG_NO_ELEVATE").is_none() {
+        Ok(Some(elevate::relaunch_elevated(&fwd)? as i32))
+    } else {
+        let exe = std::env::current_exe()?;
+        let status = std::process::Command::new(exe).args(&fwd).status()?;
+        Ok(Some(status.code().unwrap_or(1)))
+    }
+}
+
+/// Is the USBPcap kernel driver installed? Detected by the presence of `USBPcap.sys` in the
+/// system drivers directory — true whether or not the post-install reboot has happened yet.
+#[cfg(windows)]
+fn usbpcap_installed() -> bool {
+    let sysroot = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    std::path::Path::new(&sysroot)
+        .join("System32")
+        .join("drivers")
+        .join("USBPcap.sys")
+        .exists()
+}
+
 /// Assemble the live-USB recording options from CLI args.
 fn build_usb_opts(
     args: &RecordArgs,
     cfg: CheckpointConfig,
 ) -> anyhow::Result<record_usb::UsbRecordOpts> {
+    let mut snaplen = args.usb_snaplen;
+    let mut drop_transfers = Vec::new();
+    if args.drop_isoc {
+        drop_transfers.push(reveng_usbcap::XFER_ISO);
+    }
+    if args.drop_bulk {
+        drop_transfers.push(reveng_usbcap::XFER_BULK);
+    }
+    // Adaptive preset: header-only cap + drop isoc, opt-in (default stays lossless).
+    if args.auto_truncate {
+        if snaplen == 0 {
+            snaplen = 256;
+        }
+        if !drop_transfers.contains(&reveng_usbcap::XFER_ISO) {
+            drop_transfers.push(reveng_usbcap::XFER_ISO);
+        }
+        eprintln!("--auto-truncate: snaplen {snaplen} B + dropping isoc (control/interrupt kept full)");
+    }
+
     Ok(record_usb::UsbRecordOpts {
         selections: build_usb_selections(args)?,
         cfg,
@@ -620,7 +810,29 @@ fn build_usb_opts(
         min_interval_ms: args.screenshot_min_interval_ms,
         stop_vk: 0x13, // VK_PAUSE (Ctrl+Alt+Pause)
         max_duration: args.max_seconds.map(std::time::Duration::from_secs),
+        snaplen,
+        buffer: args.usb_bufsize,
+        drop_transfers,
+        endpoints: parse_endpoints(args.endpoints.as_deref()),
+        max_bytes: args.max_bytes,
     })
+}
+
+/// Parse `--endpoints` (comma-separated endpoint numbers, hex `0x81` or decimal) into a
+/// direction-agnostic (`0x0F`-masked) allow-list. `None`/empty = capture all endpoints.
+fn parse_endpoints(s: Option<&str>) -> Option<Vec<u8>> {
+    let list: Vec<u8> = split_csv(s?)
+        .iter()
+        .filter_map(|t| {
+            let v = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+                u8::from_str_radix(h, 16).ok()
+            } else {
+                t.parse::<u8>().ok()
+            }?;
+            Some(v & 0x0F)
+        })
+        .collect();
+    (!list.is_empty()).then_some(list)
 }
 
 /// Resolve the CLI device selection into one [`UsbSelection`] per USBPcap control device
@@ -701,6 +913,89 @@ fn build_usb_selections(args: &RecordArgs) -> anyhow::Result<Vec<reveng_usbcap::
             all_devices: h.all,
         })
         .collect())
+}
+
+/// Build the optional concurrent PCIe capture (`--with-pcie`) to co-log alongside USB, sharing
+/// the USB session's clock. `--pcie-replay` uses a portable replayed stream (works anywhere);
+/// otherwise a live device via the `drv` backend (Windows + reveng-pcidrv). The source is
+/// `start()`ed here so open errors surface before the pipeline spins up. Returns `None` when
+/// `--with-pcie` wasn't requested.
+fn build_pcie_capture(
+    args: &RecordArgs,
+    clock: &Clock,
+) -> anyhow::Result<Option<record_usb::PcieCapture>> {
+    use reveng_core::source::CaptureSource;
+
+    if !args.with_pcie {
+        return Ok(None);
+    }
+
+    // Portable replayed PCIe stream (works anywhere; the kernel-free way to exercise co-logging).
+    if let Some(replay) = &args.pcie_replay {
+        let mut source = reveng_pcicap::ReplayPcieSource::from_path(replay)?;
+        if let Err(e) = source.start() {
+            eprintln!("PCIe co-capture disabled (replay start failed): {e}");
+            return Ok(None);
+        }
+        return Ok(Some(record_usb::PcieCapture {
+            source: Box::new(source),
+            stop: Box::new(|| {}),
+            meta: serde_json::json!({
+                "acquisition": "replay",
+                "replay_file": replay.display().to_string(),
+            }),
+        }));
+    }
+
+    // Live PCIe device (Windows + reveng-pcidrv), stamped on the shared session clock.
+    #[cfg(windows)]
+    {
+        match args.pci_backend {
+            PciBackend::Drv => {
+                let target = resolve_pci_target(args)?;
+                let mut source = reveng_pcicap::drv::DrvPcieSource::new_live(
+                    target,
+                    clock.clone(),
+                    None, // unbounded — the USB session drives stop
+                    args.trace_mmio,
+                    args.trace_dma,
+                );
+                // Fault-tolerant: a PCIe open failure must not abort the USB recording.
+                if let Err(e) = source.start() {
+                    eprintln!("PCIe co-capture disabled (driver start failed): {e}");
+                    return Ok(None);
+                }
+                let killer = source.killer();
+                let stop: Box<dyn Fn() + Send + Sync> = Box::new(move || {
+                    if let Some(k) = &killer {
+                        k.kill();
+                    }
+                });
+                Ok(Some(record_usb::PcieCapture {
+                    source: Box::new(source),
+                    stop,
+                    meta: serde_json::json!({
+                        "acquisition": "pcidrv",
+                        "trace_mmio": args.trace_mmio,
+                        "trace_dma": args.trace_dma,
+                        "target": format!(
+                            "{:04x}:{:02x}:{:02x}.{}",
+                            target.segment, target.bus, target.device, target.function
+                        ),
+                    }),
+                }))
+            }
+            PciBackend::Etw => anyhow::bail!(
+                "--with-pcie supports the drv backend or --pcie-replay; etw isn't wired as a \
+                 concurrent secondary yet"
+            ),
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = clock;
+        anyhow::bail!("live --with-pcie requires Windows; use --pcie-replay on other platforms")
+    }
 }
 
 /// Resolve the live PCIe capture target (BDF) from `--pci-bdf` or `--pci-vidpid`.
@@ -846,6 +1141,8 @@ fn payload_fmt(f: OutFormat) -> query::PayloadFmt {
         OutFormat::Hex => query::PayloadFmt::Hex,
         OutFormat::Bin => query::PayloadFmt::Bin,
         OutFormat::Base64 => query::PayloadFmt::Base64,
-        OutFormat::Json | OutFormat::Text => query::PayloadFmt::Json,
+        OutFormat::Text => query::PayloadFmt::Text,
+        OutFormat::Auto => query::PayloadFmt::Auto,
+        OutFormat::Json => query::PayloadFmt::Json,
     }
 }

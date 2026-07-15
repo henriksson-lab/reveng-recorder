@@ -11,6 +11,7 @@ pub mod index;
 pub mod input;
 pub mod session;
 pub mod source;
+pub mod text;
 
 pub use checkpoint::{Checkpoint, CheckpointConfig, CheckpointType, IntervalTracker};
 pub use clock::Clock;

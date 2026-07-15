@@ -39,6 +39,7 @@ struct App {
     sel: usize,
     window: u64,
     rows: Vec<model::InspectorRow>,
+    secondary_rows: Vec<model::InspectorRow>,
     tex: Option<egui::TextureHandle>,
     loaded_for: Option<usize>,
 }
@@ -50,6 +51,7 @@ impl App {
             sel: 0,
             window: 20,
             rows: Vec::new(),
+            secondary_rows: Vec::new(),
             tex: None,
             loaded_for: None,
         }
@@ -63,6 +65,7 @@ impl App {
         }
         let ckpt = self.model.checkpoints[self.sel].clone();
         self.rows = self.model.frames_around(&ckpt, self.window).unwrap_or_default();
+        self.secondary_rows = self.model.secondary_rows(&ckpt).unwrap_or_default();
 
         self.tex = None;
         if let Some(path) = self.model.screenshot_path(&ckpt) {
@@ -221,6 +224,19 @@ impl eframe::App for App {
                         ui.weak("(no anchored traffic for this checkpoint)");
                     }
                 });
+
+                // Co-logged PCIe events anchored to this same checkpoint (both wires).
+                if !self.secondary_rows.is_empty() {
+                    ui.separator();
+                    ui.strong("Co-logged PCIe at this checkpoint");
+                    for row in &self.secondary_rows {
+                        ui.label(
+                            egui::RichText::new(&row.header)
+                                .monospace()
+                                .color(egui::Color32::from_rgb(181, 140, 208)),
+                        );
+                    }
+                }
             } else {
                 ui.centered_and_justified(|ui| ui.label("session has no checkpoints"));
             }

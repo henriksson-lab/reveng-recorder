@@ -115,6 +115,7 @@ fn record_pcie(
             kind,
             cause: cause.to_string(),
             anchor,
+            anchors: Vec::new(),
             screenshot_id: None,
             fg_process: None,
             fg_window: None,
@@ -216,8 +217,9 @@ fn record_pcie(
     })
 }
 
-/// A nominal byte count for a PCIe event, used to drive interval checkpoints.
-fn event_bytes(ev: &reveng_core::event::PcieEvent) -> u64 {
+/// A nominal byte count for a PCIe event, used to drive interval checkpoints and the live
+/// throughput meter.
+pub(crate) fn event_bytes(ev: &reveng_core::event::PcieEvent) -> u64 {
     use reveng_core::event::PcieEvent::*;
     match *ev {
         Mmio { width, .. } => width as u64,

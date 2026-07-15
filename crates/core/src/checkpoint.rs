@@ -20,9 +20,14 @@ pub struct Checkpoint {
     pub ts_ns: i64,
     pub kind: CheckpointType,
     pub cause: String,
-    /// Nearest preceding traffic event — source-agnostic (DESIGN.md §7).
+    /// Nearest preceding traffic event in the primary log — source-agnostic (DESIGN.md §7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub anchor: Option<TrafficAnchor>,
+    /// Additional anchors into other logs captured concurrently — e.g. the nearest preceding
+    /// PCIe event when USB + PCIe are co-logged. `anchor` stays the base (USB) source; this
+    /// carries the rest, so one checkpoint reaches both wires. Empty for single-source sessions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anchors: Vec<TrafficAnchor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]

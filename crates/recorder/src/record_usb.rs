@@ -14,10 +14,11 @@ use crate::record::RecordSummary;
 use anyhow::Result;
 use reveng_core::checkpoint::{Checkpoint, CheckpointConfig, CheckpointType};
 use reveng_core::clock::Clock;
-use reveng_core::event::{SourceKind, TrafficAnchor};
+use reveng_core::event::{SourceKind, TrafficAnchor, TrafficKind, UsbFrameHeader};
 use reveng_core::index::IndexFile;
 use reveng_core::session::{SessionRecord, SessionWriter};
 use reveng_core::source::CaptureSource;
+use reveng_pcicap::PcieLog;
 use reveng_usbcap::{Killer, UsbCaptureSource, UsbIdxRecord, UsbSelection, UsbWriter};
 use reveng_winput::{InputEvent, InputKind};
 use std::path::Path;
@@ -50,6 +51,16 @@ pub struct UsbRecordOpts {
     pub stop_vk: u16,
     /// Optional bounded capture (for automation/tests); `None` = until stop hotkey.
     pub max_duration: Option<Duration>,
+    /// Driver snaplen in bytes (`0` = unlimited default). Truncates big transfers in the kernel.
+    pub snaplen: u32,
+    /// Driver kernel buffer size in bytes (`0` = default).
+    pub buffer: u32,
+    /// USBPcap transfer-type codes to drop before writing (e.g. isoc). Empty = keep all.
+    pub drop_transfers: Vec<u8>,
+    /// If set, capture only these endpoint numbers (direction-agnostic, `0x0F`-masked).
+    pub endpoints: Option<Vec<u8>>,
+    /// Stop once total captured traffic bytes (USB + PCIe) reach this budget. `None` = no cap.
+    pub max_bytes: Option<u64>,
 }
 
 /// Wiring from the live "recording" note window (`notes_ui`) into the capture loop.
@@ -60,6 +71,86 @@ pub struct NotesUi {
     pub note_rx: Receiver<(i64, String)>,
     /// Set by the window's Stop button / close; a stop condition for the capture loop.
     pub stop_flag: Arc<AtomicBool>,
+    /// Live per-source counters the window samples to render its rate/volume dashboard —
+    /// essential once PCIe is firehosing tens of thousands of events/sec.
+    pub stats: Arc<Mutex<LiveStats>>,
+}
+
+/// Per-endpoint capture tally (identifies *which* endpoint is the firehose).
+#[derive(Default, Clone, Copy)]
+pub struct EpStat {
+    pub frames: u64,
+    pub bytes: u64,
+    /// USBPcap transfer-type code last seen on this endpoint (0=iso 1=intr 2=ctrl 3=bulk).
+    pub transfer: u8,
+}
+
+/// Monotonic per-source capture counters, published by the reader threads and sampled by the
+/// recording window (rates are computed there from deltas). Aggregates only — never contents.
+#[derive(Default)]
+pub struct LiveStats {
+    pub usb_frames: u64,
+    pub usb_bytes: u64,
+    pub usb_dropped: u64,
+    /// Per-endpoint (by endpoint byte) frame/byte tallies, for the dashboard + hot-endpoint hint.
+    pub usb_by_ep: std::collections::BTreeMap<u8, EpStat>,
+    pub pcie_events: u64,
+    pub pcie_bytes: u64,
+}
+
+/// Capture-side packet filter (reduction for high-data devices like cameras): drop chosen
+/// transfer types (e.g. isoc) and/or restrict to an endpoint allow-list. Empty = keep all
+/// (the lossless default). Never silent — drops are counted and surfaced.
+#[derive(Clone, Default)]
+pub struct PacketFilter {
+    /// USBPcap transfer-type codes to drop (0=iso 1=intr 2=ctrl 3=bulk).
+    pub drop_transfers: Vec<u8>,
+    /// Endpoint numbers to keep (direction-agnostic); `None` = all endpoints.
+    pub endpoints: Option<Vec<u8>>,
+}
+
+impl PacketFilter {
+    fn is_active(&self) -> bool {
+        !self.drop_transfers.is_empty() || self.endpoints.is_some()
+    }
+}
+
+/// Should this packet be kept? Unparseable headers are always kept (never lose data we can't
+/// classify). Endpoint matching is direction-agnostic (`0x0F`-masked). Pure — unit-tested.
+fn keep_packet(header: Option<&UsbFrameHeader>, filter: &PacketFilter) -> bool {
+    let Some(h) = header else {
+        return true;
+    };
+    if filter.drop_transfers.contains(&h.transfer) {
+        return false;
+    }
+    if let Some(allow) = &filter.endpoints {
+        if !allow.contains(&(h.endpoint & 0x0F)) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A PCIe source captured *concurrently* with USB (`--with-pcie`), folded into the same
+/// session on the shared clock. Its own reader thread writes `pcie.bin`/`pcie.idx`, and every
+/// checkpoint gains a secondary anchor to the nearest preceding PCIe event, so one checkpoint
+/// reaches both wires. The source is already `start()`ed by the caller; `stop` unblocks a
+/// parked `next()` at finalize (e.g. `CancelIoEx` for the driver backend).
+pub struct PcieCapture {
+    pub source: Box<dyn CaptureSource + Send>,
+    pub stop: Box<dyn Fn() + Send + Sync>,
+    /// Extra `meta.json` fields describing the PCIe acquisition.
+    pub meta: serde_json::Value,
+}
+
+/// Shared PCIe-reader→engine state: the latest PCIe event, for secondary-anchor resolution.
+#[derive(Default)]
+struct PcieState {
+    latest_index: Option<u64>,
+    latest_offset: u64,
+    /// Total PCIe event bytes seen (for the `--max-bytes` budget).
+    total_bytes: u64,
 }
 
 /// Shared, readers→engine traffic state (the `bytes_since_ckpt` counter + latest frame).
@@ -74,8 +165,12 @@ struct TrafficState {
     bytes_since: u64,
     /// Highest timestamp written so far (merged-index monotonicity clamp).
     last_ts: i64,
+    /// Total USB payload bytes written (for the `--max-bytes` budget).
+    total_bytes: u64,
     /// Reader threads still running; when it reaches 0 (all sources ended) the session is done.
     active_sources: usize,
+    /// Packets dropped by the capture-side filter (transfer-type / endpoint), for the summary.
+    dropped: u64,
     done: bool,
 }
 
@@ -84,11 +179,12 @@ pub fn run_usb_capture(
     out: &Path,
     opts: UsbRecordOpts,
     ui: Option<NotesUi>,
+    pcie: Option<PcieCapture>,
 ) -> Result<RecordSummary> {
     // The clock is created by the caller so the notes window shares this exact origin.
-    let (note_rx, ui_stop) = match ui {
-        Some(u) => (Some(u.note_rx), Some(u.stop_flag)),
-        None => (None, None),
+    let (note_rx, ui_stop, stats) = match ui {
+        Some(u) => (Some(u.note_rx), Some(u.stop_flag), Some(u.stats)),
+        None => (None, None, None),
     };
     let session = SessionWriter::create(out)?;
     let shots_dir = session.screenshots_dir();
@@ -106,9 +202,14 @@ pub fn run_usb_capture(
     // Start each selected control device, skipping (not aborting on) any that fail — one hub
     // that won't open must not take down the others. Collect the survivors, then create the
     // shared writer only if at least one opened (else it's the no-capture case).
+    let filter = PacketFilter {
+        drop_transfers: opts.drop_transfers.clone(),
+        endpoints: opts.endpoints.clone(),
+    };
     let mut sources = Vec::new();
     for selection in &opts.selections {
         let mut source = UsbCaptureSource::new(selection.clone(), clock.clone());
+        source.set_capture_opts(opts.snaplen, opts.buffer);
         match source.start() {
             Ok(()) => sources.push(source),
             Err(e) => eprintln!(
@@ -130,10 +231,12 @@ pub fn run_usb_capture(
             let writer = writer.clone();
             let state = state.clone();
             let reader_stop = reader_stop.clone();
+            let stats = stats.clone();
+            let filter = filter.clone();
             readers.push(
                 std::thread::Builder::new()
                     .name(format!("usbcap-reader-{i}"))
-                    .spawn(move || reader_loop(source, writer, state, reader_stop))?,
+                    .spawn(move || reader_loop(source, writer, state, reader_stop, stats, filter))?,
             );
         }
     }
@@ -157,8 +260,31 @@ pub fn run_usb_capture(
         let _ = in_tx.send(ev);
     })?;
 
+    // --- concurrent PCIe capture (--with-pcie): its own reader thread writing pcie.bin, plus
+    //     a shared latest-event cell so each checkpoint anchors to the nearest preceding PCIe
+    //     event as well as the USB frame. The source is already started by the caller. ---
+    let mut pcie_meta: Option<serde_json::Value> = None;
+    let (pcie_state, pcie_stop, pcie_reader) = if let Some(pcie) = pcie {
+        let PcieCapture { source, stop, meta } = pcie;
+        let log = PcieLog::create(session.pcie_bin(), session.pcie_idx())?;
+        let st = Arc::new(Mutex::new(PcieState::default()));
+        let handle = {
+            let st = st.clone();
+            let traffic = state.clone();
+            let reader_stop = reader_stop.clone();
+            let stats = stats.clone();
+            std::thread::Builder::new()
+                .name("pcie-reader".into())
+                .spawn(move || pcie_reader_loop(source, log, st, traffic, reader_stop, stats))?
+        };
+        pcie_meta = Some(meta);
+        (Some(st), Some(stop), Some(handle))
+    } else {
+        (None, None, None)
+    };
+
     // --- the checkpoint engine ---
-    let mut engine = Engine::new(session, &opts, shot_tx, clock.clone());
+    let mut engine = Engine::new(session, &opts, shot_tx, clock.clone(), pcie_state.clone());
     engine.emit(CheckpointType::SessionStart, "session_start", 0, None, false, (0, 0), None)?;
 
     let start = Instant::now();
@@ -168,6 +294,12 @@ pub fn run_usb_capture(
             Ok(ev) => engine.on_input(&ev, &state)?,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        }
+
+        // Remember the target app's foreground so a note (typed into our own window) is
+        // attributed to what the user was actually working in.
+        if !reveng_winput::foreground_is_self() {
+            engine.last_foreign_fg = Some(reveng_winput::foreground_context());
         }
 
         // Notes typed into the recording window become Manual checkpoints, anchored to the
@@ -195,12 +327,22 @@ pub fn run_usb_capture(
             }
         }
 
-        // Stop conditions: hotkey, notes-window Stop/close, reader EOF, or bounded duration.
+        // Stop conditions: hotkey, notes-window Stop/close, reader EOF, bounded duration, or
+        // byte budget (USB + PCIe totals).
+        let over_budget = opts.max_bytes.is_some_and(|mb| {
+            let usb = state.lock().unwrap().total_bytes;
+            let pcie = pcie_state.as_ref().map_or(0, |p| p.lock().unwrap().total_bytes);
+            usb + pcie >= mb
+        });
         if engine.stop_requested
             || ui_stop.as_ref().map(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
             || state.lock().unwrap().done
             || opts.max_duration.map(|d| start.elapsed() >= d).unwrap_or(false)
+            || over_budget
         {
+            if over_budget {
+                eprintln!("reached --max-bytes budget; stopping");
+            }
             break;
         }
     }
@@ -218,6 +360,12 @@ pub fn run_usb_capture(
         w.lock().unwrap().flush()?;
         drop(w); // close the pcapng file before finalize reads/rewrites it
     }
+    if let Some(stop) = &pcie_stop {
+        stop(); // unblock a parked PCIe read (e.g. CancelIoEx) so its reader can exit
+    }
+    if let Some(h) = pcie_reader {
+        let _ = h.join(); // PcieLog writes unbuffered, so it's durable once the thread ends
+    }
     drop(engine.shot_tx.take());
     let _ = shot_worker.join();
 
@@ -225,8 +373,14 @@ pub fn run_usb_capture(
     let stop_anchor = anchor_of(&state.lock().unwrap());
     engine.emit(CheckpointType::SessionStop, "session_stop", final_ts, stop_anchor, false, (0, 0), None)?;
 
-    let total_frames = state.lock().unwrap().total_frames;
-    engine.finalize(&clock, &opts, total_frames)?;
+    let (total_frames, dropped) = {
+        let s = state.lock().unwrap();
+        (s.total_frames, s.dropped)
+    };
+    if dropped > 0 {
+        eprintln!("dropped {dropped} USB packets via capture filter (transfer-type/endpoint)");
+    }
+    engine.finalize(&clock, &opts, total_frames, pcie_meta.as_ref())?;
 
     Ok(RecordSummary {
         events: total_frames,
@@ -250,24 +404,57 @@ fn reader_loop(
     writer: Arc<Mutex<UsbWriter>>,
     state: Arc<Mutex<TrafficState>>,
     reader_stop: Arc<AtomicBool>,
+    stats: Option<Arc<Mutex<LiveStats>>>,
+    filter: PacketFilter,
 ) -> Result<()> {
+    let filtering = filter.is_active();
     loop {
         if reader_stop.load(Ordering::Relaxed) {
             break;
         }
         match source.next() {
             Ok(Some(rec)) => {
-                // Hold `state` across the append so the merged index stays ordered: clamp the
-                // arrival timestamp non-decreasing (hubs interleave), then append under the
-                // writer lock. Serializes writes across readers — correct, since it's one file.
-                let mut s = state.lock().unwrap();
-                let ts = rec.ts_ns.max(s.last_ts);
-                s.last_ts = ts;
-                let (idx, off) = writer.lock().unwrap().append_packet(ts, &rec.payload)?;
-                s.latest_index = Some(idx);
-                s.latest_offset = off;
-                s.total_frames = idx + 1;
-                s.bytes_since = s.bytes_since.saturating_add(rec.payload.len() as u64);
+                // Parse the header once if either the filter or the dashboard needs it.
+                let header = if filtering || stats.is_some() {
+                    reveng_usbcap::parse::parse_packet_header(&rec.payload)
+                } else {
+                    None
+                };
+                // Capture-side reduction (camera/isoc firehose): drop filtered packets before
+                // writing, but count them so the drop is visible, never silent.
+                if filtering && !keep_packet(header.as_ref(), &filter) {
+                    state.lock().unwrap().dropped += 1;
+                    if let Some(stats) = &stats {
+                        stats.lock().unwrap().usb_dropped += 1;
+                    }
+                    continue;
+                }
+                let payload_len = rec.payload.len() as u64;
+                {
+                    // Hold `state` across the append so the merged index stays ordered: clamp the
+                    // arrival timestamp non-decreasing (hubs interleave), then append under the
+                    // writer lock. Serializes writes across readers — correct, it's one file.
+                    let mut s = state.lock().unwrap();
+                    let ts = rec.ts_ns.max(s.last_ts);
+                    s.last_ts = ts;
+                    let (idx, off) = writer.lock().unwrap().append_packet(ts, &rec.payload)?;
+                    s.latest_index = Some(idx);
+                    s.latest_offset = off;
+                    s.total_frames = idx + 1;
+                    s.bytes_since = s.bytes_since.saturating_add(payload_len);
+                    s.total_bytes = s.total_bytes.saturating_add(payload_len);
+                }
+                if let Some(stats) = &stats {
+                    let mut g = stats.lock().unwrap();
+                    g.usb_frames += 1;
+                    g.usb_bytes += payload_len;
+                    if let Some(h) = &header {
+                        let e = g.usb_by_ep.entry(h.endpoint).or_default();
+                        e.frames += 1;
+                        e.bytes += payload_len;
+                        e.transfer = h.transfer;
+                    }
+                }
             }
             Ok(None) => {
                 mark_source_ended(&state);
@@ -312,6 +499,12 @@ struct Engine {
     alt_down: bool,
     stop_vk: u16,
     stop_requested: bool,
+    /// Latest PCIe event, when co-logging (`--with-pcie`); source of each checkpoint's
+    /// secondary anchor.
+    pcie_state: Option<Arc<Mutex<PcieState>>>,
+    /// Most recent foreground app that wasn't our own window — used as the context for a note
+    /// checkpoint (while typing a note, *our* window is foreground, which isn't useful).
+    last_foreign_fg: Option<(Option<String>, Option<String>)>,
     _clock: Clock,
 }
 
@@ -321,6 +514,7 @@ impl Engine {
         opts: &UsbRecordOpts,
         shot_tx: std::sync::mpsc::Sender<(u64, reveng_winshot::Scope)>,
         clock: Clock,
+        pcie_state: Option<Arc<Mutex<PcieState>>>,
     ) -> Self {
         Self {
             session,
@@ -339,6 +533,8 @@ impl Engine {
             alt_down: false,
             stop_vk: opts.stop_vk,
             stop_requested: false,
+            pcie_state,
+            last_foreign_fg: None,
             _clock: clock,
         }
     }
@@ -361,6 +557,11 @@ impl Engine {
 
         let (fg_process, fg_window) = if matches!(kind, CheckpointType::SessionStart) {
             (None, None)
+        } else if matches!(kind, CheckpointType::Manual) {
+            // A note is typed into our own window; attribute it to the target app instead.
+            self.last_foreign_fg
+                .clone()
+                .unwrap_or_else(reveng_winput::foreground_context)
         } else {
             reveng_winput::foreground_context()
         };
@@ -390,12 +591,22 @@ impl Engine {
                 .push((a.event_index, format!("CHECKPOINT #{id} — {cause} in {proc}")));
         }
 
+        // Co-logging: also anchor to the nearest preceding PCIe event, so this checkpoint
+        // reaches both wires (empty when not co-logging or no PCIe event yet).
+        let anchors: Vec<TrafficAnchor> = self
+            .pcie_state
+            .as_ref()
+            .and_then(|st| pcie_anchor_of(&st.lock().unwrap()))
+            .into_iter()
+            .collect();
+
         let ckpt = Checkpoint {
             id,
             ts_ns,
             kind,
             cause: cause.to_string(),
             anchor,
+            anchors,
             screenshot_id,
             fg_process,
             fg_window,
@@ -480,7 +691,13 @@ impl Engine {
 
     /// Flush, inject checkpoint comments into the pcapng, rewrite `frames.idx` offsets, and
     /// write `meta.json` with the clock anchor (§2, §4, §8).
-    fn finalize(&mut self, clock: &Clock, opts: &UsbRecordOpts, total_frames: u64) -> Result<()> {
+    fn finalize(
+        &mut self,
+        clock: &Clock,
+        opts: &UsbRecordOpts,
+        total_frames: u64,
+        pcie_meta: Option<&serde_json::Value>,
+    ) -> Result<()> {
         use reveng_usbcap::pcapng;
 
         let pcapng_path = self.session.usb_pcapng();
@@ -509,10 +726,10 @@ impl Engine {
             }
         }
 
-        let meta = serde_json::json!({
+        let mut meta = serde_json::json!({
             "tool": "reveng-rec",
             "version": env!("CARGO_PKG_VERSION"),
-            "source": "usb",
+            "source": if pcie_meta.is_some() { "usb+pcie" } else { "usb" },
             "acquisition": "usbpcap",
             "clock": {
                 "kind": "QPC-backed monotonic (std::Instant)",
@@ -522,8 +739,125 @@ impl Engine {
             "checkpoints": self.checkpoints_written,
             "checkpoint_config": opts.cfg,
         });
+        if let (Some(obj), Some(pcie)) = (meta.as_object_mut(), pcie_meta) {
+            obj.insert("pcie".into(), pcie.clone());
+        }
         self.session.write_meta(&meta)?;
         Ok(())
+    }
+}
+
+/// A concurrent PCIe reader thread: drain the source into `pcie.bin`/`pcie.idx` on the shared
+/// clock, publishing the latest event for secondary-anchor resolution. The source is already
+/// started; a parked `next()` is unblocked at finalize via the `PcieCapture::stop` handle.
+fn pcie_reader_loop(
+    mut source: Box<dyn CaptureSource + Send>,
+    mut log: PcieLog,
+    state: Arc<Mutex<PcieState>>,
+    traffic: Arc<Mutex<TrafficState>>,
+    reader_stop: Arc<AtomicBool>,
+    stats: Option<Arc<Mutex<LiveStats>>>,
+) -> Result<()> {
+    loop {
+        if reader_stop.load(Ordering::Relaxed) {
+            break;
+        }
+        match source.next() {
+            Ok(Some(rec)) => {
+                if let TrafficKind::Pcie(ev) = &rec.kind {
+                    let bytes = crate::record::event_bytes(ev);
+                    let (idx, off) = log.append(ev)?;
+                    {
+                        let mut s = state.lock().unwrap();
+                        s.latest_index = Some(idx);
+                        s.latest_offset = off;
+                        s.total_bytes = s.total_bytes.saturating_add(bytes);
+                    }
+                    // Co-logging: PCIe traffic also drives interval checkpoints, so a
+                    // PCIe-busy / USB-idle stretch still gets periodic markers (§7).
+                    {
+                        let mut t = traffic.lock().unwrap();
+                        t.bytes_since = t.bytes_since.saturating_add(bytes);
+                    }
+                    if let Some(stats) = &stats {
+                        let mut g = stats.lock().unwrap();
+                        g.pcie_events += 1;
+                        g.pcie_bytes += bytes;
+                    }
+                }
+            }
+            Ok(None) => break, // EOF (bounded/replay source) or unblocked (live)
+            Err(e) => {
+                eprintln!("pcie reader stopped: {e}");
+                break;
+            }
+        }
+    }
+    let _ = source.stop();
+    Ok(())
+}
+
+fn pcie_anchor_of(s: &PcieState) -> Option<TrafficAnchor> {
+    s.latest_index.map(|event_index| TrafficAnchor {
+        source: SourceKind::Pcie,
+        event_index,
+        byte_offset: s.latest_offset,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reveng_usbcap::{XFER_BULK, XFER_CONTROL, XFER_ISO};
+
+    fn hdr(endpoint: u8, transfer: u8) -> UsbFrameHeader {
+        UsbFrameHeader {
+            bus: 0,
+            device: 0,
+            endpoint,
+            transfer,
+            status: 0,
+            data_length: 0,
+        }
+    }
+
+    #[test]
+    fn default_filter_keeps_everything() {
+        let f = PacketFilter::default();
+        assert!(!f.is_active());
+        assert!(keep_packet(Some(&hdr(0x81, XFER_ISO)), &f));
+    }
+
+    #[test]
+    fn drops_chosen_transfer_types_keeps_control() {
+        let f = PacketFilter {
+            drop_transfers: vec![XFER_ISO],
+            endpoints: None,
+        };
+        assert!(f.is_active());
+        assert!(!keep_packet(Some(&hdr(0x81, XFER_ISO)), &f)); // isoc dropped
+        assert!(keep_packet(Some(&hdr(0x00, XFER_CONTROL)), &f)); // control kept
+        assert!(keep_packet(Some(&hdr(0x02, XFER_BULK)), &f)); // bulk kept
+    }
+
+    #[test]
+    fn endpoint_allow_list_is_direction_agnostic() {
+        let f = PacketFilter {
+            drop_transfers: vec![],
+            endpoints: Some(vec![1, 2]),
+        };
+        assert!(keep_packet(Some(&hdr(0x81, XFER_BULK)), &f)); // ep 1 IN
+        assert!(keep_packet(Some(&hdr(0x02, XFER_BULK)), &f)); // ep 2 OUT
+        assert!(!keep_packet(Some(&hdr(0x83, XFER_BULK)), &f)); // ep 3 excluded
+    }
+
+    #[test]
+    fn unparseable_header_is_always_kept() {
+        let f = PacketFilter {
+            drop_transfers: vec![XFER_ISO],
+            endpoints: Some(vec![9]),
+        };
+        assert!(keep_packet(None, &f));
     }
 }
 
