@@ -122,6 +122,12 @@ impl PcieLog {
     pub fn offset_of(&mut self, i: u64) -> anyhow::Result<u64> {
         Ok(self.idx.get(i)?.byte_offset)
     }
+
+    /// Event `i`'s timestamp from the index record (for timeline density bucketing).
+    pub fn ts_at(&mut self, i: u64) -> anyhow::Result<i64> {
+        use reveng_core::index::FixedRecord;
+        Ok(self.idx.get(i)?.ts_ns())
+    }
 }
 
 #[cfg(test)]

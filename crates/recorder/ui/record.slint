@@ -16,6 +16,7 @@ export component DevicePicker inherits Window {
     in property <[DevItem]> usb_devices;
     in property <[DevItem]> pci_devices;
     in property <string> usb_note; // e.g. "USBPcap not installed — …" (shown when set)
+    in property <string> pci_note; // e.g. "reveng-pcidrv not loaded — …" (shown when set)
     // (index, checked) reported to Rust as the user ticks boxes.
     callback usb_toggled(int, bool);
     callback pci_toggled(int, bool);
@@ -56,6 +57,13 @@ export component DevicePicker inherits Window {
         }
 
         Text { text: "PCIe (one device co-logged)"; font-weight: 700; color: #b58cd0; }
+        Text {
+            visible: root.pci_note != "";
+            text: root.pci_note;
+            wrap: word-wrap;
+            font-size: 11px;
+            color: #e0a020;
+        }
         Rectangle {
             vertical-stretch: 1;
             background: #00000014;
@@ -113,12 +121,21 @@ export component RecordWindow inherits Window {
     in property <string> usb_endpoints: ""; // top endpoints by volume ("0x81 iso 1.2M · …")
     in property <bool> pcie_active: false;
     in property <string> pcie_stats: "";
+    in property <string> pcie_kinds: ""; // per-kind breakdown ("cfg 64 · mmio 1.2k · dma 245")
     in property <bool> pcie_hot: false; // PCIe rate high → warn colour
+
+    // Live MMIO/DMA snapshot toggles (drv backend only).
+    in property <bool> trace_available: false;
+    in-out property <bool> trace_mmio_on;
+    in-out property <bool> trace_dma_on;
 
     // Enter pressed in the input box, with the note text.
     callback submit(string);
     // Stop button / window close.
     callback stop();
+    // MMIO/DMA trace toggles flipped.
+    callback trace_mmio_toggled(bool);
+    callback trace_dma_toggled(bool);
 
     VerticalBox {
         padding: 10px;
@@ -189,6 +206,13 @@ export component RecordWindow inherits Window {
                         color: root.pcie_hot ? #e0a020 : #ffffff;
                     }
                 }
+                Text {
+                    visible: root.pcie_active && root.pcie_kinds != "";
+                    text: root.pcie_kinds;
+                    font-family: "monospace";
+                    font-size: 11px;
+                    color: #888888;
+                }
             }
         }
 
@@ -236,7 +260,24 @@ export component RecordWindow inherits Window {
         }
 
         HorizontalBox {
-            alignment: end;
+            spacing: 12px;
+            CheckBox {
+                visible: root.trace_available;
+                text: "trace MMIO";
+                checked <=> root.trace_mmio_on;
+                toggled => {
+                    root.trace_mmio_toggled(self.checked);
+                }
+            }
+            CheckBox {
+                visible: root.trace_available;
+                text: "trace DMA";
+                checked <=> root.trace_dma_on;
+                toggled => {
+                    root.trace_dma_toggled(self.checked);
+                }
+            }
+            Rectangle { horizontal-stretch: 1; }
             Button {
                 text: "Stop recording";
                 clicked => {

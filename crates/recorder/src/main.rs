@@ -533,6 +533,20 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
 
     match args.source {
         Source::Pcie => {
+            // Interactive drv/replay → the full input-driven engine (clicks→checkpoint+screenshot,
+            // notes, window) with PCIe as the primary traffic source — the same model as USB, so a
+            // PCIe-only session behaves identically. ETW, headless automation, and non-Windows keep
+            // the portable minimal loop (`record.rs`), which is cross-platform and captures no input.
+            #[cfg(windows)]
+            {
+                let headless = args.max_seconds.is_some()
+                    || std::env::var_os("REVENG_NO_NOTES_UI").is_some();
+                // drv/etw/replay all stop cleanly now, so all can drive the input engine.
+                if !headless {
+                    return run_pcie_engine_session(&args, cfg.clone());
+                }
+            }
+
             if let Some(replay) = args.replay.as_ref() {
                 let out = args.out.clone().unwrap_or_else(|| default_out(replay));
                 let summary = record::run_pcie_replay(&out, replay, &cfg)?;
@@ -642,47 +656,122 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
 
             let clock = Clock::start();
             let pcie = build_pcie_capture(&args, &clock)?;
-            let pcie_active = pcie.is_some();
-            if pcie_active {
+            if pcie.is_some() {
                 eprintln!("co-logging PCIe into the same session");
             }
-
-            // Interactive runs get the Slint notes window; automation (`--max-seconds`) and
-            // `REVENG_NO_NOTES_UI=1` run headless (no window, capture on this thread).
-            let headless =
-                opts.max_duration.is_some() || std::env::var_os("REVENG_NO_NOTES_UI").is_some();
-
-            let summary = if headless {
-                record_usb::run_usb_capture(clock, &out, opts, None, pcie)?
-            } else {
-                #[cfg(windows)]
-                {
-                    let worker_clock = clock.clone();
-                    let out2 = out.clone();
-                    let usb_active = !opts.selections.is_empty();
-                    notes_ui::run_recording_window(
-                        clock,
-                        out.clone(),
-                        usb_active,
-                        pcie_active,
-                        move |ui| {
-                            record_usb::run_usb_capture(worker_clock, &out2, opts, Some(ui), pcie)
-                        },
-                    )?
-                }
-                #[cfg(not(windows))]
-                {
-                    record_usb::run_usb_capture(clock, &out, opts, None, pcie)?
-                }
-            };
-            eprintln!(
-                "recorded {} USB frames, {} checkpoints -> {}",
-                summary.events,
-                summary.checkpoints,
-                out.display()
-            );
-            Ok(())
+            run_engine_session(&out, opts, pcie, clock)
         }
+    }
+}
+
+/// Run the shared input-driven recording engine (clicks→checkpoint+screenshot, keyboard, notes)
+/// over whatever traffic sources `opts`/`pcie` carry — USB, PCIe, both, or neither. Interactive
+/// runs get the Slint window; headless (`--max-seconds`/`REVENG_NO_NOTES_UI`) runs windowless.
+fn run_engine_session(
+    out: &std::path::Path,
+    opts: record_usb::UsbRecordOpts,
+    pcie: Option<record_usb::PcieCapture>,
+    clock: Clock,
+) -> anyhow::Result<()> {
+    let usb_active = !opts.selections.is_empty();
+    let pcie_active = pcie.is_some();
+    let headless =
+        opts.max_duration.is_some() || std::env::var_os("REVENG_NO_NOTES_UI").is_some();
+
+    let summary = if headless {
+        record_usb::run_usb_capture(clock, out, opts, None, pcie)?
+    } else {
+        #[cfg(windows)]
+        {
+            let worker_clock = clock.clone();
+            let out2 = out.to_path_buf();
+            // Live MMIO/DMA toggles reach the window only for the drv backend (both handles set).
+            let trace = pcie.as_ref().and_then(|p| match (&p.trace_mmio, &p.trace_dma) {
+                (Some(m), Some(d)) => Some((m.clone(), d.clone())),
+                _ => None,
+            });
+            notes_ui::run_recording_window(clock, out.to_path_buf(), usb_active, pcie_active, trace, move |ui| {
+                record_usb::run_usb_capture(worker_clock, &out2, opts, Some(ui), pcie)
+            })?
+        }
+        #[cfg(not(windows))]
+        {
+            record_usb::run_usb_capture(clock, out, opts, None, pcie)?
+        }
+    };
+    if usb_active {
+        eprintln!(
+            "recorded {} USB frames, {} checkpoints -> {}",
+            summary.events,
+            summary.checkpoints,
+            out.display()
+        );
+    } else if pcie_active {
+        eprintln!("recorded PCIe session, {} checkpoints -> {}", summary.checkpoints, out.display());
+    } else {
+        eprintln!(
+            "recorded {} checkpoints (input + notes only) -> {}",
+            summary.checkpoints,
+            out.display()
+        );
+    }
+    Ok(())
+}
+
+/// State of the `RevengPciCap` (reveng-pcidrv) service that backs live PCIe capture.
+#[cfg(windows)]
+enum DrvStatus {
+    Running,
+    Stopped,
+    NotInstalled,
+}
+
+/// Run `sc <args>` without flashing a console window (for the GUI path).
+#[cfg(windows)]
+fn sc(args: &[&str]) -> std::io::Result<std::process::Output> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    std::process::Command::new("sc")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+}
+
+/// Query the reveng-pcidrv service state (read-only; works unelevated).
+#[cfg(windows)]
+fn drv_status() -> DrvStatus {
+    match sc(&["query", "RevengPciCap"]) {
+        Ok(o) => {
+            let s = String::from_utf8_lossy(&o.stdout);
+            if s.contains("RUNNING") {
+                DrvStatus::Running
+            } else if s.contains("STOP") {
+                DrvStatus::Stopped // STOPPED / STOP_PENDING
+            } else {
+                DrvStatus::NotInstalled // e.g. 1060 "service does not exist"
+            }
+        }
+        Err(_) => DrvStatus::NotInstalled,
+    }
+}
+
+/// Start the reveng-pcidrv service if it's registered but stopped (needs admin). No-op if
+/// already running; a failure is returned so the caller can fall back gracefully.
+#[cfg(windows)]
+fn ensure_drv_running() -> anyhow::Result<()> {
+    if matches!(drv_status(), DrvStatus::Running) {
+        return Ok(());
+    }
+    if matches!(drv_status(), DrvStatus::NotInstalled) {
+        anyhow::bail!("reveng-pcidrv (RevengPciCap) is not installed");
+    }
+    eprintln!("loading reveng-pcidrv (starting the RevengPciCap service)…");
+    let o = sc(&["start", "RevengPciCap"])?;
+    let s = String::from_utf8_lossy(&o.stdout);
+    if s.contains("RUNNING") || s.contains("START_PENDING") {
+        Ok(())
+    } else {
+        anyhow::bail!("could not start RevengPciCap: {}", s.trim())
     }
 }
 
@@ -724,8 +813,23 @@ fn run_device_picker_and_relaunch() -> anyhow::Result<Option<i32>> {
         "USBPcap driver not installed — USB capture unavailable. Install it (PowerShell: \
          scripts/get-usbpcap.ps1, or https://desowin.org/usbpcap/), reboot, then relaunch."
     };
+    // PCIe capture needs the reveng-pcidrv (RevengPciCap) service. If it's registered but stopped
+    // the recorder will start it when recording begins; if not installed, guide the user.
+    let pci_note = if pci.is_empty() {
+        ""
+    } else {
+        match drv_status() {
+            DrvStatus::Running => "",
+            DrvStatus::Stopped => {
+                "reveng-pcidrv is installed but not loaded — it will be started (admin) when recording begins."
+            }
+            DrvStatus::NotInstalled => {
+                "reveng-pcidrv driver not loaded — PCIe capture needs it (build + test-sign per driver/reveng-pcidrv/README.md)."
+            }
+        }
+    };
 
-    let choice = match notes_ui::run_device_picker(usb, pci, usb_note)? {
+    let choice = match notes_ui::run_device_picker(usb, pci, usb_note, pci_note)? {
         Some(c) => c,
         None => return Ok(Some(0)), // user closed the picker
     };
@@ -915,26 +1019,33 @@ fn build_usb_selections(args: &RecordArgs) -> anyhow::Result<Vec<reveng_usbcap::
         .collect())
 }
 
-/// Build the optional concurrent PCIe capture (`--with-pcie`) to co-log alongside USB, sharing
-/// the USB session's clock. `--pcie-replay` uses a portable replayed stream (works anywhere);
-/// otherwise a live device via the `drv` backend (Windows + reveng-pcidrv). The source is
-/// `start()`ed here so open errors surface before the pipeline spins up. Returns `None` when
-/// `--with-pcie` wasn't requested.
+/// The optional concurrent PCIe capture to co-log alongside USB (`--with-pcie`). `None` unless
+/// requested; otherwise built from `--pcie-replay` or the live `drv` backend.
 fn build_pcie_capture(
+    args: &RecordArgs,
+    clock: &Clock,
+) -> anyhow::Result<Option<record_usb::PcieCapture>> {
+    if !args.with_pcie {
+        return Ok(None);
+    }
+    make_pcie_capture(args.pcie_replay.as_deref(), args, clock)
+}
+
+/// Build a started [`record_usb::PcieCapture`] from a replay file (`replay = Some`, works
+/// anywhere) or the live `drv` backend (`replay = None`, Windows + reveng-pcidrv), sharing
+/// `clock`. Shared by `--with-pcie` co-logging and the PCIe-only engine path. Returns `None` if
+/// the source fails to `start()` (fault-tolerant — the session records without it).
+fn make_pcie_capture(
+    replay: Option<&std::path::Path>,
     args: &RecordArgs,
     clock: &Clock,
 ) -> anyhow::Result<Option<record_usb::PcieCapture>> {
     use reveng_core::source::CaptureSource;
 
-    if !args.with_pcie {
-        return Ok(None);
-    }
-
-    // Portable replayed PCIe stream (works anywhere; the kernel-free way to exercise co-logging).
-    if let Some(replay) = &args.pcie_replay {
+    if let Some(replay) = replay {
         let mut source = reveng_pcicap::ReplayPcieSource::from_path(replay)?;
         if let Err(e) = source.start() {
-            eprintln!("PCIe co-capture disabled (replay start failed): {e}");
+            eprintln!("PCIe capture disabled (replay start failed): {e}");
             return Ok(None);
         }
         return Ok(Some(record_usb::PcieCapture {
@@ -944,6 +1055,8 @@ fn build_pcie_capture(
                 "acquisition": "replay",
                 "replay_file": replay.display().to_string(),
             }),
+            trace_mmio: None,
+            trace_dma: None,
         }));
     }
 
@@ -952,20 +1065,25 @@ fn build_pcie_capture(
     {
         match args.pci_backend {
             PciBackend::Drv => {
+                // Load the driver if it's registered but not running (we're elevated here). If it
+                // can't be loaded, the open below fails and we fall back (record without PCIe).
+                if let Err(e) = ensure_drv_running() {
+                    eprintln!("reveng-pcidrv not available: {e}");
+                }
                 let target = resolve_pci_target(args)?;
                 let mut source = reveng_pcicap::drv::DrvPcieSource::new_live(
                     target,
                     clock.clone(),
-                    None, // unbounded — the USB session drives stop
+                    None, // unbounded — the session drives stop
                     args.trace_mmio,
                     args.trace_dma,
                 );
-                // Fault-tolerant: a PCIe open failure must not abort the USB recording.
                 if let Err(e) = source.start() {
-                    eprintln!("PCIe co-capture disabled (driver start failed): {e}");
+                    eprintln!("PCIe capture disabled (driver start failed): {e}");
                     return Ok(None);
                 }
                 let killer = source.killer();
+                let (trace_mmio, trace_dma) = source.trace_handles();
                 let stop: Box<dyn Fn() + Send + Sync> = Box::new(move || {
                     if let Some(k) = &killer {
                         k.kill();
@@ -983,19 +1101,74 @@ fn build_pcie_capture(
                             target.segment, target.bus, target.device, target.function
                         ),
                     }),
+                    trace_mmio: Some(trace_mmio),
+                    trace_dma: Some(trace_dma),
                 }))
             }
-            PciBackend::Etw => anyhow::bail!(
-                "--with-pcie supports the drv backend or --pcie-replay; etw isn't wired as a \
-                 concurrent secondary yet"
-            ),
+            PciBackend::Etw => {
+                let vectors = parse_irq_vectors(args.irq_vectors.as_deref())?;
+                let mut source = reveng_pcicap::etw::EtwIrqSource::new(
+                    clock.clone(),
+                    reveng_pcicap::etw::EtwIrqOpts {
+                        vectors,
+                        max_duration: None, // the session drives stop
+                    },
+                );
+                if let Err(e) = source.start() {
+                    eprintln!("PCIe capture disabled (etw start failed): {e}");
+                    return Ok(None);
+                }
+                let flag = source.stop_handle();
+                let stop: Box<dyn Fn() + Send + Sync> =
+                    Box::new(move || flag.store(true, std::sync::atomic::Ordering::Relaxed));
+                Ok(Some(record_usb::PcieCapture {
+                    source: Box::new(source),
+                    stop,
+                    meta: serde_json::json!({
+                        "acquisition": "etw-isr",
+                        "irq_vectors": args.irq_vectors.clone().unwrap_or_else(|| "all".into()),
+                    }),
+                    trace_mmio: None,
+                    trace_dma: None,
+                }))
+            }
         }
     }
     #[cfg(not(windows))]
     {
-        let _ = clock;
-        anyhow::bail!("live --with-pcie requires Windows; use --pcie-replay on other platforms")
+        let _ = (args, clock);
+        anyhow::bail!("live PCIe requires Windows; use a replay file on other platforms")
     }
+}
+
+/// PCIe-only interactive recording through the shared input-driven engine: clicks form
+/// checkpoints + screenshots and anchor to PCIe events, exactly like the USB path. Live `drv`
+/// needs admin (replay doesn't); no USB sources are opened.
+#[cfg(windows)]
+fn run_pcie_engine_session(args: &RecordArgs, cfg: CheckpointConfig) -> anyhow::Result<()> {
+    let live = args.replay.is_none();
+    if live && !elevate::is_elevated() && std::env::var_os("REVENG_NO_ELEVATE").is_none() {
+        eprintln!("PCIe capture needs administrator rights — requesting elevation…");
+        let forward: Vec<String> = std::env::args().skip(1).collect();
+        let code = elevate::relaunch_elevated(&forward)?;
+        std::process::exit(code as i32);
+    }
+
+    let out = args.out.clone().unwrap_or_else(|| {
+        args.replay
+            .as_deref()
+            .map(default_out)
+            .unwrap_or_else(default_session_dir)
+    });
+    let clock = Clock::start();
+    let pcie = make_pcie_capture(args.replay.as_deref(), args, &clock)?;
+    if pcie.is_none() {
+        anyhow::bail!("no PCIe source available (start failed)");
+    }
+    // PCIe is the only traffic source: reuse the checkpoint/screenshot config, no USB selections.
+    let mut opts = build_usb_opts(args, cfg)?;
+    opts.selections.clear();
+    run_engine_session(&out, opts, pcie, clock)
 }
 
 /// Resolve the live PCIe capture target (BDF) from `--pci-bdf` or `--pci-vidpid`.

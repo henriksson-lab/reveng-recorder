@@ -14,6 +14,7 @@ use reveng_core::clock::Clock;
 use reveng_core::event::{Dir, PcieEvent, SourceKind, TrafficKind, TrafficRecord};
 use reveng_core::source::CaptureSource;
 use std::io::{self, Read};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -81,13 +82,18 @@ impl Drop for OwnedHandle {
     }
 }
 
-/// Stops a parked `ReadFile` on the capture handle so the reader wakes and sees EOF.
+/// Stops the reader: sets a stop flag the poll loop checks (so an *unbounded* live capture — no
+/// deadline — ends promptly) and cancels any parked `ReadFile` so a blocked read wakes at once.
 #[derive(Clone)]
-pub struct Killer(Arc<OwnedHandle>);
+pub struct Killer {
+    handle: Arc<OwnedHandle>,
+    stop: Arc<AtomicBool>,
+}
 impl Killer {
     pub fn kill(&self) {
+        self.stop.store(true, Ordering::Relaxed);
         unsafe {
-            let _ = CancelIoEx(self.0 .0, None);
+            let _ = CancelIoEx(self.handle.0, None);
         }
     }
 }
@@ -133,12 +139,15 @@ pub struct DrvPcieSource {
     handle: Option<Arc<OwnedHandle>>,
     killer: Option<Killer>,
     poll: bool,
-    trace_mmio: bool,
-    trace_dma: bool,
+    /// MMIO/DMA snapshotting — shared atomics so the recording window can toggle them live.
+    trace_mmio: Arc<AtomicBool>,
+    trace_dma: Arc<AtomicBool>,
     mmio_bytes: u32,
     max_duration: Option<Duration>,
     deadline: Option<Instant>,
     last_snap: Option<Instant>,
+    /// Set by [`Killer`] to end an unbounded live poll loop (no deadline) promptly.
+    stop: Arc<AtomicBool>,
 }
 
 impl DrvPcieSource {
@@ -151,12 +160,13 @@ impl DrvPcieSource {
             handle: None,
             killer: None,
             poll: false,
-            trace_mmio: false,
-            trace_dma: false,
+            trace_mmio: Arc::new(AtomicBool::new(false)),
+            trace_dma: Arc::new(AtomicBool::new(false)),
             mmio_bytes: DEFAULT_MMIO_BYTES,
             max_duration: None,
             deadline: None,
             last_snap: None,
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -176,8 +186,8 @@ impl DrvPcieSource {
             handle: None,
             killer: None,
             poll: true,
-            trace_mmio,
-            trace_dma,
+            trace_mmio: Arc::new(AtomicBool::new(trace_mmio)),
+            trace_dma: Arc::new(AtomicBool::new(trace_dma)),
             mmio_bytes: std::env::var("REVENG_MMIO_BYTES")
                 .ok()
                 .and_then(|s| s.parse().ok())
@@ -185,11 +195,18 @@ impl DrvPcieSource {
             max_duration,
             deadline: None,
             last_snap: None,
+            stop: Arc::new(AtomicBool::new(false)),
         }
     }
 
     pub fn killer(&self) -> Option<Killer> {
         self.killer.clone()
+    }
+
+    /// Shared `(trace_mmio, trace_dma)` flags, so the recording window can pause/resume the noisy
+    /// MMIO/DMA snapshot sources mid-capture.
+    pub fn trace_handles(&self) -> (Arc<AtomicBool>, Arc<AtomicBool>) {
+        (self.trace_mmio.clone(), self.trace_dma.clone())
     }
 }
 
@@ -238,7 +255,11 @@ impl CaptureSource for DrvPcieSource {
         }
         .map_err(|e| anyhow::anyhow!("SET_TARGET failed: {e}"))?;
 
-        self.killer = Some(Killer(owned.clone()));
+        self.stop.store(false, Ordering::Relaxed);
+        self.killer = Some(Killer {
+            handle: owned.clone(),
+            stop: self.stop.clone(),
+        });
         self.reader = Some(DeviceReader {
             handle: owned.clone(),
         });
@@ -255,25 +276,28 @@ impl CaptureSource for DrvPcieSource {
         loop {
             // In live mode, periodically ask the driver to snapshot the BARs (M3) and/or follow
             // the Event Ring (M4) so changed registers/TRBs land in the ring we're about to read.
-            if self.trace_mmio || self.trace_dma {
+            let mmio_on = self.trace_mmio.load(Ordering::Relaxed);
+            let dma_on = self.trace_dma.load(Ordering::Relaxed);
+            if mmio_on || dma_on {
                 let due = self
                     .last_snap
                     .map(|t| t.elapsed() >= MMIO_SNAP_INTERVAL)
                     .unwrap_or(true);
                 if due {
-                    if self.trace_mmio {
+                    if mmio_on {
                         ioctl_snap(&self.handle, IOCTL_REVENG_PCI_MMIO_SNAP, self.mmio_bytes);
                     }
-                    if self.trace_dma {
+                    if dma_on {
                         ioctl_snap(&self.handle, IOCTL_REVENG_PCI_DMA_SNAP, 0);
                     }
                     self.last_snap = Some(Instant::now());
                 }
             }
             let mut buf = [0u8; EVENT_SIZE];
+            let stop = self.stop.clone();
             let got = {
                 let reader = self.reader.as_mut().unwrap();
-                read_event(reader, &mut buf, self.poll, self.deadline)?
+                read_event(reader, &mut buf, self.poll, self.deadline, &stop)?
             };
             if !got {
                 return Ok(None); // EOF (snapshot) or deadline reached (live)
@@ -329,6 +353,7 @@ fn read_event(
     buf: &mut [u8],
     poll: bool,
     deadline: Option<Instant>,
+    stop: &AtomicBool,
 ) -> anyhow::Result<bool> {
     let mut filled = 0;
     while filled < buf.len() {
@@ -339,6 +364,11 @@ fn read_event(
                 }
                 if !poll {
                     return Ok(false); // snapshot: clean EOF
+                }
+                // Stop requested (window Stop / max-seconds / hotkey) — end even with no
+                // deadline. Checked at the event boundary so we never truncate a record.
+                if stop.load(Ordering::Relaxed) {
+                    return Ok(false);
                 }
                 if let Some(dl) = deadline {
                     if Instant::now() >= dl {

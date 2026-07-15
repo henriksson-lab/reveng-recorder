@@ -35,6 +35,7 @@ pub fn run_device_picker(
     usb: Vec<(String, String)>, // (label, "VID:PID")
     pci: Vec<(String, String)>, // (label, BDF)
     usb_note: &str,             // shown under the USB header (e.g. USBPcap-missing guidance)
+    pci_note: &str,             // shown under the PCIe header (e.g. reveng-pcidrv status)
 ) -> Result<Option<PickerChoice>> {
     let window = DevicePicker::new().map_err(|e| anyhow::anyhow!("create picker: {e}"))?;
 
@@ -43,6 +44,7 @@ pub fn run_device_picker(
     window.set_usb_devices(ModelRc::from(Rc::new(VecModel::from(usb_rows))));
     window.set_pci_devices(ModelRc::from(Rc::new(VecModel::from(pci_rows))));
     window.set_usb_note(usb_note.into());
+    window.set_pci_note(pci_note.into());
 
     let usb_checked = Rc::new(RefCell::new(vec![false; usb.len()]));
     let pci_checked = Rc::new(RefCell::new(vec![false; pci.len()]));
@@ -100,11 +102,13 @@ const SIZE_WARN_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Show the recording window and run `record` (the USB capture) on a worker thread until it
 /// finishes or the user stops it. `out` is the session dir (sampled for on-disk size);
 /// `usb_active`/`pcie_active` decide which dashboard rows appear. Must run on the main thread.
+#[allow(clippy::too_many_arguments)]
 pub fn run_recording_window<F>(
     clock: Clock,
     out: PathBuf,
     usb_active: bool,
     pcie_active: bool,
+    trace: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>, // (mmio, dma) live toggles, drv only
     record: F,
 ) -> Result<RecordSummary>
 where
@@ -137,6 +141,15 @@ where
     window.set_pcie_active(pcie_active);
     let notes_model: Rc<VecModel<NoteRow>> = Rc::new(VecModel::default());
     window.set_notes(ModelRc::from(notes_model.clone()));
+
+    // Live MMIO/DMA trace toggles (drv backend): checkboxes flip the shared flags mid-capture.
+    if let Some((mmio, dma)) = trace {
+        window.set_trace_available(true);
+        window.set_trace_mmio_on(mmio.load(Ordering::Relaxed));
+        window.set_trace_dma_on(dma.load(Ordering::Relaxed));
+        window.on_trace_mmio_toggled(move |on| mmio.store(on, Ordering::Relaxed));
+        window.on_trace_dma_toggled(move |on| dma.store(on, Ordering::Relaxed));
+    }
 
     // Enter → stamp on the master clock, show in the log (with stream position), forward it.
     {
@@ -220,9 +233,16 @@ where
                 let now = clock.now_ns();
                 w.set_elapsed(fmt_elapsed(now).as_str().into());
 
-                let (uf, ub, pe, pb, by_ep) = {
+                let (uf, ub, pe, pb, by_ep, pk) = {
                     let g = stats.lock().unwrap();
-                    (g.usb_frames, g.usb_bytes, g.pcie_events, g.pcie_bytes, g.usb_by_ep.clone())
+                    (
+                        g.usb_frames,
+                        g.usb_bytes,
+                        g.pcie_events,
+                        g.pcie_bytes,
+                        g.usb_by_ep.clone(),
+                        (g.pcie_config, g.pcie_mmio, g.pcie_dma, g.pcie_irq),
+                    )
                 };
                 let dt = (now - last_ns) as f64 / 1e9;
                 let usb_rate = if dt > 0.0 { (uf - last_usb) as f64 / dt } else { 0.0 };
@@ -242,6 +262,7 @@ where
                         .as_str()
                         .into(),
                 );
+                w.set_pcie_kinds(fmt_pcie_kinds(pk.0, pk.1, pk.2, pk.3).as_str().into());
                 w.set_pcie_hot(pcie_rate >= PCIE_HOT_RATE);
 
                 // Adaptive: nudge once per endpoint that sustains a high byte-rate (default stays
@@ -358,6 +379,18 @@ fn hot_hint(endpoint: u8, transfer: u8, mb_per_s: f64) -> Option<String> {
     ))
 }
 
+/// PCIe events by kind for the recording-window panel, e.g. `cfg 64 · mmio 1.2k · dma 245`.
+/// Kinds with a zero count are omitted.
+fn fmt_pcie_kinds(config: u64, mmio: u64, dma: u64, irq: u64) -> String {
+    let mut parts = Vec::new();
+    for (label, n) in [("cfg", config), ("mmio", mmio), ("dma", dma), ("irq", irq)] {
+        if n > 0 {
+            parts.push(format!("{label} {}", fmt_count(n)));
+        }
+    }
+    parts.join(" · ")
+}
+
 /// Top endpoints by captured bytes, e.g. `0x81 iso 88.0 MB · 0x02 blk 1.2 MB`.
 fn fmt_top_endpoints(by_ep: &BTreeMap<u8, EpStat>) -> String {
     let mut v: Vec<(&u8, &EpStat)> = by_ep.iter().collect();
@@ -408,6 +441,13 @@ mod tests {
         // control endpoint over threshold: still hint snaplen, no drop suggestion.
         let c = hot_hint(0x00, 2, 10.0).unwrap();
         assert!(c.contains("--usb-snaplen") && !c.contains("--drop"));
+    }
+
+    #[test]
+    fn pcie_kinds_omits_zeros() {
+        assert_eq!(fmt_pcie_kinds(64, 0, 0, 0), "cfg 64");
+        assert_eq!(fmt_pcie_kinds(64, 1200, 245, 3), "cfg 64 · mmio 1.2k · dma 245 · irq 3");
+        assert_eq!(fmt_pcie_kinds(0, 0, 0, 0), "");
     }
 
     #[test]

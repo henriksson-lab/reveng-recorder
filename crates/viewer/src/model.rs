@@ -73,6 +73,58 @@ impl SessionModel {
         })
     }
 
+    /// Traffic index `i`'s timestamp (from whichever backend is primary).
+    fn ts_at(&mut self, i: u64) -> Result<i64> {
+        match &mut self.backend {
+            Backend::Usb(r) => r.ts_at(i),
+            Backend::Pcie(l) => l.ts_at(i),
+            Backend::None => Ok(0),
+        }
+    }
+
+    /// Primary + co-logged-PCIe densities bucketed over a *shared* time axis, for a two-tone
+    /// timeline overlay showing each wire's busy regions. Secondary is empty unless co-logged.
+    pub fn traffic_density_split(&mut self, buckets: usize) -> (Vec<u32>, Vec<u32>) {
+        let total = self.total_frames;
+        if total == 0 || buckets == 0 {
+            return (Vec::new(), Vec::new());
+        }
+        // Shared span across both logs so the strips line up.
+        let mut first = self.ts_at(0).unwrap_or(0);
+        let mut last = self.ts_at(total - 1).unwrap_or(first);
+        let sec_total = self.secondary_pcie.as_ref().map_or(0, |l| l.len());
+        if sec_total > 0 {
+            if let Some(l) = &mut self.secondary_pcie {
+                first = first.min(l.ts_at(0).unwrap_or(first));
+                last = last.max(l.ts_at(sec_total - 1).unwrap_or(last));
+            }
+        }
+        let span = (last - first).max(1) as f64;
+        let bucket = |ts: i64| {
+            (((ts - first) as f64 / span).clamp(0.0, 1.0) * buckets as f64) as usize
+        }; // yields 0..=buckets
+        let bin = |b: usize| b.min(buckets - 1);
+
+        let mut prim = vec![0u32; buckets];
+        for i in 0..total {
+            if let Ok(ts) = self.ts_at(i) {
+                prim[bin(bucket(ts))] += 1;
+            }
+        }
+        let mut sec = Vec::new();
+        if sec_total > 0 {
+            sec = vec![0u32; buckets];
+            if let Some(l) = &mut self.secondary_pcie {
+                for i in 0..sec_total {
+                    if let Ok(ts) = l.ts_at(i) {
+                        sec[bin(bucket(ts))] += 1;
+                    }
+                }
+            }
+        }
+        (prim, sec)
+    }
+
     /// Decoded secondary anchors — the co-logged PCIe events referenced by a checkpoint's
     /// `anchors` — so one checkpoint shows both wires (DESIGN.md §7 co-logging).
     pub fn secondary_rows(&mut self, ckpt: &Checkpoint) -> Result<Vec<InspectorRow>> {
@@ -229,6 +281,15 @@ mod tests {
         assert_eq!(rows[1].index, 2);
         assert_eq!(rows[2].index, 3);
         assert!(rows[1].hex.contains("02 02 02"));
+
+        // Density: 5 frames at ts 1..5 ms across 4 buckets → all counted, last bucket gets the
+        // final (clamped) frame. No co-logged PCIe here, so the secondary strip is empty.
+        let (d, sec) = m.traffic_density_split(4);
+        assert_eq!(d.len(), 4);
+        assert_eq!(d.iter().sum::<u32>(), 5);
+        assert_eq!(d[3], 2);
+        assert!(sec.is_empty());
+        assert!(m.traffic_density_split(0).0.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

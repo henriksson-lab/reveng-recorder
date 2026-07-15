@@ -581,8 +581,9 @@ byte 4 is `0x50`." That correlation is what makes the decode loop converge inste
 - **Notes** — captured live during recording, not after. The `record` USB path opens a small
   Slint window (the primary recording surface: red REC indicator, elapsed clock + growing session
   size, a live **per-source rate/volume dashboard** — USB frames/s + PCIe events/s, MB, with a
-  "hot"/size warning so a PCIe firehose is visible and can't fill the disk unnoticed — a scrollback
-  log of notes, input box, Stop button). The dashboard shows *aggregates only, never contents*: the
+  "hot"/size warning so a PCIe firehose is visible and can't fill the disk unnoticed, plus a
+  per-source breakdown line (USB: top endpoints by volume; PCIe: events by kind `cfg/mmio/dma/irq`)
+  — a scrollback log of notes, input box, Stop button). The dashboard shows *aggregates only, never contents*: the
   window samples shared counters every 250 ms; the raw events stay in the logs, queried offline.
   Each logged note also records where in the stream it landed (`usb <n> · pcie <n>`). Typing a note + Enter stamps it on the master clock the instant
   the key is pressed and stores it as a `Manual` checkpoint (`note` field) anchored to the frame
@@ -597,7 +598,10 @@ byte 4 is `0x50`." That correlation is what makes the decode loop converge inste
   explicit args (`--device-vidpid …`, `--with-pcie --pci-bdf …`), so the relaunched process skips
   the picker and records normally. Leaving everything unchecked records input + notes only. One
   PCIe device can be co-logged. Bypass with an explicit device flag, `--no-capture`, headless mode
-  (`--max-seconds`/`REVENG_NO_NOTES_UI`), or `REVENG_NO_PICKER`.
+  (`--max-seconds`/`REVENG_NO_NOTES_UI`), or `REVENG_NO_PICKER`. The picker also surfaces driver
+  status — if USBPcap isn't attached, or `reveng-pcidrv` (the `RevengPciCap` service backing live
+  PCIe) isn't loaded, it says so; and when a PCIe device is recorded the elevated recorder
+  **auto-starts** the `RevengPciCap` service (`sc start`) if it's registered but stopped.
 - **Parallel multi-device capture.** The USB `record` path opens one capture per USBPcap control
   device (root hub), each on its own reader thread, all folding into the single `usb.pcapng` on the
   shared clock (arrival-order merged index, timestamps clamped non-decreasing so `frames.idx` stays
@@ -613,13 +617,22 @@ byte 4 is `0x50`." That correlation is what makes the decode loop converge inste
   screenshots already capture a camera's output); `--endpoints 0x81,0x02` restricts to an
   endpoint allow-list (direction-agnostic); `--usb-bufsize` enlarges the kernel buffer for bursts.
   Dropped packets are counted and reported — never silent. Default (no flags) is byte-exact.
+- **Source-agnostic engine.** The input-driven engine — mouse clicks (and selected keys) forming
+  checkpoints + screenshots, plus notes — is the *primary event driver* (the oracle), and traffic is
+  just what gets anchored to it (DESIGN §7). It runs the same for USB, PCIe, or both: interactive
+  `--source pcie` (drv/replay) records clicks→checkpoint+screenshot anchored to PCIe events, exactly
+  like USB. `Checkpoint.anchor` (the primary) is USB when a USB source is active, else PCIe; other
+  concurrently-captured sources go in `anchors`. So a PCIe-only session behaves like a USB-only one
+  (`ls` shows `anchor=N`; `diff`/`export`/`frames` work). Headless/automation, the ETW backend, and
+  non-Windows use the portable `record.rs` loop (no input/screen capture).
 - **USB + PCIe co-logging.** `record --with-pcie` captures a PCIe device *concurrently* with USB in
   one session: a PCIe reader thread writes `pcie.bin`/`pcie.idx` on the same clock while the USB
   hubs write `usb.pcapng`. Every checkpoint then gets a **secondary anchor** — `Checkpoint.anchors`
   (a `Vec<TrafficAnchor>`, each source-tagged) holds the nearest preceding PCIe event, while
   `anchor` stays the USB frame — so one click/note reaches *both* wires. `reveng-rec show` decodes
   each anchor against its own log; `ls` hints the PCIe anchor; the viewer renders the co-logged
-  PCIe event under the checkpoint card. The secondary source is a live device (`--pci-backend drv`,
+  PCIe event under the checkpoint card. Live PCIe capture stops promptly on window-Stop / max-seconds
+  (the `drv` reader honors a stop flag even with no deadline). The secondary source is a live device (`--pci-backend drv`,
   `--pci-bdf`/`--pci-vidpid`) or, portably, `--pcie-replay <events.jsonl>`. PCIe traffic also drives
   interval checkpoints, and `--max-bytes` caps total captured bytes.
   Single-source sessions serialize identically to before (`anchors` omitted when empty).

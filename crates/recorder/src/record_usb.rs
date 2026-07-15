@@ -14,7 +14,7 @@ use crate::record::RecordSummary;
 use anyhow::Result;
 use reveng_core::checkpoint::{Checkpoint, CheckpointConfig, CheckpointType};
 use reveng_core::clock::Clock;
-use reveng_core::event::{SourceKind, TrafficAnchor, TrafficKind, UsbFrameHeader};
+use reveng_core::event::{PcieEvent, SourceKind, TrafficAnchor, TrafficKind, UsbFrameHeader};
 use reveng_core::index::IndexFile;
 use reveng_core::session::{SessionRecord, SessionWriter};
 use reveng_core::source::CaptureSource;
@@ -96,6 +96,11 @@ pub struct LiveStats {
     pub usb_by_ep: std::collections::BTreeMap<u8, EpStat>,
     pub pcie_events: u64,
     pub pcie_bytes: u64,
+    /// PCIe event counts by kind, for the recording-window PCIe panel.
+    pub pcie_config: u64,
+    pub pcie_mmio: u64,
+    pub pcie_dma: u64,
+    pub pcie_irq: u64,
 }
 
 /// Capture-side packet filter (reduction for high-data devices like cameras): drop chosen
@@ -142,6 +147,9 @@ pub struct PcieCapture {
     pub stop: Box<dyn Fn() + Send + Sync>,
     /// Extra `meta.json` fields describing the PCIe acquisition.
     pub meta: serde_json::Value,
+    /// Live MMIO/DMA snapshot toggles (drv backend only), so the window can pause them.
+    pub trace_mmio: Option<Arc<AtomicBool>>,
+    pub trace_dma: Option<Arc<AtomicBool>>,
 }
 
 /// Shared PCIe-reader→engine state: the latest PCIe event, for secondary-anchor resolution.
@@ -265,7 +273,8 @@ pub fn run_usb_capture(
     //     event as well as the USB frame. The source is already started by the caller. ---
     let mut pcie_meta: Option<serde_json::Value> = None;
     let (pcie_state, pcie_stop, pcie_reader) = if let Some(pcie) = pcie {
-        let PcieCapture { source, stop, meta } = pcie;
+        // trace_mmio/dma toggles are held by the source + window; not needed here.
+        let PcieCapture { source, stop, meta, .. } = pcie;
         let log = PcieLog::create(session.pcie_bin(), session.pcie_idx())?;
         let st = Arc::new(Mutex::new(PcieState::default()));
         let handle = {
@@ -283,8 +292,9 @@ pub fn run_usb_capture(
         (None, None, None)
     };
 
-    // --- the checkpoint engine ---
-    let mut engine = Engine::new(session, &opts, shot_tx, clock.clone(), pcie_state.clone());
+    // --- the checkpoint engine --- (USB is primary when at least one USB source started)
+    let usb_active = writer.is_some();
+    let mut engine = Engine::new(session, &opts, shot_tx, clock.clone(), usb_active, pcie_state.clone());
     engine.emit(CheckpointType::SessionStart, "session_start", 0, None, false, (0, 0), None)?;
 
     let start = Instant::now();
@@ -499,8 +509,11 @@ struct Engine {
     alt_down: bool,
     stop_vk: u16,
     stop_requested: bool,
-    /// Latest PCIe event, when co-logging (`--with-pcie`); source of each checkpoint's
-    /// secondary anchor.
+    /// Whether USB is a configured source. When true, USB is the primary anchor and PCIe (if
+    /// any) is secondary; when false (PCIe-only), PCIe becomes the primary anchor.
+    usb_active: bool,
+    /// Latest PCIe event, when co-logging (`--with-pcie`) or PCIe-only; source of a checkpoint's
+    /// PCIe anchor.
     pcie_state: Option<Arc<Mutex<PcieState>>>,
     /// Most recent foreground app that wasn't our own window — used as the context for a note
     /// checkpoint (while typing a note, *our* window is foreground, which isn't useful).
@@ -514,6 +527,7 @@ impl Engine {
         opts: &UsbRecordOpts,
         shot_tx: std::sync::mpsc::Sender<(u64, reveng_winshot::Scope)>,
         clock: Clock,
+        usb_active: bool,
         pcie_state: Option<Arc<Mutex<PcieState>>>,
     ) -> Self {
         Self {
@@ -533,6 +547,7 @@ impl Engine {
             alt_down: false,
             stop_vk: opts.stop_vk,
             stop_requested: false,
+            usb_active,
             pcie_state,
             last_foreign_fg: None,
             _clock: clock,
@@ -585,20 +600,28 @@ impl Engine {
             }
         }
 
-        if let Some(a) = &anchor {
-            let proc = fg_process.clone().unwrap_or_else(|| "?".into());
-            self.comments
-                .push((a.event_index, format!("CHECKPOINT #{id} — {cause} in {proc}")));
-        }
-
-        // Co-logging: also anchor to the nearest preceding PCIe event, so this checkpoint
-        // reaches both wires (empty when not co-logging or no PCIe event yet).
-        let anchors: Vec<TrafficAnchor> = self
+        // Primary anchor = the configured primary source: USB when a USB source is active, else
+        // PCIe (a PCIe-only session anchors clicks/notes to PCIe events, same as USB does to
+        // frames). Any other concurrently-captured source goes in `anchors` (co-logging).
+        let pcie_anchor = self
             .pcie_state
             .as_ref()
-            .and_then(|st| pcie_anchor_of(&st.lock().unwrap()))
-            .into_iter()
-            .collect();
+            .and_then(|st| pcie_anchor_of(&st.lock().unwrap()));
+        let (anchor, anchors): (Option<TrafficAnchor>, Vec<TrafficAnchor>) = if self.usb_active {
+            (anchor, pcie_anchor.into_iter().collect())
+        } else {
+            (pcie_anchor, Vec::new())
+        };
+
+        // Checkpoint comments are injected into the USB pcapng, which only exists when USB is
+        // active — so only record them then.
+        if self.usb_active {
+            if let Some(a) = &anchor {
+                let proc = fg_process.clone().unwrap_or_else(|| "?".into());
+                self.comments
+                    .push((a.event_index, format!("CHECKPOINT #{id} — {cause} in {proc}")));
+            }
+        }
 
         let ckpt = Checkpoint {
             id,
@@ -783,6 +806,12 @@ fn pcie_reader_loop(
                         let mut g = stats.lock().unwrap();
                         g.pcie_events += 1;
                         g.pcie_bytes += bytes;
+                        match ev {
+                            PcieEvent::Config { .. } => g.pcie_config += 1,
+                            PcieEvent::Mmio { .. } => g.pcie_mmio += 1,
+                            PcieEvent::Dma { .. } => g.pcie_dma += 1,
+                            PcieEvent::Irq { .. } => g.pcie_irq += 1,
+                        }
                     }
                 }
             }

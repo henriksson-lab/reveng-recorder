@@ -18,6 +18,27 @@ struct Cli {
     session: PathBuf,
 }
 
+/// Paint one traffic-density strip: a full-width histogram, bar height + colour intensity ∝
+/// bucket count. No-op for an empty strip.
+fn draw_density_strip(ui: &mut egui::Ui, bins: &[u32], h: f32, color: impl Fn(u8) -> egui::Color32) {
+    if bins.is_empty() {
+        return;
+    }
+    let max = (*bins.iter().max().unwrap_or(&1)).max(1) as f32;
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+    let bw = rect.width() / bins.len() as f32;
+    for (i, &c) in bins.iter().enumerate() {
+        let frac = c as f32 / max;
+        let x = rect.left() + i as f32 * bw;
+        let bar = egui::Rect::from_min_max(
+            egui::pos2(x, rect.bottom() - h * frac),
+            egui::pos2(x + bw.max(1.0), rect.bottom()),
+        );
+        let shade = (60.0 + 180.0 * frac) as u8;
+        ui.painter().rect_filled(bar, 0.0, color(shade));
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
     let model = SessionModel::open(&cli.session)?;
@@ -42,10 +63,15 @@ struct App {
     secondary_rows: Vec<model::InspectorRow>,
     tex: Option<egui::TextureHandle>,
     loaded_for: Option<usize>,
+    /// Traffic density buckets across the whole capture (timeline overlay), computed once.
+    /// `density` = primary source; `density_pcie` = co-logged PCIe (empty if none).
+    density: Vec<u32>,
+    density_pcie: Vec<u32>,
 }
 
 impl App {
-    fn new(model: SessionModel) -> Self {
+    fn new(mut model: SessionModel) -> Self {
+        let (density, density_pcie) = model.traffic_density_split(120);
         Self {
             model,
             sel: 0,
@@ -54,6 +80,8 @@ impl App {
             secondary_rows: Vec::new(),
             tex: None,
             loaded_for: None,
+            density,
+            density_pcie,
         }
     }
 
@@ -113,6 +141,11 @@ impl eframe::App for App {
 
         // Timeline strip: one coloured tick per checkpoint, click to select.
         egui::Panel::top("timeline").show(ui, |ui| {
+            // Traffic-density overlay: busy regions of the whole capture at a glance. Primary
+            // source in teal; co-logged PCIe (if any) in a thinner purple strip below, on the
+            // same time axis.
+            draw_density_strip(ui, &self.density, 18.0, |s| egui::Color32::from_rgb(40, s, s));
+            draw_density_strip(ui, &self.density_pcie, 12.0, |s| egui::Color32::from_rgb(s, 40, s));
             ui.add_space(2.0);
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 ui.horizontal(|ui| {

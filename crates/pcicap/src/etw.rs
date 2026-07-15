@@ -18,7 +18,9 @@ use reveng_core::clock::Clock;
 use reveng_core::event::{PcieEvent, SourceKind, TrafficKind, TrafficRecord};
 use reveng_core::source::CaptureSource;
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use windows::core::{GUID, PCWSTR, PWSTR};
@@ -75,6 +77,9 @@ pub struct EtwIrqSource {
     ns_anchor: i64,
     qpc_freq: i64,
     deadline: Option<Instant>,
+    /// Set by [`stop_handle`] to end an unbounded stream promptly (used when ETW is a
+    /// concurrent PCIe secondary with no deadline). Checked in `next`'s poll loop.
+    stop: Arc<AtomicBool>,
 }
 
 impl EtwIrqSource {
@@ -91,7 +96,14 @@ impl EtwIrqSource {
             ns_anchor: 0,
             qpc_freq: 1,
             deadline: None,
+            stop: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    /// A flag another thread can set to stop this source (for finalize when it's a concurrent
+    /// secondary). Setting it makes `next` return `Ok(None)` within one poll (~200 ms).
+    pub fn stop_handle(&self) -> Arc<AtomicBool> {
+        self.stop.clone()
     }
 
     fn fold_qpc(&self, qpc: i64) -> i64 {
@@ -317,6 +329,7 @@ impl CaptureSource for EtwIrqSource {
             })?;
         self.consumer = Some(consumer);
 
+        self.stop.store(false, Ordering::Relaxed);
         self.deadline = self.opts.max_duration.map(|d| Instant::now() + d);
         Ok(())
     }
@@ -327,6 +340,9 @@ impl CaptureSource for EtwIrqSource {
             None => return Ok(None),
         };
         loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return Ok(None);
+            }
             if let Some(dl) = self.deadline {
                 if Instant::now() >= dl {
                     return Ok(None);
@@ -354,6 +370,7 @@ impl CaptureSource for EtwIrqSource {
     }
 
     fn stop(&mut self) -> anyhow::Result<()> {
+        self.stop.store(true, Ordering::Relaxed);
         // Stopping the session makes ProcessTrace return, which lets the consumer thread exit.
         if let Some(session) = self.session.take() {
             let name = wide(KERNEL_LOGGER_NAME);

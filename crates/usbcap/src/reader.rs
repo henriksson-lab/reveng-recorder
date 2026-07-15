@@ -103,6 +103,12 @@ impl UsbReader {
         Ok(self.idx.get(i)?.endpoint)
     }
 
+    /// Frame `i`'s timestamp straight from the index record (for timeline density bucketing).
+    pub fn ts_at(&mut self, i: u64) -> anyhow::Result<i64> {
+        use reveng_core::index::FixedRecord;
+        Ok(self.idx.get(i)?.ts_ns())
+    }
+
     /// Just the raw payload bytes of frame `i` (no hex/ascii/base64 rendering).
     pub fn payload_at(&mut self, i: u64) -> anyhow::Result<Vec<u8>> {
         let (_rec, packet) = self.raw_packet(i)?;
