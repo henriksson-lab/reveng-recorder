@@ -108,6 +108,7 @@ pub fn run_recording_window<F>(
     out: PathBuf,
     usb_active: bool,
     pcie_active: bool,
+    mem_active: bool, // memory snapshots armed (--mem-pid/--mem-process) → show the Snapshot button
     trace: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>, // (mmio, dma) live toggles, drv only
     record: F,
 ) -> Result<RecordSummary>
@@ -115,12 +116,15 @@ where
     F: FnOnce(NotesUi) -> Result<RecordSummary> + Send + 'static,
 {
     let (note_tx, note_rx) = std::sync::mpsc::channel::<(i64, String)>();
+    // Memory-snapshot trigger: the window holds the sender, the capture loop the receiver.
+    let (snap_tx, snap_rx) = std::sync::mpsc::channel::<i64>();
     let stop_flag = Arc::new(AtomicBool::new(false));
     let worker_done = Arc::new(AtomicBool::new(false));
     let stats = Arc::new(Mutex::new(LiveStats::default()));
 
     let wiring = NotesUi {
         note_rx,
+        snap_rx: mem_active.then_some(snap_rx),
         stop_flag: stop_flag.clone(),
         stats: stats.clone(),
     };
@@ -139,8 +143,23 @@ where
     let window = RecordWindow::new().map_err(|e| anyhow::anyhow!("create window: {e}"))?;
     window.set_usb_active(usb_active);
     window.set_pcie_active(pcie_active);
+    window.set_mem_active(mem_active);
     let notes_model: Rc<VecModel<NoteRow>> = Rc::new(VecModel::default());
     window.set_notes(ModelRc::from(notes_model.clone()));
+
+    // Snapshot button → stamp on the master clock and trigger a memory snapshot on the worker.
+    if mem_active {
+        let clock = clock.clone();
+        let weak = window.as_weak();
+        let count = Rc::new(Cell::new(0u32));
+        window.on_snapshot(move || {
+            let _ = snap_tx.send(clock.now_ns());
+            count.set(count.get() + 1);
+            if let Some(w) = weak.upgrade() {
+                w.set_snap_count(format!("{} snapshot(s)", count.get()).as_str().into());
+            }
+        });
+    }
 
     // Live MMIO/DMA trace toggles (drv backend): checkboxes flip the shared flags mid-capture.
     if let Some((mmio, dma)) = trace {

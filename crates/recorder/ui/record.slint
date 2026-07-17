@@ -129,6 +129,10 @@ export component RecordWindow inherits Window {
     in-out property <bool> trace_mmio_on;
     in-out property <bool> trace_dma_on;
 
+    // Process-memory snapshots (--mem-pid/--mem-process): show the Snapshot button + a counter.
+    in property <bool> mem_active: false;
+    in property <string> snap_count: "";
+
     // Enter pressed in the input box, with the note text.
     callback submit(string);
     // Stop button / window close.
@@ -136,6 +140,8 @@ export component RecordWindow inherits Window {
     // MMIO/DMA trace toggles flipped.
     callback trace_mmio_toggled(bool);
     callback trace_dma_toggled(bool);
+    // Memory-snapshot button pressed.
+    callback snapshot();
 
     VerticalBox {
         padding: 10px;
@@ -275,6 +281,20 @@ export component RecordWindow inherits Window {
                 checked <=> root.trace_dma_on;
                 toggled => {
                     root.trace_dma_toggled(self.checked);
+                }
+            }
+            Text {
+                visible: root.mem_active;
+                text: root.snap_count;
+                font-size: 11px;
+                color: #888888;
+                vertical-alignment: center;
+            }
+            Button {
+                visible: root.mem_active;
+                text: "📸 Snapshot";
+                clicked => {
+                    root.snapshot();
                 }
             }
             Rectangle { horizontal-stretch: 1; }

@@ -16,6 +16,7 @@ reveng-usbcap.workspace = true
 reveng-pcicap.workspace = true
 reveng-winput.workspace = true
 reveng-winshot.workspace = true
+reveng-memcap.workspace = true
 reveng-export.workspace = true
 anyhow.workspace = true
 serde.workspace = true

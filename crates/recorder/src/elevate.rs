@@ -25,6 +25,21 @@ pub fn relaunch_elevated(args: &[String]) -> anyhow::Result<u32> {
     imp::relaunch_elevated(args)
 }
 
+/// Enable `SeDebugPrivilege` in this process token so `OpenProcess(PROCESS_VM_READ)` reaches
+/// targets owned by other users (needed for memory snapshots). Best-effort: it's present only
+/// in an elevated token, and enterprise policy can remove it — on failure the later
+/// `OpenProcess` just returns a clear error. No-op off Windows.
+pub fn enable_debug_privilege() -> anyhow::Result<()> {
+    #[cfg(windows)]
+    {
+        imp::enable_debug_privilege()
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(())
+    }
+}
+
 #[cfg(windows)]
 mod imp {
     use windows::core::PCWSTR;
@@ -55,6 +70,34 @@ mod imp {
             res?;
             Ok(elevation.TokenIsElevated != 0)
         }
+    }
+
+    pub fn enable_debug_privilege() -> anyhow::Result<()> {
+        use windows::core::w;
+        use windows::Win32::Foundation::LUID;
+        use windows::Win32::Security::{
+            AdjustTokenPrivileges, LookupPrivilegeValueW, LUID_AND_ATTRIBUTES,
+            SE_PRIVILEGE_ENABLED, TOKEN_ADJUST_PRIVILEGES, TOKEN_PRIVILEGES,
+        };
+        unsafe {
+            let mut token = HANDLE::default();
+            OpenProcessToken(
+                GetCurrentProcess(),
+                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                &mut token,
+            )?;
+            let mut luid = LUID::default();
+            let looked = LookupPrivilegeValueW(None, w!("SeDebugPrivilege"), &mut luid);
+            let tp = TOKEN_PRIVILEGES {
+                PrivilegeCount: 1,
+                Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+            };
+            let adjusted = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None);
+            let _ = CloseHandle(token);
+            looked?;
+            adjusted?; // note: succeeds even if the privilege isn't held (ERROR_NOT_ALL_ASSIGNED)
+        }
+        Ok(())
     }
 
     pub fn relaunch_elevated(args: &[String]) -> anyhow::Result<u32> {

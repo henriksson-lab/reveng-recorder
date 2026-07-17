@@ -117,6 +117,7 @@ fn record_pcie(
             anchor,
             anchors: Vec::new(),
             screenshot_id: None,
+            mem_snapshot_id: None,
             fg_process: None,
             fg_window: None,
             cursor: (0, 0),

@@ -197,6 +197,182 @@ fn fmt_elapsed(ns: i64) -> String {
     format!("{:02}:{:02}.{:03}", secs / 60, secs % 60, ms)
 }
 
+// ---- process-memory snapshots: the decoded-form oracle (reveng-memcap) -------------------
+
+fn snap_dir(s: &SessionReader, id: u64) -> std::path::PathBuf {
+    s.memsnaps_dir().join(format!("{id:06}"))
+}
+
+fn load_meta(dir: &Path) -> Result<reveng_memcap::MemSnapshotMeta> {
+    let raw = std::fs::read(dir.join("manifest.json"))
+        .with_context(|| format!("no memory snapshot at {}", dir.display()))?;
+    Ok(serde_json::from_slice(&raw)?)
+}
+
+fn hex_inline(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+}
+
+fn parse_addr(s: &str) -> Result<u64> {
+    let s = s.trim();
+    if let Some(h) = s.strip_prefix("0x").or_else(|| s.strip_prefix("0X")) {
+        Ok(u64::from_str_radix(h, 16)?)
+    } else {
+        Ok(s.parse()?)
+    }
+}
+
+/// `mem ls` — snapshots taken during the session, each with the timeline context (elapsed +
+/// the traffic frame live when it was taken) so you know what to diff against what.
+pub fn mem_ls(session_dir: &Path) -> Result<()> {
+    let s = SessionReader::open(session_dir)?;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    for c in s.checkpoints()? {
+        let Some(mid) = c.mem_snapshot_id else { continue };
+        let meta = load_meta(&snap_dir(&s, mid)).ok();
+        let line = serde_json::json!({
+            "snapshot": mid,
+            "checkpoint": c.id,
+            "ts_ns": c.ts_ns,
+            "elapsed": fmt_elapsed(c.ts_ns),
+            "pid": meta.as_ref().map(|m| m.pid),
+            "process": meta.as_ref().map(|m| m.process.clone()),
+            "total_bytes": meta.as_ref().map(|m| m.total_bytes),
+            "stored_bytes": meta.as_ref().map(|m| m.stored_bytes),
+            "compression": meta.as_ref().map(|m| m.compression.clone()),
+            "regions": meta.as_ref().map(|m| m.regions.len()),
+            "anchor_index": c.anchor.map(|a| a.event_index),
+            "note": c.note,
+        });
+        writeln!(w, "{line}")?;
+    }
+    Ok(())
+}
+
+/// `mem regions` — the region table of one snapshot.
+pub fn mem_regions(session_dir: &Path, id: u64) -> Result<()> {
+    let s = SessionReader::open(session_dir)?;
+    let meta = load_meta(&snap_dir(&s, id))?;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    for r in &meta.regions {
+        let line = serde_json::json!({
+            "base": format!("0x{:x}", r.base),
+            "size": r.size,
+            "stored_len": r.stored_len,
+            "protect": format!("0x{:x}", r.protect),
+            "mem_type": format!("0x{:x}", r.mem_type),
+            "hash": r.hash,
+        });
+        writeln!(w, "{line}")?;
+    }
+    Ok(())
+}
+
+/// `mem diff a b` — the before→after delta. New and Changed regions carry the acquired data,
+/// so they're ranked first; each changed byte-run shows old vs new (truncated to `max`).
+pub fn mem_diff(session_dir: &Path, a: u64, b: u64, max: usize) -> Result<()> {
+    use reveng_memcap::RegionDelta;
+    let s = SessionReader::open(session_dir)?;
+    let la = reveng_memcap::LoadedSnapshot::load(&snap_dir(&s, a))?;
+    let lb = reveng_memcap::LoadedSnapshot::load(&snap_dir(&s, b))?;
+    let mut deltas = reveng_memcap::diff(&la, &lb);
+    let rank = |d: &RegionDelta| match d {
+        RegionDelta::New { .. } => 0,
+        RegionDelta::Changed { .. } => 1,
+        RegionDelta::Resized { .. } => 2,
+        RegionDelta::Freed { .. } => 3,
+    };
+    deltas.sort_by_key(|d| (rank(d), delta_base(d)));
+
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    for d in &deltas {
+        let line = match d {
+            RegionDelta::New { base, size } => serde_json::json!({
+                "kind": "new", "base": format!("0x{base:x}"), "size": size }),
+            RegionDelta::Freed { base, size } => serde_json::json!({
+                "kind": "freed", "base": format!("0x{base:x}"), "size": size }),
+            RegionDelta::Resized { base, old_size, new_size } => serde_json::json!({
+                "kind": "resized", "base": format!("0x{base:x}"),
+                "old_size": old_size, "new_size": new_size }),
+            RegionDelta::Changed { base, size, changes } => {
+                let cs: Vec<_> = changes
+                    .iter()
+                    .map(|c| {
+                        let n = c.old.len().min(c.new.len());
+                        serde_json::json!({
+                            "addr": format!("0x{:x}", c.abs_addr),
+                            "offset": c.offset,
+                            "len": n,
+                            "old": hex_inline(&c.old[..n.min(max)]),
+                            "new": hex_inline(&c.new[..n.min(max)]),
+                            "truncated": n > max,
+                        })
+                    })
+                    .collect();
+                serde_json::json!({
+                    "kind": "changed", "base": format!("0x{base:x}"), "size": size,
+                    "changed_runs": cs.len(), "changes": cs })
+            }
+        };
+        writeln!(w, "{line}")?;
+    }
+    Ok(())
+}
+
+fn delta_base(d: &reveng_memcap::RegionDelta) -> u64 {
+    use reveng_memcap::RegionDelta::*;
+    match d {
+        New { base, .. } | Freed { base, .. } | Resized { base, .. } | Changed { base, .. } => *base,
+    }
+}
+
+/// `mem scan id <value>` — find every encoding of a known (on-screen) value in a snapshot.
+/// The seed that turns a noisy diff into a precise pointer.
+pub fn mem_scan(session_dir: &Path, id: u64, value: &str) -> Result<()> {
+    let s = SessionReader::open(session_dir)?;
+    let snap = reveng_memcap::LoadedSnapshot::load(&snap_dir(&s, id))?;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    for h in reveng_memcap::scan(&snap, value) {
+        let line = serde_json::json!({
+            "addr": format!("0x{:x}", h.abs_addr),
+            "encoding": h.encoding,
+            "region_base": format!("0x{:x}", h.region_base),
+            "offset": h.offset,
+        });
+        writeln!(w, "{line}")?;
+    }
+    Ok(())
+}
+
+/// `mem read id <addr> <len>` — hex/auto-render a slice of a snapshot at a target address.
+pub fn mem_read(session_dir: &Path, id: u64, addr: &str, len: u64) -> Result<()> {
+    let s = SessionReader::open(session_dir)?;
+    let snap = reveng_memcap::LoadedSnapshot::load(&snap_dir(&s, id))?;
+    let addr = parse_addr(addr)?;
+    let Some(r) = snap
+        .meta
+        .regions
+        .iter()
+        .find(|r| addr >= r.base && addr < r.base + r.size)
+    else {
+        anyhow::bail!("address 0x{addr:x} is not inside any captured region");
+    };
+    let bytes = snap.region_bytes(r);
+    let start = (addr - r.base) as usize;
+    let end = (start + len as usize).min(bytes.len());
+    let slice = &bytes[start..end];
+    if reveng_core::text::is_texty(slice) {
+        print!("{}", String::from_utf8_lossy(slice));
+    } else {
+        print!("{}", hexdump(slice));
+    }
+    Ok(())
+}
+
 /// `show` — a checkpoint card, including the anchored traffic event.
 pub fn show(session_dir: &Path, id: u64) -> Result<()> {
     let s = SessionReader::open(session_dir)?;

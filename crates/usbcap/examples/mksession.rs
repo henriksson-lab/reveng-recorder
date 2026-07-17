@@ -53,6 +53,7 @@ fn main() -> anyhow::Result<()> {
             }),
             anchors: Vec::new(),
             screenshot_id: None,
+            mem_snapshot_id: None,
             fg_process: Some("Vendor.exe".into()),
             fg_window: Some("Device Config".into()),
             cursor: (842, 391),

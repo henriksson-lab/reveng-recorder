@@ -43,6 +43,10 @@ impl SessionWriter {
     pub fn screenshots_dir(&self) -> PathBuf {
         self.root.join("screenshots")
     }
+    /// Directory holding process-memory snapshots (`memsnaps/<id:06>/`), created on first use.
+    pub fn memsnaps_dir(&self) -> PathBuf {
+        self.root.join("memsnaps")
+    }
     pub fn usb_pcapng(&self) -> PathBuf {
         self.root.join("usb.pcapng")
     }
@@ -104,6 +108,10 @@ impl SessionReader {
     }
     pub fn frames_idx(&self) -> PathBuf {
         self.root.join("frames.idx")
+    }
+    /// Directory holding process-memory snapshots (`memsnaps/<id:06>/`).
+    pub fn memsnaps_dir(&self) -> PathBuf {
+        self.root.join("memsnaps")
     }
 
     pub fn meta(&self) -> anyhow::Result<serde_json::Value> {
@@ -169,6 +177,7 @@ mod tests {
             }),
             anchors: Vec::new(),
             screenshot_id: None,
+            mem_snapshot_id: None,
             fg_process: None,
             fg_window: None,
             cursor: (0, 0),

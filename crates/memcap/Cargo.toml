@@ -1,0 +1,23 @@
+[package]
+name = "reveng-memcap"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Process memory snapshotting + before/after delta (the decoded-form oracle)."
+
+[dependencies]
+reveng-core.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# Pure-Rust deflate (miniz_oxide backend, no C toolchain) for optional per-region compression.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Diagnostics_ToolHelp",
+] }

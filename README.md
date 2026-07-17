@@ -40,7 +40,7 @@ instant plus the USB frames around it, and can hand off to Wireshark at the exac
 ## Current state
 
 **The entire USB path is implemented and verified end-to-end on Windows; the PCIe hypervisor
-is the only remaining tier.** `cargo build --workspace` and `cargo test --workspace` pass (20
+is the only remaining tier.** `cargo build --workspace` and `cargo test --workspace` pass (41
 tests). Windows-only code is `cfg`-gated so everything still compiles on other OSes.
 
 - **Real, tested, cross-platform (any OS):**
@@ -66,6 +66,12 @@ tests). Windows-only code is `cfg`-gated so everything still compiles on other O
     the stop hotkey (Ctrl+Alt+Pause) and `--max-seconds`, and finalize with comment injection.
   - `viewer` — the egui timeline / screenshot pane / traffic inspector with click + ←/→ seek.
   - `export` Wireshark handoff (`wireshark.exe -r … -g <frame>`) and the `devices` command.
+  - `memcap` — **process-memory snapshots** (the "decoded-form oracle", DESIGN.md §6a). `record
+    --mem-pid <PID>` / `--mem-process <name.exe>` arms a 📸 Snapshot button in the recording window;
+    each press dumps the target's committed memory to `memsnaps/<id>/` on a worker, anchored to the
+    live frame. Query the before/after delta with `reveng-rec mem ls|regions|diff|scan|read`. Capture
+    is chunked/streamed (bounded RAM) with optional `--mem-compress` (region-parallel deflate);
+    Windows-only capture, cross-platform diff/scan.
 
   > The whole live USB pipeline (reader → checkpoints → screenshots → comment injection →
   > query → viewer) is verified without real USBPcap hardware via a fake `USBPcapCMD` emitting
@@ -83,7 +89,7 @@ tests). Windows-only code is `cfg`-gated so everything still compiles on other O
 
 ```
 cargo build --workspace      # all crates (Windows bits cfg-gated on non-Windows)
-cargo test  --workspace      # 13 tests: index, checkpoints, USBPcap parse, pcie log, pcapng
+cargo test  --workspace      # 41 tests: index, checkpoints, USBPcap/pcapng parse, pcie log, text/dashboard formatters, mem diff/scan/deflate
 ./target/debug/reveng-rec --help
 ```
 
@@ -194,6 +200,12 @@ binary. The loop for reverse-engineering a proprietary protocol:
    decoded fields against what the screenshot showed (`reveng-rec track`, `diff`, `bytes --stats`).
 7. Refine, save the decoder to `decoders/`, re-decode to render semantic fields.
 
+**No clean export?** When the wire bytes are opaque and the vendor app is the only thing that decodes
+them, arm a memory snapshot (`record --mem-pid <PID>`), click 📸 Snapshot just before and after
+acquiring a reading, then `reveng-rec mem diff` → `mem scan "<on-screen value>"` → `mem read` to
+recover the *decoded* struct out of the app's memory — cross-referenced with the same checkpoint's
+wire `anchor`. That's the wire → memory → screen triple (the decoded-form oracle, `DESIGN.md` §6a).
+
 The full contract (CLI, file formats, decoder interface, reassembly) is in `DESIGN.md` §8–§8b.
 
 ## Ethical / safety note
@@ -219,6 +231,7 @@ reveng-recorder/
     pcicap/            # PCIe source: real ReplayPcieSource; HvPcieSource stubbed (hypervisor tier)
     winput/            # REAL (win): WH_MOUSE_LL/WH_KEYBOARD_LL hooks + fg context enrichment
     winshot/           # REAL (win): GDI BitBlt screen capture → PNG
+    memcap/            # REAL (win capture) + portable diff/scan: process-memory snapshots (mem CLI)
     export/            # REAL: pcapng slicing + Wireshark handoff
     recorder/          # bin `reveng-rec`: full CLI + USB orchestration + query over USB/PCIe
     viewer/            # bin `reveng-viewer`: REAL egui timeline / screenshot / inspector / seek

@@ -110,6 +110,7 @@ reveng-recorder/
     pcicap/      # PCIe CaptureSource: talks to reveng-hv, emits Mmio/Dma/Irq/Config events (§4a)
     winput/      # LL mouse/keyboard hooks, InputEvent
     winshot/     # screen capture (GDI default, DXGI Desktop Duplication optional) + PNG encode
+    memcap/      # process-memory snapshot capture (Windows) + before/after diff/scan (portable) (§6a)
     recorder/    # bin: orchestration, checkpoint engine, control/hotkey
     viewer/      # bin: egui app — timeline, inspector, seek, export
     export/      # pcapng slicing + Wireshark handoff (shared by viewer)
@@ -118,7 +119,9 @@ reveng-recorder/
 ```
 
 All acquisition backends implement one `CaptureSource` trait (emit timestamped events onto the
-shared timeline); USB and PCIe differ only in acquisition, not in anything downstream.
+shared timeline); USB and PCIe differ only in acquisition, not in anything downstream. `memcap` is
+the exception — not a traffic backend but a manual-trigger **checkpoint attachment** (like
+screenshots): it hangs a decoded-memory snapshot off a checkpoint rather than streaming events. See §6a.
 
 Key deps: `windows` (windows-rs) for hooks/capture/clock, `crossbeam-channel`, `rusqlite`,
 `serde`/`serde_json`, `image` (PNG), `eframe`/`egui` for the viewer, `clap` for the CLI.
@@ -295,6 +298,92 @@ screenshot(id PK, ts_ns, path, monitor_idx, width, height, trigger_checkpoint)
 
 ---
 
+## 6a. Process-memory snapshots (the decoded-form oracle)
+
+Some protocols never expose a clean export: the bytes on the wire (or in a file) are compressed,
+chunked, or checksummed, and the vendor app is the only thing that decodes them. But once the app
+*has* parsed them, its **resident memory holds the decoded form** — floats as IEEE-754, strings as
+UTF-16, arrays laid out contiguously. Snapshotting the target process's memory **before and after a
+data acquisition** and diffing the two points straight at where the acquired data landed, already
+decoded. This is a third leg of the oracle (§8b): pair a changed memory address with the on-screen
+value that produced it (`scan`) and the on-the-wire bytes at that instant (the checkpoint `anchor`) —
+the **wire → memory → screen** triple.
+
+It has the same shape as screenshots (§6): a heavy capture done on a worker, stored as side files,
+referenced by an id on the checkpoint. It is **not** a `CaptureSource` (it isn't a streamed traffic
+backend) — it's a **manual-trigger checkpoint attachment**, Windows-only (`crates/memcap`,
+`cfg`-gated like `winput`/`winshot`; the format + diff/scan analysis is cross-platform).
+
+**Capturing.** `reveng-rec record --mem-pid <PID>` (or `--mem-process <name.exe>`) arms it; the
+recording window then shows a **📸 Snapshot** button. Each press dumps the target's committed,
+private, writable memory on a worker thread and emits a `Manual` checkpoint carrying a
+`mem_snapshot_id` — anchored to the traffic frame live at that instant, exactly as a click carries
+`screenshot_id`. Needs Administrator + `SeDebugPrivilege` (auto-enabled in `elevate.rs`) to open a
+cross-user target. It is a genuine full memory reader — same authorized-machine posture as the rest
+of the tool (§12).
+
+**Capture is streamed and bounded.** The address space is walked region by region and each region is
+read in fixed **4 MiB chunks** (`VirtualQueryEx` + `ReadProcessMemory`), streamed straight to disk —
+so peak capture memory is bounded by the chunk, not the region or the whole target footprint.
+`--mem-compress` stores each region as an independent **deflate** stream (pure-Rust `flate2`); regions
+are deflated on a **bounded region-parallel thread pool** so compression overlaps capture, the queue
+bound providing backpressure. The read side (`diff`/`scan`) loads a snapshot's uncompressed image into RAM.
+
+**Storage** (side files, not in `events.ndjson` — the same pattern as `screenshots/`):
+
+```
+memsnaps/
+  000000/
+    manifest.json   # MemSnapshotMeta
+    regions.bin     # each region's bytes at file_offset for stored_len bytes (deflate if compressed)
+  000001/ ...
+```
+
+```rust
+struct MemSnapshotMeta {
+    id: u64, ts_ns: i64, pid: u32, process: String,
+    total_bytes: u64,     // uncompressed sum(size)
+    stored_bytes: u64,    // on-disk sum(stored_len) — the compressed size when --mem-compress
+    compression: String,  // "none" | "deflate"
+    regions: Vec<RegionMeta>,
+}
+struct RegionMeta {
+    base: u64, size: u64,           // target VA, uncompressed length
+    protect: u32, mem_type: u32,    // PAGE_* flags, MEM_PRIVATE/MAPPED/IMAGE
+    hash: String,                   // fnv1a64 of the uncompressed bytes (diff skips unchanged regions)
+    file_offset: u64, stored_len: u64,   // where/how many bytes in regions.bin
+}
+```
+
+**Querying** (the agent/LLM surface; composes with §8a.1):
+
+```
+reveng-rec mem ls   <session>                    # snapshots on the timeline: elapsed, pid, size, compression, anchored frame
+reveng-rec mem regions <session> <id>            # region table (base, size, protect, hash)
+reveng-rec mem diff <session> <a> <b>            # before→after delta: New/Changed/Freed/Resized regions
+reveng-rec mem scan <session> <id> <value>       # find a value's encodings (u8/u16/u32/u64 LE+BE, f32/f64, ASCII, UTF-16LE)
+reveng-rec mem read <session> <id> <addr> <len>  # hex/auto-render a slice at a target VA
+```
+
+`mem diff` ranks **New** and **Changed** regions first — they're what carry freshly-acquired data —
+and `--max` caps the bytes shown per changed run. `mem scan` is seeded with the value you can read
+straight off the screenshot, turning a noisy diff into a precise pointer.
+
+**Workflow (RE-loop style, §8b).** Arm on the vendor app, click **📸 Snapshot** just before and just
+after acquiring a reading, then:
+
+```
+reveng-rec mem diff  dev.session 0 1              # what memory changed across the acquisition
+reveng-rec mem scan  dev.session 1 "42.5"         # where the on-screen value 42.5 lives (→ an f64 at 0x…)
+reveng-rec mem read  dev.session 1 0x1f2a40 64    # dump that struct; recover neighbouring fields
+```
+
+Cross-reference the changed address with the checkpoint's USB/PCIe `anchor` (§7): the same click that
+changed memory is anchored to the bytes that arrived on the wire, so you learn the on-wire encoding
+*and* its decoded in-memory form in one shot.
+
+---
+
 ## 7. Checkpoints — the seek anchors
 
 A checkpoint is a marker on the unified timeline that also stores **where in the traffic stream** it
@@ -313,6 +402,7 @@ struct Checkpoint {
     // source is an addition, not a schema migration. See §4a / build-order note in §13.
     anchor: Option<TrafficAnchor>,
     screenshot_id: Option<u64>,
+    mem_snapshot_id: Option<u64>,// process-memory snapshot at this checkpoint (§6a), if triggered
     fg_process: Option<String>,  // context snapshot
     fg_window: Option<String>,
     cursor: (i32, i32),
@@ -355,6 +445,8 @@ session_2026-07-11_1030/
   index.sqlite       # DERIVED, rebuildable: checkpoint, screenshot, decoded-field tables
   screenshots/
     000001.png ...
+  memsnaps/          # process-memory snapshots (§6a), when armed — side files like screenshots/
+    000000/{manifest.json, regions.bin} ...
 ```
 
 - **Sources of truth:** `usb.pcapng` (USB) and `events.ndjson` (input/checkpoints). Both are
@@ -469,6 +561,7 @@ reveng-rec frames --range 10400:10460
 reveng-rec diff <ckptA> <ckptB>      # frames that differ between two checkpoints
 reveng-rec payload <frame> --format hex   # raw payload bytes of one frame
 reveng-rec grep <hexpattern>         # frames whose payload contains a byte pattern
+reveng-rec mem ls|regions|diff|scan|read  # process-memory snapshots taken during recording (§6a)
 ```
 
 **Text vs binary.** `payload` defaults to `--format auto`: endpoints that classify as text
@@ -722,6 +815,8 @@ Checkpoints default to: mouse button-down, a special-key set, and interval-durin
 | `--out <dir>` | `./session_<ts>` | session output directory |
 | `--stop-hotkey Ctrl+Alt+Pause` | set | clean-stop hotkey |
 | `--rotate-mb N` | off | rotate `usb.pcapng` into segments every N MB (see §8.2) |
+| `--mem-pid N` / `--mem-process name.exe` | off | arm process-memory snapshots against a target (§6a); the window shows a 📸 Snapshot button (needs admin + SeDebugPrivilege) |
+| `--mem-compress` | off | store each memory-snapshot region deflate-compressed (§6a) |
 
 ### 11.4 Equivalent TOML
 
@@ -775,7 +870,8 @@ reveng-rec record --device-vidpid 1234:abcd \
   buffer is the real backstop; if we can't keep up, *it* drops and we log a gap marker.
 - **Clock skew** between USB (system-time) and input (QPC) is a few ms — fine for click-seeking,
   called out for anyone needing bus-accurate timing.
-- **This is, functionally, a keylogger + screen recorder.** It's legitimate RE/defensive tooling,
+- **This is, functionally, a keylogger + screen recorder** — and, with `--mem-pid`/`--mem-process`
+  (§6a), a **process-memory reader** (admin + SeDebugPrivilege). It's legitimate RE/defensive tooling,
   but it must only be run on a machine the operator owns/is authorized to instrument. Sessions stay
   local; no network egress. Worth a consent banner + a visible "RECORDING" indicator.
 - **Non-goals (for now):** non-Windows platforms; **raw PCIe TLP / hardware analyzers** (the

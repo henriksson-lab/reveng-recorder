@@ -4675,6 +4675,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "reveng-memcap"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "flate2",
+ "reveng-core",
+ "serde",
+ "serde_json",
+ "windows",
+]
+
+[[package]]
 name = "reveng-pcicap"
 version = "0.0.1"
 dependencies = [
@@ -4694,6 +4706,7 @@ dependencies = [
  "clap",
  "reveng-core",
  "reveng-export",
+ "reveng-memcap",
  "reveng-pcicap",
  "reveng-usbcap",
  "reveng-winput",

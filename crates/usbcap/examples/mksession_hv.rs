@@ -127,6 +127,7 @@ fn main() -> anyhow::Result<()> {
             anchor: a,
             anchors: Vec::new(),
             screenshot_id: None,
+            mem_snapshot_id: None,
             fg_process: Some("CameraApp.exe".into()),
             fg_window: Some("Acme Webcam — Live".into()),
             cursor: (960, 540),

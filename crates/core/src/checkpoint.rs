@@ -30,6 +30,11 @@ pub struct Checkpoint {
     pub anchors: Vec<TrafficAnchor>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub screenshot_id: Option<u64>,
+    /// Process-memory snapshot captured at this checkpoint (id → `memsnaps/<id:06>/`), if the
+    /// user triggered one. The decoded-form oracle: pair with `anchor` (wire bytes) + the
+    /// screenshot (screen state). See `reveng-memcap`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_snapshot_id: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fg_process: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]

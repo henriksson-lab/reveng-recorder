@@ -61,6 +61,14 @@ pub struct UsbRecordOpts {
     pub endpoints: Option<Vec<u8>>,
     /// Stop once total captured traffic bytes (USB + PCIe) reach this budget. `None` = no cap.
     pub max_bytes: Option<u64>,
+    /// Arm manual process-memory snapshots against this PID (the decoded-form oracle). The
+    /// window shows a Snapshot button; each press dumps the target's memory + emits a checkpoint
+    /// carrying `mem_snapshot_id`. `None` = feature off.
+    pub mem_pid: Option<u32>,
+    /// Arm memory snapshots against the first process matching this image name (alt to `mem_pid`).
+    pub mem_process: Option<String>,
+    /// Compress each memory snapshot's `regions.bin` with deflate (smaller on disk, a little CPU).
+    pub mem_compress: bool,
 }
 
 /// Wiring from the live "recording" note window (`notes_ui`) into the capture loop.
@@ -69,6 +77,9 @@ pub struct UsbRecordOpts {
 pub struct NotesUi {
     /// `(ts_ns stamped at Enter, note text)`, one per submitted note.
     pub note_rx: Receiver<(i64, String)>,
+    /// `ts_ns` stamped when the window's Snapshot button is pressed — a manual memory-snapshot
+    /// trigger. `None` when memory snapshots aren't armed (`--mem-pid`/`--mem-process` unset).
+    pub snap_rx: Option<Receiver<i64>>,
     /// Set by the window's Stop button / close; a stop condition for the capture loop.
     pub stop_flag: Arc<AtomicBool>,
     /// Live per-source counters the window samples to render its rate/volume dashboard —
@@ -190,12 +201,13 @@ pub fn run_usb_capture(
     pcie: Option<PcieCapture>,
 ) -> Result<RecordSummary> {
     // The clock is created by the caller so the notes window shares this exact origin.
-    let (note_rx, ui_stop, stats) = match ui {
-        Some(u) => (Some(u.note_rx), Some(u.stop_flag), Some(u.stats)),
-        None => (None, None, None),
+    let (note_rx, snap_rx, ui_stop, stats) = match ui {
+        Some(u) => (Some(u.note_rx), u.snap_rx, Some(u.stop_flag), Some(u.stats)),
+        None => (None, None, None, None),
     };
     let session = SessionWriter::create(out)?;
     let shots_dir = session.screenshots_dir();
+    let memsnaps_dir = session.memsnaps_dir();
 
     let state = Arc::new(Mutex::new(TrafficState::default()));
     let reader_stop = Arc::new(AtomicBool::new(false));
@@ -262,6 +274,42 @@ pub fn run_usb_capture(
             }
         })?;
 
+    // --- memory-snapshot worker (manual trigger via the window's Snapshot button) ---
+    // The target is opened here (so failure surfaces up front) and moved into the worker; each
+    // trigger dumps its committed private memory to `memsnaps/<id:06>/`. `mem_tx` stays `None`
+    // when the feature is off or the target can't be opened, so a stray press is a no-op.
+    let (mem_tx, mem_rx) = std::sync::mpsc::channel::<(u64, i64)>();
+    let (mem_worker, mem_tx) = match open_mem_source(&opts) {
+        None => (None, None),
+        Some(Err(e)) => {
+            eprintln!("memory snapshots disabled: {e}");
+            (None, None)
+        }
+        Some(Ok(src)) => {
+            eprintln!("memory snapshots armed for pid {}", src.pid());
+            let dir = memsnaps_dir.clone();
+            let compress = opts.mem_compress;
+            let h = std::thread::Builder::new()
+                .name("memcap-worker".into())
+                .spawn(move || {
+                    while let Ok((id, ts)) = mem_rx.recv() {
+                        let d = dir.join(format!("{id:06}"));
+                        match src.snapshot(id, ts, &d, compress) {
+                            Ok(m) => eprintln!(
+                                "memory snapshot #{id}: {} regions, {} B ({} B on disk)",
+                                m.regions.len(),
+                                m.total_bytes,
+                                m.stored_bytes
+                            ),
+                            Err(e) => eprintln!("memory snapshot #{id} failed: {e}"),
+                        }
+                    }
+                })?;
+            (Some(h), Some(mem_tx))
+        }
+    };
+    let mut mem_next_id: u64 = 0;
+
     // --- input hooks ---
     let (in_tx, in_rx) = std::sync::mpsc::channel::<InputEvent>();
     let hooks = reveng_winput::install(clock.clone(), move |ev| {
@@ -322,6 +370,24 @@ pub fn run_usb_capture(
             }
         }
 
+        // A Snapshot-button press dumps the target's memory (on the worker) and emits a
+        // checkpoint carrying `mem_snapshot_id`, anchored to the frame live at that instant —
+        // so `mem diff`/`mem scan` pair the decoded memory with the on-the-wire bytes.
+        if let Some(rx) = &snap_rx {
+            while let Ok(ts) = rx.try_recv() {
+                let Some(tx) = &mem_tx else {
+                    eprintln!("memory snapshot requested but capture is disabled");
+                    continue;
+                };
+                let mem_id = mem_next_id;
+                mem_next_id += 1;
+                let _ = tx.send((mem_id, ts));
+                let anchor = anchor_of(&state.lock().unwrap());
+                engine.next_mem_snapshot_id = Some(mem_id);
+                engine.emit(CheckpointType::Manual, "mem_snapshot", ts, anchor, false, (0, 0), None)?;
+            }
+        }
+
         // Interval checkpoint: only during sustained traffic with no user action (§7).
         if opts.cfg.interval_ms > 0 {
             let now = clock.now_ns();
@@ -378,6 +444,10 @@ pub fn run_usb_capture(
     }
     drop(engine.shot_tx.take());
     let _ = shot_worker.join();
+    drop(mem_tx); // close the channel so the memcap worker drains its queue and exits
+    if let Some(h) = mem_worker {
+        let _ = h.join();
+    }
 
     let final_ts = clock.now_ns();
     let stop_anchor = anchor_of(&state.lock().unwrap());
@@ -404,6 +474,21 @@ fn anchor_of(s: &TrafficState) -> Option<TrafficAnchor> {
         event_index,
         byte_offset: s.latest_offset,
     })
+}
+
+/// Open the memory-snapshot target from the opts (`--mem-pid` wins over `--mem-process`), or
+/// `None` when the feature isn't armed. Enables `SeDebugPrivilege` first (best-effort) so a
+/// cross-user/other target opens once elevated.
+fn open_mem_source(opts: &UsbRecordOpts) -> Option<Result<reveng_memcap::MemSnapshotSource>> {
+    if opts.mem_pid.is_none() && opts.mem_process.is_none() {
+        return None;
+    }
+    let _ = crate::elevate::enable_debug_privilege();
+    if let Some(pid) = opts.mem_pid {
+        Some(reveng_memcap::MemSnapshotSource::open(pid))
+    } else {
+        Some(reveng_memcap::MemSnapshotSource::by_name(opts.mem_process.as_deref().unwrap()))
+    }
 }
 
 /// A reader thread: drain one source into the shared `usb.pcapng` + `frames.idx`, bumping
@@ -518,6 +603,9 @@ struct Engine {
     /// Most recent foreground app that wasn't our own window — used as the context for a note
     /// checkpoint (while typing a note, *our* window is foreground, which isn't useful).
     last_foreign_fg: Option<(Option<String>, Option<String>)>,
+    /// Set immediately before `emit` to stamp the next checkpoint with a memory-snapshot id;
+    /// `emit` `take()`s it so it applies to exactly one checkpoint.
+    next_mem_snapshot_id: Option<u64>,
     _clock: Clock,
 }
 
@@ -550,6 +638,7 @@ impl Engine {
             usb_active,
             pcie_state,
             last_foreign_fg: None,
+            next_mem_snapshot_id: None,
             _clock: clock,
         }
     }
@@ -631,6 +720,7 @@ impl Engine {
             anchor,
             anchors,
             screenshot_id,
+            mem_snapshot_id: self.next_mem_snapshot_id.take(),
             fg_process,
             fg_window,
             cursor,

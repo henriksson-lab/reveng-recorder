@@ -130,6 +130,38 @@ enum Cmd {
     HvSelftest,
     /// Read reveng-hv's diagnostic record (last devirtualize reason/RIP, secondary-ctls status).
     HvDiag,
+    /// Process-memory snapshots + before/after delta (the decoded-form oracle).
+    Mem {
+        #[command(subcommand)]
+        cmd: MemCmd,
+    },
+}
+
+/// `mem` subcommands over a session's `memsnaps/`. See `reveng-memcap`.
+#[derive(Subcommand)]
+enum MemCmd {
+    /// List snapshots taken (id, elapsed, pid, size, anchored frame).
+    Ls { session: PathBuf },
+    /// Region table for one snapshot.
+    Regions { session: PathBuf, id: u64 },
+    /// Before→after delta between two snapshots (new/changed/freed regions).
+    Diff {
+        session: PathBuf,
+        a: u64,
+        b: u64,
+        /// Max bytes shown per changed run.
+        #[arg(long, default_value_t = 32)]
+        max: usize,
+    },
+    /// Find a value's encodings in a snapshot (seed with the on-screen number/string).
+    Scan { session: PathBuf, id: u64, value: String },
+    /// Hex/auto-render a slice of a snapshot at a target address (hex `0x…` or decimal).
+    Read {
+        session: PathBuf,
+        id: u64,
+        addr: String,
+        len: u64,
+    },
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -328,6 +360,21 @@ struct RecordArgs {
     #[arg(long)]
     max_bytes: Option<u64>,
 
+    /// Arm manual process-memory snapshots against this PID: the recording window shows a
+    /// Snapshot button; each press dumps the target's committed memory and emits a checkpoint
+    /// carrying `mem_snapshot_id`. Query later with `reveng-rec mem diff/scan/ls`. Needs admin +
+    /// SeDebugPrivilege (auto-enabled). The decoded-form oracle for when there's no clean export.
+    #[arg(long)]
+    mem_pid: Option<u32>,
+
+    /// Like `--mem-pid` but resolves the target by image name (first match, e.g. `Vendor.exe`).
+    #[arg(long)]
+    mem_process: Option<String>,
+
+    /// Compress each memory snapshot on disk (deflate). Smaller `regions.bin`; slight CPU cost.
+    #[arg(long)]
+    mem_compress: bool,
+
     #[arg(long)]
     config: Option<PathBuf>,
 }
@@ -400,6 +447,13 @@ fn run() -> anyhow::Result<()> {
         Cmd::HvVmxtest => run_hv_op(hv::vmxtest),
         Cmd::HvSelftest => run_hv_op(hv::selftest),
         Cmd::HvDiag => run_hv_op(hv::diag),
+        Cmd::Mem { cmd } => match cmd {
+            MemCmd::Ls { session } => query::mem_ls(&session),
+            MemCmd::Regions { session, id } => query::mem_regions(&session, id),
+            MemCmd::Diff { session, a, b, max } => query::mem_diff(&session, a, b, max),
+            MemCmd::Scan { session, id, value } => query::mem_scan(&session, id, &value),
+            MemCmd::Read { session, id, addr, len } => query::mem_read(&session, id, &addr, len),
+        },
     }
 }
 
@@ -675,6 +729,7 @@ fn run_engine_session(
 ) -> anyhow::Result<()> {
     let usb_active = !opts.selections.is_empty();
     let pcie_active = pcie.is_some();
+    let mem_active = opts.mem_pid.is_some() || opts.mem_process.is_some();
     let headless =
         opts.max_duration.is_some() || std::env::var_os("REVENG_NO_NOTES_UI").is_some();
 
@@ -690,7 +745,7 @@ fn run_engine_session(
                 (Some(m), Some(d)) => Some((m.clone(), d.clone())),
                 _ => None,
             });
-            notes_ui::run_recording_window(clock, out.to_path_buf(), usb_active, pcie_active, trace, move |ui| {
+            notes_ui::run_recording_window(clock, out.to_path_buf(), usb_active, pcie_active, mem_active, trace, move |ui| {
                 record_usb::run_usb_capture(worker_clock, &out2, opts, Some(ui), pcie)
             })?
         }
@@ -919,6 +974,9 @@ fn build_usb_opts(
         drop_transfers,
         endpoints: parse_endpoints(args.endpoints.as_deref()),
         max_bytes: args.max_bytes,
+        mem_pid: args.mem_pid,
+        mem_process: args.mem_process.clone(),
+        mem_compress: args.mem_compress,
     })
 }
 
