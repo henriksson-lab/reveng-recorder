@@ -285,10 +285,10 @@ impl CaptureSource for DrvPcieSource {
                     .unwrap_or(true);
                 if due {
                     if mmio_on {
-                        ioctl_snap(&self.handle, IOCTL_REVENG_PCI_MMIO_SNAP, self.mmio_bytes);
+                        ioctl_snap(&self.handle, IOCTL_REVENG_PCI_MMIO_SNAP, self.mmio_bytes)?;
                     }
                     if dma_on {
-                        ioctl_snap(&self.handle, IOCTL_REVENG_PCI_DMA_SNAP, 0);
+                        ioctl_snap(&self.handle, IOCTL_REVENG_PCI_DMA_SNAP, 0)?;
                     }
                     self.last_snap = Some(Instant::now());
                 }
@@ -329,19 +329,22 @@ impl CaptureSource for DrvPcieSource {
 
 /// Trigger one snapshot IOCTL (M3 MMIO or M4 DMA), which pushes change events into the driver's
 /// ring. `arg` is passed as the IOCTL input (e.g. MMIO snapshot length); 0 sends no input.
-fn ioctl_snap(handle: &Option<Arc<OwnedHandle>>, code: u32, arg: u32) {
-    if let Some(h) = handle {
-        let mut returned = 0u32;
-        let inbuf = arg.to_le_bytes();
-        let (in_ptr, in_len) = if arg != 0 {
-            (Some(inbuf.as_ptr() as *const _), inbuf.len() as u32)
-        } else {
-            (None, 0)
-        };
-        unsafe {
-            let _ = DeviceIoControl(h.0, code, in_ptr, in_len, None, 0, Some(&mut returned), None);
-        }
+fn ioctl_snap(handle: &Option<Arc<OwnedHandle>>, code: u32, arg: u32) -> anyhow::Result<()> {
+    let h = handle
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("PCIe driver snapshot requested without an open handle"))?;
+    let mut returned = 0u32;
+    let inbuf = arg.to_le_bytes();
+    let (in_ptr, in_len) = if arg != 0 {
+        (Some(inbuf.as_ptr() as *const _), inbuf.len() as u32)
+    } else {
+        (None, 0)
+    };
+    unsafe {
+        DeviceIoControl(h.0, code, in_ptr, in_len, None, 0, Some(&mut returned), None)
     }
+    .map_err(|e| anyhow::anyhow!("PCIe snapshot IOCTL 0x{code:08x} failed: {e}"))?;
+    Ok(())
 }
 
 /// Read exactly one event. Returns `Ok(false)` to signal end-of-stream:

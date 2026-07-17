@@ -42,8 +42,20 @@ impl<R: FixedRecord> IndexFile<R> {
 
     /// Open an existing index file for read/append.
     pub fn open(path: impl AsRef<Path>) -> std::io::Result<Self> {
+        if R::SIZE == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fixed index record size must be non-zero",
+            ));
+        }
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let bytes = file.metadata()?.len();
+        if bytes % R::SIZE as u64 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "index file ends with a partial record",
+            ));
+        }
         Ok(Self {
             file,
             len: bytes / R::SIZE as u64,
@@ -62,6 +74,12 @@ impl<R: FixedRecord> IndexFile<R> {
     /// Append a record; returns its index. Cheap and crash-safe — this runs on the
     /// hot recording path.
     pub fn append(&mut self, rec: &R) -> std::io::Result<u64> {
+        if R::SIZE == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "fixed index record size must be non-zero",
+            ));
+        }
         let mut buf = vec![0u8; R::SIZE];
         rec.write_to(&mut buf);
         self.file.seek(SeekFrom::End(0))?;
@@ -73,8 +91,17 @@ impl<R: FixedRecord> IndexFile<R> {
 
     /// Direct-address read of record N.
     pub fn get(&mut self, index: u64) -> std::io::Result<R> {
+        if index >= self.len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "index record is out of bounds",
+            ));
+        }
         let mut buf = vec![0u8; R::SIZE];
-        self.file.seek(SeekFrom::Start(index * R::SIZE as u64))?;
+        let offset = index
+            .checked_mul(R::SIZE as u64)
+            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "index offset overflow"))?;
+        self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(&mut buf)?;
         Ok(R::read_from(&buf))
     }
@@ -149,6 +176,25 @@ mod tests {
         assert_eq!(idx.search_le_ts(40).unwrap(), Some(3));
         assert_eq!(idx.search_le_ts(999).unwrap(), Some(3));
 
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn open_rejects_partial_records_and_get_rejects_out_of_bounds() {
+        let path = std::env::temp_dir().join("reveng_index_invalid_test.bin");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(&path, [0u8; 1]).unwrap();
+        assert_eq!(
+            IndexFile::<Rec>::open(&path).err().expect("partial index must fail").kind(),
+            std::io::ErrorKind::InvalidData
+        );
+
+        let mut idx = IndexFile::<Rec>::create(&path).unwrap();
+        idx.append(&Rec { ts: 1, v: 1 }).unwrap();
+        assert_eq!(
+            idx.get(1).err().expect("out-of-bounds get must fail").kind(),
+            std::io::ErrorKind::UnexpectedEof
+        );
         let _ = std::fs::remove_file(&path);
     }
 }

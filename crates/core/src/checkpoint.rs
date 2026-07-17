@@ -133,8 +133,10 @@ mod tests {
 
     #[test]
     fn any_key_overrides() {
-        let mut cfg = CheckpointConfig::default();
-        cfg.on_any_key = true;
+        let cfg = CheckpointConfig {
+            on_any_key: true,
+            ..Default::default()
+        };
         assert!(cfg.key_triggers("A"));
     }
 

@@ -43,7 +43,9 @@ pub fn enable_debug_privilege() -> anyhow::Result<()> {
 #[cfg(windows)]
 mod imp {
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, HANDLE};
+    use windows::Win32::Foundation::{
+        CloseHandle, GetLastError, ERROR_CANCELLED, ERROR_NOT_ALL_ASSIGNED, HANDLE,
+    };
     use windows::Win32::Security::{
         GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY,
     };
@@ -93,9 +95,13 @@ mod imp {
                 Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
             };
             let adjusted = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None);
+            let adjust_error = GetLastError();
             let _ = CloseHandle(token);
             looked?;
-            adjusted?; // note: succeeds even if the privilege isn't held (ERROR_NOT_ALL_ASSIGNED)
+            adjusted?;
+            if adjust_error == ERROR_NOT_ALL_ASSIGNED {
+                anyhow::bail!("SeDebugPrivilege is not present in this process token");
+            }
         }
         Ok(())
     }
@@ -139,7 +145,7 @@ mod imp {
             }
             WaitForSingleObject(info.hProcess, INFINITE);
             let mut code = 0u32;
-            let _ = GetExitCodeProcess(info.hProcess, &mut code);
+            GetExitCodeProcess(info.hProcess, &mut code)?;
             let _ = CloseHandle(info.hProcess);
             Ok(code)
         }
@@ -164,7 +170,7 @@ mod imp {
                 }
                 '"' => {
                     // Escape all pending backslashes, then the quote.
-                    out.extend(std::iter::repeat('\\').take(backslashes));
+                    out.extend(std::iter::repeat_n('\\', backslashes));
                     backslashes = 0;
                     out.push('\\');
                     out.push('"');
@@ -175,7 +181,7 @@ mod imp {
                 }
             }
         }
-        out.extend(std::iter::repeat('\\').take(backslashes)); // double trailing before closing "
+        out.extend(std::iter::repeat_n('\\', backslashes)); // double trailing before closing "
         out.push('"');
         out
     }

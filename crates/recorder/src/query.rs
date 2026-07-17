@@ -357,13 +357,14 @@ pub fn mem_read(session_dir: &Path, id: u64, addr: &str, len: u64) -> Result<()>
         .meta
         .regions
         .iter()
-        .find(|r| addr >= r.base && addr < r.base + r.size)
+        .find(|r| addr.checked_sub(r.base).is_some_and(|offset| offset < r.size))
     else {
         anyhow::bail!("address 0x{addr:x} is not inside any captured region");
     };
     let bytes = snap.region_bytes(r);
-    let start = (addr - r.base) as usize;
-    let end = (start + len as usize).min(bytes.len());
+    let start = usize::try_from(addr - r.base).context("address offset does not fit this platform")?;
+    let requested = usize::try_from(len).unwrap_or(usize::MAX);
+    let end = start.saturating_add(requested).min(bytes.len());
     let slice = &bytes[start..end];
     if reveng_core::text::is_texty(slice) {
         print!("{}", String::from_utf8_lossy(slice));
@@ -440,7 +441,7 @@ pub fn frames(
             .anchor
             .map(|a| a.event_index)
             .context("checkpoint has no traffic anchor")?;
-        (center.saturating_sub(window), center + window)
+        (center.saturating_sub(window), center.saturating_add(window))
     } else {
         (0, total - 1)
     };
@@ -764,18 +765,8 @@ pub fn decode(
     let (prog, prog_args) = parts.split_first().context("--with is empty")?;
 
     let s = SessionReader::open(session_dir)?;
-    let mut log = open_log(&s)?;
+    let log = open_log(&s)?;
     let total = log.len();
-
-    let mut frames = Vec::with_capacity(total as usize);
-    for i in 0..total {
-        if let Some(f) = filter {
-            if !log.matches_filter(i, f)? {
-                continue;
-            }
-        }
-        frames.push(log.event_json(i)?.to_string());
-    }
 
     let mut child = Command::new(prog)
         .args(prog_args)
@@ -785,23 +776,44 @@ pub fn decode(
         .with_context(|| format!("failed to launch decoder `{cmd}`"))?;
 
     let mut stdin = child.stdin.take().context("decoder stdin unavailable")?;
-    let writer = std::thread::spawn(move || {
-        for line in &frames {
-            if writeln!(stdin, "{line}").is_err() {
-                break;
+    let writer = std::thread::spawn(move || -> Result<()> {
+        let mut log = log;
+        for i in 0..total {
+            if let Some(f) = filter {
+                if !log.matches_filter(i, f)? {
+                    continue;
+                }
+            }
+            let line = log.event_json(i)?;
+            if let Err(e) = writeln!(stdin, "{line}") {
+                if e.kind() == std::io::ErrorKind::BrokenPipe {
+                    break;
+                }
+                return Err(e.into());
             }
         }
+        Ok(())
     });
 
     let stdout = child.stdout.take().context("decoder stdout unavailable")?;
     let out = std::io::stdout();
     let mut w = out.lock();
     use std::io::BufRead;
-    for line in std::io::BufReader::new(stdout).lines() {
-        writeln!(w, "{}", line?)?;
+    let output_result = (|| -> Result<()> {
+        for line in std::io::BufReader::new(stdout).lines() {
+            writeln!(w, "{}", line?)?;
+        }
+        Ok(())
+    })();
+    if output_result.is_err() {
+        let _ = child.kill();
     }
-    let _ = writer.join();
+    let input_result = writer
+        .join()
+        .map_err(|_| anyhow::anyhow!("decoder input writer thread panicked"))?;
     let status = child.wait()?;
+    output_result?;
+    input_result?;
     if !status.success() {
         anyhow::bail!("decoder exited with {status}");
     }
@@ -821,7 +833,7 @@ fn parse_hex_pattern(p: &str) -> Result<Vec<u8>> {
         .chars()
         .filter(|c| c.is_ascii_hexdigit())
         .collect();
-    if cleaned.is_empty() || cleaned.len() % 2 != 0 {
+    if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) {
         anyhow::bail!("hex pattern must be an even number of hex digits");
     }
     (0..cleaned.len())

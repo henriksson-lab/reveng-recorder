@@ -140,6 +140,7 @@ fn record_pcie(
     let mut last_ckpt_ts = 0i64;
     let mut last_index = 0u64;
     let mut have_last = false;
+    let mut last_event_ts: Option<i64> = None;
     let interval_ns = (cfg.interval_ms as i64).saturating_mul(1_000_000);
 
     while let Some(rec) = source.next()? {
@@ -148,10 +149,14 @@ fn record_pcie(
             TrafficKind::Pcie(e) => e,
             TrafficKind::Usb(_) => continue, // replay stream is PCIe-only
         };
+        if last_event_ts.is_some_and(|previous| ts < previous) {
+            anyhow::bail!("capture timestamps are not monotonic: {ts} followed {last_event_ts:?}");
+        }
         let (index, offset) = log.append(&ev)?;
         events += 1;
         last_index = index;
         have_last = true;
+        last_event_ts = Some(ts);
         bytes_since = bytes_since.saturating_add(event_bytes(&ev));
 
         // Interval checkpoint: only when enough traffic has accumulated *and* the
@@ -186,7 +191,7 @@ fn record_pcie(
     } else {
         None
     };
-    let stop_ts = last_ckpt_ts.max(0);
+    let stop_ts = last_event_ts.unwrap_or(0).max(0);
     session.append_record(&SessionRecord::Checkpoint(new_ckpt(
         stop_ts,
         CheckpointType::SessionStop,

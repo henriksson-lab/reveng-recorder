@@ -58,24 +58,45 @@ impl<W: Write> PcapngWriter<W> {
     /// Append one packet (an Enhanced Packet Block). Returns the block's byte offset —
     /// this is exactly what goes into `frames.idx` for O(1) seeking.
     pub fn write_packet(&mut self, ts_ns: i64, data: &[u8]) -> std::io::Result<u64> {
+        if ts_ns < 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "pcapng packet timestamp must be non-negative",
+            ));
+        }
+        let data_len = u32::try_from(data.len()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "packet is too large for pcapng",
+            )
+        })?;
         let block_offset = self.offset;
         let ts_us = (ts_ns / 1000) as u64;
         let ts_high = (ts_us >> 32) as u32;
         let ts_low = (ts_us & 0xFFFF_FFFF) as u32;
         let pad = pad4(data.len());
-        let total = 32 + data.len() + pad;
+        let total = 32usize
+            .checked_add(data.len())
+            .and_then(|n| n.checked_add(pad))
+            .and_then(|n| u32::try_from(n).ok())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "packet is too large for a pcapng block",
+                )
+            })?;
 
-        let mut b = Vec::with_capacity(total);
+        let mut b = Vec::with_capacity(total as usize);
         b.extend_from_slice(&BT_EPB.to_le_bytes());
-        b.extend_from_slice(&(total as u32).to_le_bytes());
+        b.extend_from_slice(&total.to_le_bytes());
         b.extend_from_slice(&0u32.to_le_bytes()); // interface id
         b.extend_from_slice(&ts_high.to_le_bytes());
         b.extend_from_slice(&ts_low.to_le_bytes());
-        b.extend_from_slice(&(data.len() as u32).to_le_bytes()); // captured len
-        b.extend_from_slice(&(data.len() as u32).to_le_bytes()); // original len
+        b.extend_from_slice(&data_len.to_le_bytes()); // captured len
+        b.extend_from_slice(&data_len.to_le_bytes()); // original len
         b.extend_from_slice(data);
-        b.extend(std::iter::repeat(0u8).take(pad));
-        b.extend_from_slice(&(total as u32).to_le_bytes());
+        b.extend(std::iter::repeat_n(0u8, pad));
+        b.extend_from_slice(&total.to_le_bytes());
 
         self.w.write_all(&b)?;
         self.offset += b.len() as u64;
@@ -109,11 +130,18 @@ pub struct Block {
 pub fn scan_blocks(data: &[u8]) -> anyhow::Result<Vec<Block>> {
     let mut blocks = Vec::new();
     let mut off = 0usize;
-    while off + 8 <= data.len() {
+    while data.len().saturating_sub(off) >= 8 {
         let block_type = u32::from_le_bytes(data[off..off + 4].try_into().unwrap());
         let len = u32::from_le_bytes(data[off + 4..off + 8].try_into().unwrap()) as usize;
-        if len < 12 || off + len > data.len() {
+        let Some(end) = off.checked_add(len) else {
+            anyhow::bail!("pcapng block length overflows at offset {off}");
+        };
+        if len < 12 || !len.is_multiple_of(4) || end > data.len() {
             anyhow::bail!("corrupt pcapng block at offset {off} (len {len})");
+        }
+        let trailing_len = u32::from_le_bytes(data[off + len - 4..off + len].try_into().unwrap()) as usize;
+        if trailing_len != len {
+            anyhow::bail!("pcapng block at offset {off} has mismatched trailing length");
         }
         blocks.push(Block {
             offset: off,
@@ -121,6 +149,9 @@ pub fn scan_blocks(data: &[u8]) -> anyhow::Result<Vec<Block>> {
             block_type,
         });
         off += len;
+    }
+    if off != data.len() {
+        anyhow::bail!("trailing {} byte(s) after final pcapng block", data.len() - off);
     }
     Ok(blocks)
 }
@@ -142,16 +173,28 @@ pub fn packets(data: &[u8]) -> anyhow::Result<Vec<Packet<'_>>> {
             continue;
         }
         let o = b.offset;
+        if b.len < 32 {
+            anyhow::bail!("Enhanced Packet Block at offset {o} is too short");
+        }
         let ts_high = u32::from_le_bytes(data[o + 12..o + 16].try_into().unwrap()) as u64;
         let ts_low = u32::from_le_bytes(data[o + 16..o + 20].try_into().unwrap()) as u64;
         let caplen = u32::from_le_bytes(data[o + 20..o + 24].try_into().unwrap()) as usize;
         let ts_us = (ts_high << 32) | ts_low;
+        let ts_ns = ts_us
+            .checked_mul(1000)
+            .and_then(|value| i64::try_from(value).ok())
+            .ok_or_else(|| anyhow::anyhow!("packet timestamp at offset {o} is out of range"))?;
         let data_start = o + 28;
-        let data_end = data_start + caplen;
+        let data_end = data_start
+            .checked_add(caplen)
+            .filter(|&end| end <= o + b.len - 4)
+            .ok_or_else(|| {
+                anyhow::anyhow!("corrupt Enhanced Packet Block at offset {o} (caplen {caplen})")
+            })?;
         out.push(Packet {
             frame_index,
             offset: o,
-            ts_ns: (ts_us * 1000) as i64,
+            ts_ns,
             data: &data[data_start..data_end],
         });
         frame_index += 1;
@@ -206,11 +249,18 @@ pub fn inject_comments(data: &[u8], comments: &[(u64, String)]) -> anyhow::Resul
             continue;
         }
         let o = b.offset;
+        if b.len < 32 {
+            anyhow::bail!("Enhanced Packet Block at offset {o} is too short");
+        }
         let caplen = u32::from_le_bytes(data[o + 20..o + 24].try_into().unwrap()) as usize;
         let ts_high = u32::from_le_bytes(data[o + 12..o + 16].try_into().unwrap());
         let ts_low = u32::from_le_bytes(data[o + 16..o + 20].try_into().unwrap());
         let orig_len = u32::from_le_bytes(data[o + 24..o + 28].try_into().unwrap());
-        let pkt = &data[o + 28..o + 28 + caplen];
+        let packet_end = (o + 28)
+            .checked_add(caplen)
+            .filter(|&end| end <= o + b.len - 4)
+            .ok_or_else(|| anyhow::anyhow!("corrupt Enhanced Packet Block at offset {o}"))?;
+        let pkt = &data[o + 28..packet_end];
 
         new_offsets.push(out.len() as u64);
 
@@ -218,30 +268,37 @@ pub fn inject_comments(data: &[u8], comments: &[(u64, String)]) -> anyhow::Resul
             None => out.extend_from_slice(&data[o..o + b.len]), // unchanged
             Some(comment) => {
                 let cbytes = comment.as_bytes();
+                let comment_len = u16::try_from(cbytes.len())
+                    .map_err(|_| anyhow::anyhow!("pcapng comment exceeds 65535 bytes"))?;
                 let cpad = pad4(cbytes.len());
                 let data_pad = pad4(caplen);
                 // options: opt_comment (4 + clen + cpad) + opt_endofopt (4)
                 let opts_len = 4 + cbytes.len() + cpad + 4;
-                let total = 32 + caplen + data_pad + opts_len;
+                let total = 32usize
+                    .checked_add(caplen)
+                    .and_then(|n| n.checked_add(data_pad))
+                    .and_then(|n| n.checked_add(opts_len))
+                    .and_then(|n| u32::try_from(n).ok())
+                    .ok_or_else(|| anyhow::anyhow!("commented pcapng block is too large"))?;
 
                 out.extend_from_slice(&BT_EPB.to_le_bytes());
-                out.extend_from_slice(&(total as u32).to_le_bytes());
+                out.extend_from_slice(&total.to_le_bytes());
                 out.extend_from_slice(&0u32.to_le_bytes()); // interface id
                 out.extend_from_slice(&ts_high.to_le_bytes());
                 out.extend_from_slice(&ts_low.to_le_bytes());
                 out.extend_from_slice(&(caplen as u32).to_le_bytes());
                 out.extend_from_slice(&orig_len.to_le_bytes());
                 out.extend_from_slice(pkt);
-                out.extend(std::iter::repeat(0u8).take(data_pad));
+                out.extend(std::iter::repeat_n(0u8, data_pad));
                 // opt_comment (code 1)
                 out.extend_from_slice(&1u16.to_le_bytes());
-                out.extend_from_slice(&(cbytes.len() as u16).to_le_bytes());
+                out.extend_from_slice(&comment_len.to_le_bytes());
                 out.extend_from_slice(cbytes);
-                out.extend(std::iter::repeat(0u8).take(cpad));
+                out.extend(std::iter::repeat_n(0u8, cpad));
                 // opt_endofopt (code 0, len 0)
                 out.extend_from_slice(&0u16.to_le_bytes());
                 out.extend_from_slice(&0u16.to_le_bytes());
-                out.extend_from_slice(&(total as u32).to_le_bytes());
+                out.extend_from_slice(&total.to_le_bytes());
             }
         }
         frame_index += 1;
@@ -313,5 +370,25 @@ mod tests {
         assert_eq!(pkts.len(), 3);
         assert_eq!(pkts[0].data, &[1, 1, 1]);
         assert_eq!(pkts[2].data, &[3, 3, 3]);
+    }
+
+    #[test]
+    fn malformed_epb_returns_error_instead_of_panicking() {
+        let mut short = Vec::new();
+        short.extend_from_slice(&BT_EPB.to_le_bytes());
+        short.extend_from_slice(&12u32.to_le_bytes());
+        short.extend_from_slice(&12u32.to_le_bytes());
+        assert!(packets(&short).is_err());
+        assert!(inject_comments(&short, &[(0, "note".into())]).is_err());
+
+        let mut oversized_caplen = Vec::new();
+        {
+            let mut w = PcapngWriter::new(&mut oversized_caplen).unwrap();
+            w.write_packet(1_000, &[1, 2, 3]).unwrap();
+        }
+        // First EPB begins after the 28-byte SHB and 20-byte IDB.
+        oversized_caplen[68..72].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(packets(&oversized_caplen).is_err());
+        assert!(inject_comments(&oversized_caplen, &[(0, "note".into())]).is_err());
     }
 }

@@ -106,8 +106,9 @@ mod imp {
     use windows::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, KBDLLHOOKSTRUCT,
         LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL,
-        WM_KEYDOWN, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEWHEEL,
-        WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1,
+        WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
+        WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
+        WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1,
     };
 
     struct HookState {
@@ -171,10 +172,10 @@ mod imp {
         if code >= 0 {
             let kb = &*(lparam.0 as *const KBDLLHOOKSTRUCT);
             let msg = wparam.0 as u32;
-            let kind = if msg == WM_KEYDOWN || msg == WM_SYSKEYDOWN {
-                InputKind::KeyDown
-            } else {
-                InputKind::KeyUp
+            let kind = match msg {
+                WM_KEYDOWN | WM_SYSKEYDOWN => InputKind::KeyDown,
+                WM_KEYUP | WM_SYSKEYUP => InputKind::KeyUp,
+                _ => return CallNextHookEx(None, code, wparam, lparam),
             };
             emit(InputEvent {
                 ts_ns: now_ns(),

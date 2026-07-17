@@ -163,7 +163,7 @@ impl SessionModel {
             None => return Ok(Vec::new()),
         };
         let start = center.saturating_sub(window);
-        let end = (center + window).min(total - 1);
+        let end = center.saturating_add(window).min(total - 1);
 
         let mut rows = Vec::new();
         for i in start..=end {

@@ -180,6 +180,13 @@ pub struct UsbCaptureSource {
     buffer: u32,
 }
 
+impl Drop for UsbCaptureSource {
+    fn drop(&mut self) {
+        // In particular, reap the CLI fallback if pcap-header validation failed during start.
+        let _ = <Self as CaptureSource>::stop(self);
+    }
+}
+
 impl UsbCaptureSource {
     pub fn new(selection: UsbSelection, clock: Clock) -> Self {
         Self {
@@ -329,9 +336,11 @@ impl CaptureSource for UsbCaptureSource {
 
     fn stop(&mut self) -> anyhow::Result<()> {
         self.reader = None;
-        if let Some(mut child) = self.child.lock().unwrap().take() {
-            let _ = child.kill();
-            let _ = child.wait();
+        if let Ok(mut slot) = self.child.lock() {
+            if let Some(mut child) = slot.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
         }
         Ok(())
     }

@@ -66,6 +66,8 @@ mod imp {
         SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN,
     };
 
+    const MAX_CAPTURE_PIXELS: usize = 100_000_000;
+
     /// The capture rectangle in virtual-screen coordinates (may be negative on the left/top).
     fn scope_rect(scope: Scope) -> anyhow::Result<RECT> {
         unsafe {
@@ -104,8 +106,17 @@ mod imp {
 
     pub fn capture(scope: Scope) -> anyhow::Result<Frame> {
         let rect = scope_rect(scope)?;
-        let width = (rect.right - rect.left).max(1);
-        let height = (rect.bottom - rect.top).max(1);
+        let width64 = i64::from(rect.right) - i64::from(rect.left);
+        let height64 = i64::from(rect.bottom) - i64::from(rect.top);
+        if width64 <= 0 || height64 <= 0 || width64 > i64::from(i32::MAX) || height64 > i64::from(i32::MAX) {
+            anyhow::bail!("invalid capture rectangle {rect:?}");
+        }
+        let width = width64 as i32;
+        let height = height64 as i32;
+        let pixels = (width as usize)
+            .checked_mul(height as usize)
+            .filter(|&n| n <= MAX_CAPTURE_PIXELS)
+            .ok_or_else(|| anyhow::anyhow!("capture rectangle is too large: {width}x{height}"))?;
 
         unsafe {
             // Screen DC (origin at the primary monitor; BitBlt reaches other monitors via
@@ -130,11 +141,15 @@ mod imp {
             let _bmp_guard = Bitmap(bmp);
 
             let old = SelectObject(mem, HGDIOBJ(bmp.0));
-            BitBlt(
+            // Restore the previous selection before propagating a blit failure. A bitmap
+            // cannot be deleted while selected into a DC, so returning directly from
+            // `BitBlt(...)?` would leak the bitmap on this error path.
+            let blit = BitBlt(
                 mem, 0, 0, width, height, Some(screen), rect.left, rect.top,
                 SRCCOPY | CAPTUREBLT,
-            )?;
+            );
             SelectObject(mem, old);
+            blit?;
 
             // Pull pixels as top-down 32bpp BGRA via GetDIBits.
             let mut bi = BITMAPINFO {
@@ -149,7 +164,7 @@ mod imp {
                 },
                 ..Default::default()
             };
-            let mut bgra = vec![0u8; (width as usize) * (height as usize) * 4];
+            let mut bgra = vec![0u8; pixels * 4];
             let got = GetDIBits(
                 mem,
                 bmp,
@@ -159,12 +174,12 @@ mod imp {
                 &mut bi,
                 DIB_RGB_COLORS,
             );
-            if got == 0 {
-                anyhow::bail!("GetDIBits returned 0 scanlines");
+            if got != height {
+                anyhow::bail!("GetDIBits returned {got} of {height} scanlines");
             }
 
             // BGRA (GDI) -> RGB. GDI's alpha byte is meaningless, so drop it.
-            let mut rgb = vec![0u8; (width as usize) * (height as usize) * 3];
+            let mut rgb = vec![0u8; pixels * 3];
             for (src, dst) in bgra.chunks_exact(4).zip(rgb.chunks_exact_mut(3)) {
                 dst[0] = src[2]; // R
                 dst[1] = src[1]; // G

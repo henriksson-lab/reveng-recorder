@@ -413,7 +413,7 @@ fn fmt_pcie_kinds(config: u64, mmio: u64, dma: u64, irq: u64) -> String {
 /// Top endpoints by captured bytes, e.g. `0x81 iso 88.0 MB · 0x02 blk 1.2 MB`.
 fn fmt_top_endpoints(by_ep: &BTreeMap<u8, EpStat>) -> String {
     let mut v: Vec<(&u8, &EpStat)> = by_ep.iter().collect();
-    v.sort_by(|a, b| b.1.bytes.cmp(&a.1.bytes));
+    v.sort_by_key(|item| std::cmp::Reverse(item.1.bytes));
     v.iter()
         .take(3)
         .map(|(ep, st)| format!("0x{:02x} {} {}", ep, xfer_short(st.transfer), fmt_bytes(st.bytes)))

@@ -11,6 +11,8 @@ use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+const MAX_EVENT_LINE: usize = 1024 * 1024;
+
 /// 16-byte PCIe index record: `{ts_ns, byte_offset}`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PcieIdxRecord {
@@ -94,6 +96,9 @@ impl PcieLog {
 
     /// Read the event stored at a byte offset in `pcie.bin`.
     pub fn event_at_offset(&mut self, offset: u64) -> anyhow::Result<PcieEvent> {
+        if offset >= self.bin.metadata()?.len() {
+            anyhow::bail!("PCIe event offset {offset} is outside pcie.bin");
+        }
         self.bin.seek(SeekFrom::Start(offset))?;
         let mut buf = Vec::new();
         let mut byte = [0u8; 1];
@@ -101,6 +106,9 @@ impl PcieLog {
             let n = self.bin.read(&mut byte)?;
             if n == 0 || byte[0] == b'\n' {
                 break;
+            }
+            if buf.len() == MAX_EVENT_LINE {
+                anyhow::bail!("PCIe event at offset {offset} exceeds {MAX_EVENT_LINE} bytes");
             }
             buf.push(byte[0]);
         }

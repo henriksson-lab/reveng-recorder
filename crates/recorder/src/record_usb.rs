@@ -191,6 +191,75 @@ struct TrafficState {
     /// Packets dropped by the capture-side filter (transfer-type / endpoint), for the summary.
     dropped: u64,
     done: bool,
+    error: Option<String>,
+}
+
+struct UsbReaderGuard {
+    stop: Arc<AtomicBool>,
+    killers: Vec<Killer>,
+    readers: Vec<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl UsbReaderGuard {
+    fn new(stop: Arc<AtomicBool>) -> Self {
+        Self {
+            stop,
+            killers: Vec::new(),
+            readers: Vec::new(),
+        }
+    }
+
+    fn stop_and_join(&mut self, state: &Arc<Mutex<TrafficState>>) {
+        self.stop.store(true, Ordering::Relaxed);
+        for killer in &self.killers {
+            killer.kill();
+        }
+        for reader in self.readers.drain(..) {
+            if reader.join().is_err() {
+                record_reader_error(state, "USB reader thread panicked".into());
+            }
+        }
+        self.killers.clear();
+    }
+}
+
+impl Drop for UsbReaderGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        for killer in &self.killers {
+            killer.kill();
+        }
+        for reader in self.readers.drain(..) {
+            let _ = reader.join();
+        }
+    }
+}
+
+struct PcieReaderGuard {
+    stop: Option<Box<dyn Fn() + Send + Sync>>,
+    reader: Option<std::thread::JoinHandle<Result<()>>>,
+}
+
+impl PcieReaderGuard {
+    fn stop_and_join(&mut self, state: &Arc<Mutex<TrafficState>>) {
+        if let Some(stop) = self.stop.take() {
+            stop();
+        }
+        if self.reader.take().is_some_and(|reader| reader.join().is_err()) {
+            record_reader_error(state, "PCIe reader thread panicked".into());
+        }
+    }
+}
+
+impl Drop for PcieReaderGuard {
+    fn drop(&mut self) {
+        if let Some(stop) = self.stop.take() {
+            stop();
+        }
+        if let Some(reader) = self.reader.take() {
+            let _ = reader.join();
+        }
+    }
 }
 
 pub fn run_usb_capture(
@@ -216,8 +285,7 @@ pub fn run_usb_capture(
     // folded into the single shared `usb.pcapng`/`frames.idx`. Start them up front so
     // spawn/open errors surface here. Empty `selections` = no capture at all (the window
     // still runs: input + screenshots + notes only, no USB source, no admin needed).
-    let mut killers: Vec<Killer> = Vec::new();
-    let mut readers = Vec::new();
+    let mut usb_threads = UsbReaderGuard::new(reader_stop.clone());
 
     // Start each selected control device, skipping (not aborting on) any that fail — one hub
     // that won't open must not take down the others. Collect the survivors, then create the
@@ -247,13 +315,13 @@ pub fn run_usb_capture(
     if let Some(writer) = &writer {
         state.lock().unwrap().active_sources = sources.len();
         for (i, source) in sources.into_iter().enumerate() {
-            killers.push(source.killer());
+            usb_threads.killers.push(source.killer());
             let writer = writer.clone();
             let state = state.clone();
             let reader_stop = reader_stop.clone();
             let stats = stats.clone();
             let filter = filter.clone();
-            readers.push(
+            usb_threads.readers.push(
                 std::thread::Builder::new()
                     .name(format!("usbcap-reader-{i}"))
                     .spawn(move || reader_loop(source, writer, state, reader_stop, stats, filter))?,
@@ -320,7 +388,7 @@ pub fn run_usb_capture(
     //     a shared latest-event cell so each checkpoint anchors to the nearest preceding PCIe
     //     event as well as the USB frame. The source is already started by the caller. ---
     let mut pcie_meta: Option<serde_json::Value> = None;
-    let (pcie_state, pcie_stop, pcie_reader) = if let Some(pcie) = pcie {
+    let (pcie_state, mut pcie_thread) = if let Some(pcie) = pcie {
         // trace_mmio/dma toggles are held by the source + window; not needed here.
         let PcieCapture { source, stop, meta, .. } = pcie;
         let log = PcieLog::create(session.pcie_bin(), session.pcie_idx())?;
@@ -335,9 +403,15 @@ pub fn run_usb_capture(
                 .spawn(move || pcie_reader_loop(source, log, st, traffic, reader_stop, stats))?
         };
         pcie_meta = Some(meta);
-        (Some(st), Some(stop), Some(handle))
+        (
+            Some(st),
+            Some(PcieReaderGuard {
+                stop: Some(stop),
+                reader: Some(handle),
+            }),
+        )
     } else {
-        (None, None, None)
+        (None, None)
     };
 
     // --- the checkpoint engine --- (USB is primary when at least one USB source started)
@@ -347,7 +421,8 @@ pub fn run_usb_capture(
 
     let start = Instant::now();
     let interval_ns = (opts.cfg.interval_ms as i64).saturating_mul(1_000_000);
-    loop {
+    let run_result = (|| -> Result<()> {
+      loop {
         match in_rx.recv_timeout(Duration::from_millis(100)) {
             Ok(ev) => engine.on_input(&ev, &state)?,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
@@ -413,6 +488,7 @@ pub fn run_usb_capture(
         if engine.stop_requested
             || ui_stop.as_ref().map(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
             || state.lock().unwrap().done
+            || state.lock().unwrap().error.is_some()
             || opts.max_duration.map(|d| start.elapsed() >= d).unwrap_or(false)
             || over_budget
         {
@@ -421,26 +497,19 @@ pub fn run_usb_capture(
             }
             break;
         }
-    }
+      }
+      Ok(())
+    })();
 
     // --- finalize: tear down threads, then inject checkpoint comments (§4) ---
     hooks.stop();
-    reader_stop.store(true, Ordering::Relaxed);
-    for k in &killers {
-        k.kill(); // unblock readers parked in a blocking pipe read
-    }
-    for r in readers {
-        let _ = r.join();
-    }
+    usb_threads.stop_and_join(&state);
     if let Some(w) = writer {
         w.lock().unwrap().flush()?;
         drop(w); // close the pcapng file before finalize reads/rewrites it
     }
-    if let Some(stop) = &pcie_stop {
-        stop(); // unblock a parked PCIe read (e.g. CancelIoEx) so its reader can exit
-    }
-    if let Some(h) = pcie_reader {
-        let _ = h.join(); // PcieLog writes unbuffered, so it's durable once the thread ends
+    if let Some(mut pcie_thread) = pcie_thread.take() {
+        pcie_thread.stop_and_join(&state);
     }
     drop(engine.shot_tx.take());
     let _ = shot_worker.join();
@@ -448,6 +517,9 @@ pub fn run_usb_capture(
     if let Some(h) = mem_worker {
         let _ = h.join();
     }
+
+    // All capture/worker resources are stopped before an event/checkpoint write failure escapes.
+    run_result?;
 
     let final_ts = clock.now_ns();
     let stop_anchor = anchor_of(&state.lock().unwrap());
@@ -461,6 +533,10 @@ pub fn run_usb_capture(
         eprintln!("dropped {dropped} USB packets via capture filter (transfer-type/endpoint)");
     }
     engine.finalize(&clock, &opts, total_frames, pcie_meta.as_ref())?;
+
+    if let Some(error) = state.lock().unwrap().error.clone() {
+        anyhow::bail!(error);
+    }
 
     Ok(RecordSummary {
         events: total_frames,
@@ -532,7 +608,13 @@ fn reader_loop(
                     let mut s = state.lock().unwrap();
                     let ts = rec.ts_ns.max(s.last_ts);
                     s.last_ts = ts;
-                    let (idx, off) = writer.lock().unwrap().append_packet(ts, &rec.payload)?;
+                    let (idx, off) = match writer.lock().unwrap().append_packet(ts, &rec.payload) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            s.error = Some(format!("writing USB capture: {e:#}"));
+                            break;
+                        }
+                    };
                     s.latest_index = Some(idx);
                     s.latest_offset = off;
                     s.total_frames = idx + 1;
@@ -557,6 +639,7 @@ fn reader_loop(
             }
             Err(e) => {
                 eprintln!("usb reader stopped: {e}");
+                record_reader_error(&state, format!("USB capture reader failed: {e:#}"));
                 mark_source_ended(&state);
                 break;
             }
@@ -572,6 +655,13 @@ fn mark_source_ended(state: &Arc<Mutex<TrafficState>>) {
     s.active_sources = s.active_sources.saturating_sub(1);
     if s.active_sources == 0 {
         s.done = true;
+    }
+}
+
+fn record_reader_error(state: &Arc<Mutex<TrafficState>>, error: String) {
+    let mut s = state.lock().unwrap();
+    if s.error.is_none() {
+        s.error = Some(error);
     }
 }
 
@@ -819,6 +909,12 @@ impl Engine {
         if !self.comments.is_empty() && pcapng_path.exists() {
             let data = std::fs::read(&pcapng_path)?;
             let (new_data, new_offsets) = pcapng::inject_comments(&data, &self.comments)?;
+            if new_offsets.len() as u64 != total_frames {
+                anyhow::bail!(
+                    "pcapng/index frame count mismatch: pcapng has {}, index has {total_frames}",
+                    new_offsets.len()
+                );
+            }
             std::fs::write(&pcapng_path, &new_data)?;
 
             // Rewrite frames.idx so byte_offsets match the recommented pcapng.
@@ -879,7 +975,13 @@ fn pcie_reader_loop(
             Ok(Some(rec)) => {
                 if let TrafficKind::Pcie(ev) = &rec.kind {
                     let bytes = crate::record::event_bytes(ev);
-                    let (idx, off) = log.append(ev)?;
+                    let (idx, off) = match log.append(ev) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            record_reader_error(&traffic, format!("writing PCIe capture: {e:#}"));
+                            break;
+                        }
+                    };
                     {
                         let mut s = state.lock().unwrap();
                         s.latest_index = Some(idx);
@@ -908,6 +1010,7 @@ fn pcie_reader_loop(
             Ok(None) => break, // EOF (bounded/replay source) or unblocked (live)
             Err(e) => {
                 eprintln!("pcie reader stopped: {e}");
+                record_reader_error(&traffic, format!("PCIe capture reader failed: {e:#}"));
                 break;
             }
         }

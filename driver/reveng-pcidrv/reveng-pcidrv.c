@@ -11,12 +11,16 @@
  *     ISR pushes an IRQ event (with the true MSI vector) into the same ring. This is the
  *     high-fidelity per-controller interrupt capture the ETW ISR path could not provide.
  *
- * The ring is a lock-free MPSC queue: interrupt service routines (multiple CPUs, DIRQL) are the
- * producers; the single ReadFile path (PASSIVE) is the consumer. Overwrite on overflow drops the
- * oldest unread events and bumps a dropped counter (surfaced via the control device later).
+ * The ring is a bounded lock-free MPSC queue: interrupt service routines (multiple CPUs, DIRQL)
+ * are the producers; the single ReadFile path (PASSIVE) is the consumer. A full ring drops the
+ * new event and bumps a dropped counter. Per-slot sequence numbers prevent producers that are
+ * delayed for more than one ring rotation from ever writing a slot that has been reused.
  */
 #include <ntddk.h>
+#include <wdmsec.h>
 #include "reveng_pci_abi.h"
+
+#pragma comment(lib, "Wdmsec.lib")
 
 /* HalGetBusDataByOffset is deprecated but is the simplest config-space read without owning the
  * device; the WDK builds warnings-as-errors, and PoStartNextPowerIrp is likewise legacy. */
@@ -37,7 +41,7 @@ typedef struct _EVENT_RING {
     volatile LONG64  Head;             /* reserved slot count (producers)  */
     LONG64           Tail;             /* consumed count (single reader)   */
     volatile LONG64  Dropped;          /* events lost to overflow          */
-    volatile LONG64  Commit[RING_N];   /* per-slot published sequence, -1 = empty */
+    volatile LONG64  Commit[RING_N];   /* producer/consumer ownership sequence */
     REVENG_PCI_EVENT Slots[RING_N];
 } EVENT_RING;
 
@@ -83,15 +87,37 @@ typedef struct _FILTER_EXT {
 
 static PDEVICE_OBJECT g_ControlDevice; /* the one control device; ISRs push into its ring */
 static PFILTER_EXT    g_ActiveFilter;  /* most-recently-started filter (for MMIO snapshot) */
+/* Serializes active-filter publication, snapshot IOCTLs, and BAR/DMA teardown.  A kernel mutex
+ * preserves PASSIVE_LEVEL while held, which the mapping and interrupt-disconnect paths require. */
+static KMUTEX         g_FilterMutex;
 static UNICODE_STRING g_SymLink;
+/* Private setup-class GUID used only to give IoCreateDeviceSecure stable policy identity. */
+static const GUID g_ControlClassGuid =
+    {0x67df8d87, 0x22b8, 0x4f62, {0x9f, 0xf0, 0x61, 0xad, 0x27, 0x89, 0x38, 0xa5}};
+
+static void AcquireFilterMutex(void)
+{
+    (void)KeWaitForSingleObject(&g_FilterMutex, Executive, KernelMode, FALSE, NULL);
+}
+
+static void ReleaseFilterMutex(void)
+{
+    KeReleaseMutex(&g_FilterMutex, FALSE);
+}
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD RevengUnload;
 DRIVER_ADD_DEVICE RevengAddDevice;
+_Dispatch_type_(IRP_MJ_CREATE)
+_Dispatch_type_(IRP_MJ_CLOSE)
 DRIVER_DISPATCH RevengCreateClose;
+_Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
 DRIVER_DISPATCH RevengDeviceControl;
+_Dispatch_type_(IRP_MJ_READ)
 DRIVER_DISPATCH RevengRead;
+_Dispatch_type_(IRP_MJ_PNP)
 DRIVER_DISPATCH RevengPnp;
+_Dispatch_type_(IRP_MJ_POWER)
 DRIVER_DISPATCH RevengPower;
 DRIVER_DISPATCH RevengPassThrough;
 
@@ -112,41 +138,54 @@ static void RingInit(EVENT_RING *r)
     r->Tail = 0;
     r->Dropped = 0;
     for (i = 0; i < RING_N; i++) {
-        r->Commit[i] = -1;
+        r->Commit[i] = (LONG64)i; /* sequence `i` means slot i is free for producer i */
     }
 }
 
 /* Producer: safe from any IRQL / CPU (ISR context included). */
 static void RingPush(EVENT_RING *r, const REVENG_PCI_EVENT *ev)
 {
-    LONG64 seq = InterlockedIncrement64(&r->Head) - 1;
-    ULONG idx = (ULONG)(seq & RING_MASK);
+    LONG64 seq;
+    ULONG idx;
+
+    for (;;) {
+        LONG64 slotSeq;
+        seq = r->Head;
+        idx = (ULONG)(seq & RING_MASK);
+        slotSeq = r->Commit[idx];
+        if (slotSeq == seq) {
+            if (InterlockedCompareExchange64(&r->Head, seq + 1, seq) == seq) {
+                break; /* this producer exclusively owns the slot */
+            }
+            continue;
+        }
+        if (slotSeq < seq) {
+            InterlockedIncrement64(&r->Dropped); /* queue full; never overwrite live data */
+            return;
+        }
+        /* Another producer advanced Head before our snapshot; retry at the new position. */
+    }
+
     r->Slots[idx] = *ev;
     /* Publish last, with a full barrier, so the consumer never reads a half-written slot. */
-    InterlockedExchange64(&r->Commit[idx], seq);
+    InterlockedExchange64(&r->Commit[idx], seq + 1);
 }
 
 /* Consumer: single reader (ReadFile). Returns bytes copied into `out`. */
 static ULONG RingDrain(EVENT_RING *r, PUCHAR out, ULONG outcap)
 {
     ULONG copied = 0;
-    LONG64 head = r->Head; /* snapshot */
     LONG64 tail = r->Tail;
 
-    /* If producers lapped us, skip ahead to the oldest still-live slot and count the loss. */
-    if (head - tail > (LONG64)RING_N) {
-        LONG64 lost = (head - (LONG64)RING_N) - tail;
-        InterlockedExchangeAdd64(&r->Dropped, lost);
-        tail = head - (LONG64)RING_N;
-    }
-
-    while (tail < head && (copied + sizeof(REVENG_PCI_EVENT)) <= outcap) {
+    while ((copied + sizeof(REVENG_PCI_EVENT)) <= outcap) {
         ULONG idx = (ULONG)(tail & RING_MASK);
-        if (r->Commit[idx] != tail) {
-            break; /* producer reserved this slot but hasn't published yet */
+        if (r->Commit[idx] != tail + 1) {
+            break; /* empty, or its producer reserved but has not published yet */
         }
         RtlCopyMemory(out + copied, &r->Slots[idx], sizeof(REVENG_PCI_EVENT));
         copied += sizeof(REVENG_PCI_EVENT);
+        /* Make the slot available only after the event has been copied out. */
+        InterlockedExchange64(&r->Commit[idx], tail + (LONG64)RING_N);
         tail++;
     }
     r->Tail = tail;
@@ -425,7 +464,8 @@ static BOOLEAN PhysInRam(ULONGLONG pa, ULONG len)
     for (i = 0; ranges[i].NumberOfBytes.QuadPart != 0; i++) {
         ULONGLONG base = (ULONGLONG)ranges[i].BaseAddress.QuadPart;
         ULONGLONG size = (ULONGLONG)ranges[i].NumberOfBytes.QuadPart;
-        if (pa >= base && pa + len <= base + size) {
+        /* Avoid wraparound in both ranges before accepting an untrusted device address. */
+        if (pa >= base && (ULONGLONG)len <= size && pa - base <= size - (ULONGLONG)len) {
             ok = TRUE;
             break;
         }
@@ -476,11 +516,19 @@ static BOOLEAN ReadPhys(ULONGLONG pa, PVOID dst, ULONG len)
     return NT_SUCCESS(s) && done == len;
 }
 
+/* Validate a register access without allowing offset+length to wrap. */
+static BOOLEAN BarRangeValid(const BAR_MAP *bar, ULONG offset, ULONG length)
+{
+    return bar != NULL && bar->Va != NULL && length <= bar->Length &&
+           offset <= bar->Length - length;
+}
+
 /* Read the interrupter-0 Event Ring pointers from MMIO, copy the ring segment out of system
  * memory, and emit a DMA event per Event TRB that changed since the last snapshot. */
 static void DmaSnapshot(PFILTER_EXT fx)
 {
     PCONTROL_EXT ctl = ControlExt();
+    BAR_MAP *barMap;
     PUCHAR bar;
     ULONG rtsoff, erstsz, erstba_lo, erstba_hi;
     ULONGLONG erstba;
@@ -489,10 +537,22 @@ static void DmaSnapshot(PFILTER_EXT fx)
     if (fx == NULL || ctl == NULL || fx->BarCount == 0 || fx->Bars[0].Va == NULL) {
         return;
     }
-    bar = (PUCHAR)fx->Bars[0].Va;
+    barMap = &fx->Bars[0];
+    bar = (PUCHAR)barMap->Va;
 
     /* Runtime register base (RTSOFF, bits 31:5), then interrupter 0's ERST size/base. */
+    if (!BarRangeValid(barMap, 0x18, sizeof(ULONG))) {
+        DmaMarker(ctl, 11, 0x18, barMap->Length);
+        return;
+    }
     rtsoff = READ_REGISTER_ULONG((PULONG)(bar + 0x18)) & ~0x1Fu;
+    /* The final register read is at RTSOFF+0x34.  Validate the whole register window before
+     * doing any access derived from the device-controlled RTSOFF value. */
+    if (rtsoff > MAXULONG - 0x34 ||
+        !BarRangeValid(barMap, rtsoff + 0x28, 0x10)) {
+        DmaMarker(ctl, 11, rtsoff, barMap->Length);
+        return;
+    }
     erstsz = READ_REGISTER_ULONG((PULONG)(bar + rtsoff + 0x28)) & 0xFFFF;
     erstba_lo = READ_REGISTER_ULONG((PULONG)(bar + rtsoff + 0x30));
     erstba_hi = READ_REGISTER_ULONG((PULONG)(bar + rtsoff + 0x34));
@@ -537,6 +597,7 @@ static void DmaSnapshot(PFILTER_EXT fx)
             DmaCleanup(fx);
             return;
         }
+        RtlZeroMemory(fx->SegPrev, segbytes);
         fx->SegLen = segbytes;
         fx->SegDev = segbase;
         fx->ErstbaDev = erstba;
@@ -576,7 +637,16 @@ static void DmaSnapshot(PFILTER_EXT fx)
 /* Forward an IRP down the stack unchanged. */
 NTSTATUS RevengPassThrough(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
+    PCOMMON_EXT common = (PCOMMON_EXT)DeviceObject->DeviceExtension;
     PFILTER_EXT fx = (PFILTER_EXT)DeviceObject->DeviceExtension;
+    if (!common->IsFilter) {
+        /* The named control device has no lower stack.  Unhandled majors (notably CLEANUP)
+         * must be completed locally rather than interpreting CONTROL_EXT bytes as fx->Lower. */
+        Irp->IoStatus.Status = STATUS_INVALID_DEVICE_REQUEST;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return STATUS_INVALID_DEVICE_REQUEST;
+    }
     IoSkipCurrentIrpStackLocation(Irp);
     return IoCallDriver(fx->Lower, Irp);
 }
@@ -586,7 +656,9 @@ NTSTATUS RevengPower(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     PFILTER_EXT fx = (PFILTER_EXT)DeviceObject->DeviceExtension;
     /* The non-PnP control device is not in any stack — just succeed. */
     if (!fx->IsFilter) {
-        NTSTATUS s = Irp->IoStatus.Status;
+        NTSTATUS s = STATUS_SUCCESS;
+        Irp->IoStatus.Status = s;
+        Irp->IoStatus.Information = 0;
         PoStartNextPowerIrp(Irp);
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return s;
@@ -614,7 +686,9 @@ NTSTATUS RevengPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     /* The non-PnP control device should never see PnP IRPs; if it does, fail cleanly rather
      * than dereference a CONTROL_EXT as a FILTER_EXT. */
     if (!fx->IsFilter) {
-        status = Irp->IoStatus.Status;
+        status = STATUS_INVALID_DEVICE_REQUEST;
+        Irp->IoStatus.Status = status;
+        Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
         return status;
     }
@@ -643,8 +717,10 @@ NTSTATUS RevengPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
              * fails for MSI, see README) and map its BARs for MMIO snapshotting (M3). */
             RememberLineVector(fx, res);
             (void)ConnectInterrupt(fx); /* best-effort: capture is optional to the device */
+            AcquireFilterMutex();
             MapBars(fx, res);
             g_ActiveFilter = fx;
+            ReleaseFilterMutex();
         }
         Irp->IoStatus.Status = status;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -653,24 +729,28 @@ NTSTATUS RevengPnp(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     }
     case IRP_MN_STOP_DEVICE:
     case IRP_MN_SURPRISE_REMOVAL:
+        AcquireFilterMutex();
         if (g_ActiveFilter == fx) {
             g_ActiveFilter = NULL;
         }
         DisconnectInterrupt(fx);
         UnmapBars(fx);
         DmaCleanup(fx);
+        ReleaseFilterMutex();
         IoSkipCurrentIrpStackLocation(Irp);
         status = IoCallDriver(fx->Lower, Irp);
         IoReleaseRemoveLock(&fx->RemoveLock, Irp);
         return status;
 
     case IRP_MN_REMOVE_DEVICE:
+        AcquireFilterMutex();
         if (g_ActiveFilter == fx) {
             g_ActiveFilter = NULL;
         }
         DisconnectInterrupt(fx);
         UnmapBars(fx);
         DmaCleanup(fx);
+        ReleaseFilterMutex();
         IoSkipCurrentIrpStackLocation(Irp);
         status = IoCallDriver(fx->Lower, Irp);
         IoReleaseRemoveLockAndWait(&fx->RemoveLock, Irp);
@@ -760,13 +840,25 @@ NTSTATUS RevengDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         if (sp->Parameters.DeviceIoControl.InputBufferLength >= sizeof(ULONG)) {
             reqBytes = *(ULONG *)Irp->AssociatedIrp.SystemBuffer;
         }
-        SnapshotBars(g_ActiveFilter, reqBytes); /* NULL-safe: no-op if no filter attached */
-        status = STATUS_SUCCESS;
+        AcquireFilterMutex();
+        if (g_ActiveFilter != NULL) {
+            SnapshotBars(g_ActiveFilter, reqBytes);
+            status = STATUS_SUCCESS;
+        } else {
+            status = STATUS_DEVICE_NOT_READY;
+        }
+        ReleaseFilterMutex();
         break;
     }
     case IOCTL_REVENG_PCI_DMA_SNAP:
-        DmaSnapshot(g_ActiveFilter); /* NULL-safe */
-        status = STATUS_SUCCESS;
+        AcquireFilterMutex();
+        if (g_ActiveFilter != NULL) {
+            DmaSnapshot(g_ActiveFilter);
+            status = STATUS_SUCCESS;
+        } else {
+            status = STATUS_DEVICE_NOT_READY;
+        }
+        ReleaseFilterMutex();
         break;
     default:
         break;
@@ -821,8 +913,18 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     RtlInitUnicodeString(&devName, L"\\Device\\RevengPciCap");
     RtlInitUnicodeString(&g_SymLink, L"\\DosDevices\\RevengPciCap");
 
-    status = IoCreateDevice(DriverObject, sizeof(CONTROL_EXT), &devName,
-                            FILE_DEVICE_UNKNOWN, FILE_DEVICE_SECURE_OPEN, FALSE, &devObj);
+    /* The ring has one consumer by design; make the control device exclusive so a second
+     * ReadFile handle cannot race Tail or split the event stream. */
+    status = IoCreateDeviceSecure(
+        DriverObject,
+        sizeof(CONTROL_EXT),
+        &devName,
+        FILE_DEVICE_UNKNOWN,
+        FILE_DEVICE_SECURE_OPEN,
+        TRUE,
+        &SDDL_DEVOBJ_SYS_ALL_ADM_ALL,
+        &g_ControlClassGuid,
+        &devObj);
     if (!NT_SUCCESS(status)) {
         return status;
     }
@@ -836,6 +938,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     RtlZeroMemory(ext, sizeof(*ext));
     ext->IsFilter = FALSE;
     RingInit(&ext->ring);
+    KeInitializeMutex(&g_FilterMutex, 0);
     devObj->Flags |= DO_BUFFERED_IO;
     devObj->Flags &= ~DO_DEVICE_INITIALIZING;
     g_ControlDevice = devObj;
@@ -851,6 +954,7 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
     /* Every other major function just passes through on filter devices. */
     for (i = 0; i <= IRP_MJ_MAXIMUM_FUNCTION; i++) {
         if (DriverObject->MajorFunction[i] == NULL) {
+#pragma warning(suppress : 28168) /* one safe fallback intentionally covers every other major */
             DriverObject->MajorFunction[i] = RevengPassThrough;
         }
     }

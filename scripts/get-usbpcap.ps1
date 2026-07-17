@@ -141,9 +141,11 @@ try {
     if ($sig.Status -eq 'Valid') {
         Write-Ok "Authenticode: Valid - $($sig.SignerCertificate.Subject)"
     } else {
-        Write-Warn2 "Authenticode status: $($sig.Status) (installer may still be genuine; verify manually)"
+        throw "Authenticode signature is not valid ($($sig.Status)); refusing to run $dest."
     }
-} catch { Write-Warn2 "Could not check Authenticode signature: $($_.Exception.Message)" }
+} catch {
+    throw "Could not verify the installer signature: $($_.Exception.Message)"
+}
 
 if ($DownloadOnly) {
     Write-Step "Download-only requested. Installer at: $dest"
@@ -165,6 +167,9 @@ $installArgs = if ($Silent) { '/S' } else { $null }
 $proc = if ($installArgs) { Start-Process -FilePath $dest -ArgumentList $installArgs -Wait -PassThru }
         else               { Start-Process -FilePath $dest -Wait -PassThru }
 Write-Ok "Installer exited with code $($proc.ExitCode)"
+if ($proc.ExitCode -ne 0) {
+    throw "USBPcap installer failed with exit code $($proc.ExitCode)."
+}
 
 # ----------------------------------------------------------------------------
 # 4. Verify + wire up discovery.

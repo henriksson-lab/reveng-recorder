@@ -316,10 +316,22 @@ impl LoadedSnapshot {
         let deflate = meta.compression == "deflate";
         let mut regions = std::collections::HashMap::with_capacity(meta.regions.len());
         for r in &meta.regions {
-            let start = r.file_offset as usize;
-            let end = start + r.stored_len as usize;
-            let stored = raw.get(start..end).unwrap_or(&[]);
-            let bytes = if deflate { inflate(stored, r.size as usize)? } else { stored.to_vec() };
+            let start = usize::try_from(r.file_offset).context("region offset does not fit this platform")?;
+            let stored_len = usize::try_from(r.stored_len).context("region stored length does not fit this platform")?;
+            let expected_size = usize::try_from(r.size).context("region size does not fit this platform")?;
+            let end = start.checked_add(stored_len).context("region offset overflow")?;
+            let stored = raw
+                .get(start..end)
+                .context("region bytes are outside regions.bin")?;
+            let bytes = if deflate { inflate(stored, expected_size)? } else { stored.to_vec() };
+            if bytes.len() != expected_size {
+                anyhow::bail!(
+                    "region at offset {} has {} bytes, expected {}",
+                    r.file_offset,
+                    bytes.len(),
+                    expected_size
+                );
+            }
             regions.insert(r.file_offset, bytes);
         }
         Ok(Self { meta, regions })
@@ -333,8 +345,19 @@ impl LoadedSnapshot {
 /// Inflate one deflate-compressed region (`hint` = expected uncompressed size, for pre-alloc).
 fn inflate(data: &[u8], hint: usize) -> Result<Vec<u8>> {
     use std::io::Read;
-    let mut out = Vec::with_capacity(hint);
-    flate2::read::DeflateDecoder::new(data).read_to_end(&mut out)?;
+    // Do not trust a manifest-provided size enough to reserve it all up front. The decoder's
+    // `take` bound below still enforces the exact declared limit while capacity grows with data.
+    let mut out = Vec::with_capacity(hint.min(16 * 1024 * 1024));
+    let max_len = u64::try_from(hint)
+        .ok()
+        .and_then(|n| n.checked_add(1))
+        .context("region size is too large to inflate")?;
+    flate2::read::DeflateDecoder::new(data)
+        .take(max_len)
+        .read_to_end(&mut out)?;
+    if out.len() > hint {
+        anyhow::bail!("deflate region exceeds its declared size");
+    }
     Ok(out)
 }
 
@@ -776,7 +799,8 @@ mod imp {
         let (work_tx, work_rx) = sync_channel::<(u64, u32, u32, Vec<u8>)>(threads * 2);
         let work_rx = Arc::new(Mutex::new(work_rx));
         // (base, protect, mem_type, uncompressed_size, hash, compressed_bytes)
-        let (res_tx, res_rx) = channel::<(u64, u32, u32, u64, u64, Vec<u8>)>();
+        type EncodedRegion = (u64, u32, u32, u64, u64, Vec<u8>);
+        let (res_tx, res_rx) = channel::<std::result::Result<EncodedRegion, String>>();
 
         std::thread::scope(|s| -> Result<super::MemSnapshotMeta> {
             for _ in 0..threads {
@@ -788,18 +812,28 @@ mod imp {
                     let hash = super::fnv1a64(&bytes);
                     match super::deflate(&bytes) {
                         Ok(comp) => {
-                            if tx.send((base, protect, mt, bytes.len() as u64, hash, comp)).is_err() {
+                            if tx
+                                .send(Ok((base, protect, mt, bytes.len() as u64, hash, comp)))
+                                .is_err()
+                            {
                                 break;
                             }
                         }
-                        Err(_) => break,
+                        Err(e) => {
+                            let _ = tx.send(Err(format!(
+                                "compressing memory region at 0x{base:x}: {e:#}"
+                            )));
+                            break;
+                        }
                     }
                 });
             }
             drop(res_tx); // res_rx closes once every compressor clone is dropped
 
             let collector = s.spawn(move || -> Result<super::MemSnapshotMeta> {
-                while let Ok((base, protect, mt, size, hash, comp)) = res_rx.recv() {
+                while let Ok(result) = res_rx.recv() {
+                    let (base, protect, mt, size, hash, comp) =
+                        result.map_err(anyhow::Error::msg)?;
                     w.push_encoded_region(base, protect, mt, size, hash, &comp)?;
                 }
                 w.finish()
@@ -948,5 +982,11 @@ mod tests {
             .any(|h| h.encoding == "u32_le" && h.abs_addr == 0x1002));
         let s = scan(&a, "Acme");
         assert!(s.iter().any(|h| h.encoding == "ascii" && h.abs_addr == 0x2000));
+    }
+
+    #[test]
+    fn inflate_rejects_data_larger_than_its_manifest_size() {
+        let compressed = deflate(&[42u8; 32]).unwrap();
+        assert!(inflate(&compressed, 31).is_err());
     }
 }

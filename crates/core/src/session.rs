@@ -122,14 +122,26 @@ impl SessionReader {
     /// All records from `events.ndjson`, in file order.
     pub fn records(&self) -> anyhow::Result<Vec<SessionRecord>> {
         let file = fs::File::open(self.root.join("events.ndjson"))?;
+        let mut reader = std::io::BufReader::new(file);
         let mut out = Vec::new();
-        for line in std::io::BufReader::new(file).lines() {
-            let line = line?;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.read_line(&mut line)? == 0 {
+                break;
+            }
+            let terminated = line.ends_with('\n');
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            out.push(serde_json::from_str::<SessionRecord>(line)?);
+            match serde_json::from_str::<SessionRecord>(line) {
+                Ok(record) => out.push(record),
+                // A crash can leave only the final append partially written.  Preserve all
+                // complete source-of-truth records and ignore that unterminated tail.
+                Err(_) if !terminated => break,
+                Err(e) => return Err(e.into()),
+            }
         }
         Ok(out)
     }
@@ -195,5 +207,38 @@ mod tests {
             }
             _ => panic!("expected a checkpoint record"),
         }
+    }
+
+    #[test]
+    fn records_ignore_only_an_unterminated_crash_tail() {
+        let dir = std::env::temp_dir().join(format!(
+            "reveng_session_tail_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut writer = SessionWriter::create(&dir).unwrap();
+        writer
+            .append_record(&SessionRecord::Input(InputEvent {
+                ts_ns: 1,
+                kind: crate::input::InputKind::KeyDown,
+                button: None,
+                vk: Some(65),
+                scancode: None,
+                x: 0,
+                y: 0,
+                injected: false,
+            }))
+            .unwrap();
+        drop(writer);
+        use std::io::Write as _;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(dir.join("events.ndjson"))
+            .unwrap();
+        file.write_all(br#"{"rec":"checkpoint""#).unwrap();
+        drop(file);
+
+        assert_eq!(SessionReader::open(&dir).unwrap().records().unwrap().len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

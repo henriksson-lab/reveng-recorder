@@ -22,7 +22,9 @@ use windows::Win32::Devices::DeviceAndDriverInstallation::{
     SPDRP_ADDRESS, SPDRP_BUSNUMBER, SPDRP_UPPERFILTERS, SP_CLASSINSTALL_HEADER, SP_DEVINFO_DATA,
     SP_PROPCHANGE_PARAMS,
 };
-use windows::Win32::Foundation::ERROR_NO_MORE_ITEMS;
+use windows::Win32::Foundation::{
+    ERROR_INSUFFICIENT_BUFFER, ERROR_INVALID_DATA, ERROR_NO_MORE_ITEMS,
+};
 
 /// The driver's service name, and the value we install into the target's UpperFilters.
 pub const SERVICE_NAME: &str = "RevengPciCap";
@@ -31,15 +33,24 @@ pub const SERVICE_NAME: &str = "RevengPciCap";
 /// restart it so PnP loads our filter into its stack.
 pub fn attach(bus: u8, device: u8, function: u8) -> anyhow::Result<()> {
     with_device(bus, device, function, |hdev, info| unsafe {
-        set_upper_filters(hdev, info, Some(SERVICE_NAME))?;
-        restart_device(hdev, info)
+        update_upper_filters(hdev, info, true)?;
+        if let Err(restart_error) = restart_device(hdev, info) {
+            // Do not leave a filter armed for the next reboot when activation failed now.
+            return match update_upper_filters(hdev, info, false) {
+                Ok(()) => Err(restart_error.context("device restart failed; filter registration rolled back")),
+                Err(rollback_error) => Err(anyhow::anyhow!(
+                    "device restart failed ({restart_error:#}) and UpperFilters rollback also failed ({rollback_error:#})"
+                )),
+            };
+        }
+        Ok(())
     })
 }
 
-/// Remove our upper filter from the device and restart it (reverts to the stock stack).
+/// Remove our upper filter from the device and restart it while preserving any other filters.
 pub fn detach(bus: u8, device: u8, function: u8) -> anyhow::Result<()> {
     with_device(bus, device, function, |hdev, info| unsafe {
-        set_upper_filters(hdev, info, None)?;
+        update_upper_filters(hdev, info, false)?;
         restart_device(hdev, info)
     })
 }
@@ -93,33 +104,43 @@ fn with_device(
     }
 }
 
-/// Set (or, with `None`, clear) the device's `UpperFilters` to a single service name.
-unsafe fn set_upper_filters(
+/// Add or remove only our service from `UpperFilters`, preserving filters installed by the
+/// device vendor or other software.
+unsafe fn update_upper_filters(
     hdev: HDEVINFO,
     info: &SP_DEVINFO_DATA,
-    service: Option<&str>,
+    attach: bool,
 ) -> anyhow::Result<()> {
-    match service {
-        Some(name) => {
-            // REG_MULTI_SZ: one entry + double-NUL terminator, as UTF-16 little-endian bytes.
-            let mut u16s: Vec<u16> = name.encode_utf16().collect();
-            u16s.push(0); // terminate the string
-            u16s.push(0); // terminate the multi-sz
-            let bytes = u16_slice_as_bytes(&u16s);
-            SetupDiSetDeviceRegistryPropertyW(hdev, info as *const _ as *mut _, SPDRP_UPPERFILTERS, Some(bytes))
-                .map_err(|e| anyhow::anyhow!("set UpperFilters failed: {e}"))
+    let mut filters = get_multi_sz(hdev, info, SPDRP_UPPERFILTERS)?;
+    if attach {
+        if !filters.iter().any(|f| f.eq_ignore_ascii_case(SERVICE_NAME)) {
+            filters.push(SERVICE_NAME.to_owned());
         }
-        None => {
-            // Empty buffer deletes the property.
-            SetupDiSetDeviceRegistryPropertyW(hdev, info as *const _ as *mut _, SPDRP_UPPERFILTERS, None)
-                .map_err(|e| anyhow::anyhow!("clear UpperFilters failed: {e}"))
-        }
+    } else {
+        filters.retain(|f| !f.eq_ignore_ascii_case(SERVICE_NAME));
     }
+
+    if filters.is_empty() {
+        // No remaining filters: delete the property.
+        return SetupDiSetDeviceRegistryPropertyW(hdev, info as *const _ as *mut _, SPDRP_UPPERFILTERS, None)
+            .map_err(|e| anyhow::anyhow!("clear UpperFilters failed: {e}"));
+    }
+
+    // REG_MULTI_SZ: each entry is NUL-terminated, with one final NUL terminator.
+    let mut u16s = Vec::new();
+    for filter in filters {
+        u16s.extend(filter.encode_utf16());
+        u16s.push(0);
+    }
+    u16s.push(0);
+    let bytes = u16_slice_as_bytes(&u16s);
+    SetupDiSetDeviceRegistryPropertyW(hdev, info as *const _ as *mut _, SPDRP_UPPERFILTERS, Some(bytes))
+        .map_err(|e| anyhow::anyhow!("set UpperFilters failed: {e}"))
 }
 
 /// Restart the device (DIF_PROPERTYCHANGE / DICS_PROPCHANGE) so the filter change takes effect.
 unsafe fn restart_device(hdev: HDEVINFO, info: &SP_DEVINFO_DATA) -> anyhow::Result<()> {
-    let mut params = SP_PROPCHANGE_PARAMS {
+    let params = SP_PROPCHANGE_PARAMS {
         ClassInstallHeader: SP_CLASSINSTALL_HEADER {
             cbSize: std::mem::size_of::<SP_CLASSINSTALL_HEADER>() as u32,
             InstallFunction: DIF_PROPERTYCHANGE,
@@ -131,7 +152,7 @@ unsafe fn restart_device(hdev: HDEVINFO, info: &SP_DEVINFO_DATA) -> anyhow::Resu
     SetupDiSetClassInstallParamsW(
         hdev,
         Some(info as *const _),
-        Some(&mut params.ClassInstallHeader),
+        Some(&params.ClassInstallHeader),
         std::mem::size_of::<SP_PROPCHANGE_PARAMS>() as u32,
     )
     .map_err(|e| anyhow::anyhow!("SetClassInstallParams failed: {e}"))?;
@@ -154,4 +175,35 @@ unsafe fn get_u32(hdev: HDEVINFO, info: &SP_DEVINFO_DATA, prop: SETUP_DI_REGISTR
     SetupDiGetDeviceRegistryPropertyW(hdev, info, prop, None, Some(&mut buf), Some(&mut needed))
         .ok()?;
     Some(u32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]))
+}
+
+/// Read a REG_MULTI_SZ property. Missing or malformed values are treated as empty so attach can
+/// safely establish the property; valid existing entries are always preserved verbatim.
+unsafe fn get_multi_sz(
+    hdev: HDEVINFO,
+    info: &SP_DEVINFO_DATA,
+    prop: SETUP_DI_REGISTRY_PROPERTY,
+) -> anyhow::Result<Vec<String>> {
+    let mut needed = 0u32;
+    match SetupDiGetDeviceRegistryPropertyW(hdev, info, prop, None, None, Some(&mut needed)) {
+        Ok(()) => {}
+        Err(e) if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() => {}
+        Err(e) if e.code() == ERROR_INVALID_DATA.to_hresult() => return Ok(Vec::new()),
+        Err(e) => return Err(anyhow::anyhow!("read existing UpperFilters size failed: {e}")),
+    }
+    if needed < 2 {
+        return Ok(Vec::new());
+    }
+    let mut buf = vec![0u8; needed as usize];
+    SetupDiGetDeviceRegistryPropertyW(hdev, info, prop, None, Some(&mut buf), Some(&mut needed))
+        .map_err(|e| anyhow::anyhow!("read existing UpperFilters failed: {e}"))?;
+    buf.truncate(needed as usize);
+    Ok(buf
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect::<Vec<_>>()
+        .split(|&c| c == 0)
+        .filter(|s| !s.is_empty())
+        .map(String::from_utf16_lossy)
+        .collect())
 }

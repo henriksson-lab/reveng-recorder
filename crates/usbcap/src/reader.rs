@@ -16,6 +16,9 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
+const BT_EPB: u32 = 0x0000_0006;
+const MAX_PACKET_LEN: usize = 64 * 1024 * 1024;
+
 /// A decoded USB frame, ready to render as one JSON line (DESIGN.md §8a).
 #[derive(Debug, Clone, Serialize)]
 pub struct UsbFrame {
@@ -117,7 +120,7 @@ impl UsbReader {
         } else {
             0
         };
-        Ok(if header_len > 0 && header_len <= packet.len() {
+        Ok(if header_len >= crate::parse::USBPCAP_HEADER_LEN && header_len <= packet.len() {
             packet[header_len..].to_vec()
         } else {
             Vec::new()
@@ -131,13 +134,38 @@ impl UsbReader {
         //   [0..4] block type, [4..8] total len, [8..12] iface id,
         //   [12..16] ts_high, [16..20] ts_low, [20..24] caplen, [24..28] origlen,
         //   [28..28+caplen] packet data.
-        self.pcapng.seek(SeekFrom::Start(rec.byte_offset + 20))?;
-        let mut caplen_buf = [0u8; 4];
-        self.pcapng.read_exact(&mut caplen_buf)?;
-        let caplen = u32::from_le_bytes(caplen_buf) as usize;
-        self.pcapng.seek(SeekFrom::Start(rec.byte_offset + 28))?;
+        let mut header = [0u8; 28];
+        self.pcapng.seek(SeekFrom::Start(rec.byte_offset))?;
+        self.pcapng.read_exact(&mut header)?;
+        let block_type = u32::from_le_bytes(header[0..4].try_into().unwrap());
+        let total_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
+        let caplen = u32::from_le_bytes(header[20..24].try_into().unwrap()) as usize;
+        let file_len = self.pcapng.metadata()?.len();
+        let block_end = rec
+            .byte_offset
+            .checked_add(total_len)
+            .filter(|&end| end <= file_len)
+            .ok_or_else(|| anyhow::anyhow!("frame {i} points outside usb.pcapng"))?;
+        if block_type != BT_EPB
+            || total_len < 32
+            || !total_len.is_multiple_of(4)
+            || caplen > MAX_PACKET_LEN
+            || caplen as u64 > total_len - 32
+        {
+            anyhow::bail!("frame {i} has an invalid pcapng Enhanced Packet Block");
+        }
+        self.pcapng
+            .seek(SeekFrom::Start(rec.byte_offset.checked_add(28).ok_or_else(
+                || anyhow::anyhow!("frame {i} packet offset overflow"),
+            )?))?;
         let mut data = vec![0u8; caplen];
         self.pcapng.read_exact(&mut data)?;
+        self.pcapng.seek(SeekFrom::Start(block_end - 4))?;
+        let mut trailer = [0u8; 4];
+        self.pcapng.read_exact(&mut trailer)?;
+        if u32::from_le_bytes(trailer) as u64 != total_len {
+            anyhow::bail!("frame {i} has mismatched pcapng block lengths");
+        }
         Ok((rec, data))
     }
 
@@ -151,7 +179,7 @@ impl UsbReader {
         } else {
             0
         };
-        let payload = if header_len > 0 && header_len <= packet.len() {
+        let payload = if header_len >= crate::parse::USBPCAP_HEADER_LEN && header_len <= packet.len() {
             packet[header_len..].to_vec()
         } else {
             Vec::new()
@@ -227,5 +255,31 @@ mod tests {
 
         let _ = std::fs::remove_file(&pcapng);
         let _ = std::fs::remove_file(&idx);
+    }
+
+    #[test]
+    fn rejects_index_pointing_at_a_non_packet_block() {
+        let dir = std::env::temp_dir();
+        let pcapng = dir.join("reveng_usbrw_bad_offset.pcapng");
+        let idx = dir.join("reveng_usbrw_bad_offset.idx");
+        let _ = std::fs::remove_file(&pcapng);
+        let _ = std::fs::remove_file(&idx);
+        {
+            let mut w = UsbWriter::create(&pcapng, &idx).unwrap();
+            w.append_packet(1_000, &packet(0x81, 3, &[1])).unwrap();
+            w.flush().unwrap();
+        }
+        let mut index = IndexFile::<UsbIdxRecord>::open(&idx).unwrap();
+        let mut rec = index.get(0).unwrap();
+        rec.byte_offset = 0; // Section Header Block, not an Enhanced Packet Block.
+        drop(index);
+        let mut replacement = IndexFile::<UsbIdxRecord>::create(&idx).unwrap();
+        replacement.append(&rec).unwrap();
+        drop(replacement);
+
+        let mut reader = UsbReader::open(&pcapng, &idx).unwrap();
+        assert!(reader.frame_at(0).is_err());
+        let _ = std::fs::remove_file(pcapng);
+        let _ = std::fs::remove_file(idx);
     }
 }

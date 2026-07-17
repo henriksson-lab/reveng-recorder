@@ -534,7 +534,11 @@ fn run_export(
             .anchor
             .map(|a| a.event_index)
             .ok_or_else(|| anyhow::anyhow!("checkpoint {ckpt} has no traffic anchor"))?;
-        (anchor.saturating_sub(CONTEXT), anchor + CONTEXT, anchor)
+        (
+            anchor.saturating_sub(CONTEXT),
+            anchor.saturating_add(CONTEXT),
+            anchor,
+        )
     } else if let Some(r) = range {
         let (a, b) = r
             .split_once(':')
@@ -562,8 +566,10 @@ fn run_export(
 }
 
 fn run_record(args: RecordArgs) -> anyhow::Result<()> {
-    let mut cfg = CheckpointConfig::default();
-    cfg.on_any_key = args.checkpoint_on_any_key;
+    let mut cfg = CheckpointConfig {
+        on_any_key: args.checkpoint_on_any_key,
+        ..Default::default()
+    };
     if let Some(k) = &args.checkpoint_keys {
         cfg.special_keys = split_csv(k);
     }

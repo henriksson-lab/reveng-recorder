@@ -27,6 +27,10 @@ pub fn parse_packet_header(buf: &[u8]) -> Option<UsbFrameHeader> {
     }
     let u16le = |o: usize| u16::from_le_bytes([buf[o], buf[o + 1]]);
     let u32le = |o: usize| u32::from_le_bytes([buf[o], buf[o + 1], buf[o + 2], buf[o + 3]]);
+    let header_len = u16le(0) as usize;
+    if !(USBPCAP_HEADER_LEN..=buf.len()).contains(&header_len) {
+        return None;
+    }
     Some(UsbFrameHeader {
         status: u32le(10),
         bus: u16le(17),

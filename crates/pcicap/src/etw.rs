@@ -82,6 +82,14 @@ pub struct EtwIrqSource {
     stop: Arc<AtomicBool>,
 }
 
+impl Drop for EtwIrqSource {
+    fn drop(&mut self) {
+        // The ETW callback borrows `_tx` through logfile.Context.  Always stop ProcessTrace and
+        // join its thread before Rust drops that box, including partial-start error paths.
+        let _ = <Self as CaptureSource>::stop(self);
+    }
+}
+
 impl EtwIrqSource {
     pub fn new(clock: Clock, opts: EtwIrqOpts) -> Self {
         Self {
@@ -120,23 +128,26 @@ fn wide(s: &str) -> Vec<u16> {
 /// A heap buffer holding an `EVENT_TRACE_PROPERTIES` followed by room for the logger name,
 /// as the ETW ABI requires (the name is written in-line at `LoggerNameOffset`).
 struct TraceProps {
-    buf: Vec<u8>,
+    // u64 backing guarantees the alignment required by EVENT_TRACE_PROPERTIES.
+    buf: Vec<u64>,
 }
 
 impl TraceProps {
     fn new() -> Self {
         // Space for the fixed struct + a generous logger-name tail.
         let size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 2 * (KERNEL_LOGGER_NAME.len() + 1) * 2;
-        Self { buf: vec![0u8; size] }
+        Self {
+            buf: vec![0u64; size.div_ceil(std::mem::size_of::<u64>())],
+        }
     }
 
     fn as_mut(&mut self) -> *mut EVENT_TRACE_PROPERTIES {
-        self.buf.as_mut_ptr() as *mut EVENT_TRACE_PROPERTIES
+        self.buf.as_mut_ptr().cast()
     }
 
     /// Fill the header for a real-time kernel (ISR) session.
     fn init_kernel_isr(&mut self) {
-        let total = self.buf.len() as u32;
+        let total = (self.buf.len() * std::mem::size_of::<u64>()) as u32;
         unsafe {
             let p = &mut *self.as_mut();
             p.Wnode.BufferSize = total;
@@ -151,7 +162,7 @@ impl TraceProps {
 
     /// A minimal header for a `ControlTraceW(STOP)` call.
     fn init_for_stop(&mut self) {
-        let total = self.buf.len() as u32;
+        let total = (self.buf.len() * std::mem::size_of::<u64>()) as u32;
         unsafe {
             let p = &mut *self.as_mut();
             p.Wnode.BufferSize = total;
@@ -246,35 +257,22 @@ impl CaptureSource for EtwIrqSource {
         let mut freq = 0i64;
         let mut qpc = 0i64;
         unsafe {
-            let _ = QueryPerformanceFrequency(&mut freq);
-            let _ = QueryPerformanceCounter(&mut qpc);
+            QueryPerformanceFrequency(&mut freq)?;
+            QueryPerformanceCounter(&mut qpc)?;
         }
         self.qpc_freq = freq;
         self.qpc_anchor = qpc;
         self.ns_anchor = self.clock.now_ns();
 
-        // Start (or restart) the NT Kernel Logger with ISR tracing.
+        // Start the NT Kernel Logger with ISR tracing.
         let name = wide(KERNEL_LOGGER_NAME);
         let mut session = CONTROLTRACE_HANDLE::default();
         let mut props = TraceProps::new();
         props.init_kernel_isr();
-        let mut err = unsafe { StartTraceW(&mut session, PCWSTR(name.as_ptr()), props.as_mut()) };
+        let err = unsafe { StartTraceW(&mut session, PCWSTR(name.as_ptr()), props.as_mut()) };
         if err == ERROR_ALREADY_EXISTS {
-            // A stale kernel logger is running — stop it and try once more.
-            let mut stopper = TraceProps::new();
-            stopper.init_for_stop();
-            unsafe {
-                let _ = ControlTraceW(
-                    CONTROLTRACE_HANDLE::default(),
-                    PCWSTR(name.as_ptr()),
-                    stopper.as_mut(),
-                    EVENT_TRACE_CONTROL_STOP,
-                );
-            }
-            let mut props2 = TraceProps::new();
-            props2.init_kernel_isr();
-            session = CONTROLTRACE_HANDLE::default();
-            err = unsafe { StartTraceW(&mut session, PCWSTR(name.as_ptr()), props2.as_mut()) };
+            // Never stop a kernel logger owned by diagnostics or another recorder.
+            anyhow::bail!("NT Kernel Logger is already in use by another trace session");
         }
         if err.is_err() {
             anyhow::bail!(
@@ -291,8 +289,10 @@ impl CaptureSource for EtwIrqSource {
         self.rx = Some(rx);
 
         // Open the real-time consumer.
-        let mut logfile = EVENT_TRACE_LOGFILEW::default();
-        logfile.LoggerName = PWSTR(name.as_ptr() as *mut _); // borrow for OpenTrace
+        let mut logfile = EVENT_TRACE_LOGFILEW {
+            LoggerName: PWSTR(name.as_ptr() as *mut _), // borrow for OpenTrace
+            ..Default::default()
+        };
         logfile.Anonymous1.ProcessTraceMode =
             PROCESS_TRACE_MODE_REAL_TIME | PROCESS_TRACE_MODE_EVENT_RECORD;
         logfile.Anonymous2.EventRecordCallback = Some(event_callback);
@@ -319,14 +319,22 @@ impl CaptureSource for EtwIrqSource {
         self._tx = Some(boxed);
 
         // ProcessTrace blocks until the session is stopped; run it on its own thread.
-        let consumer = std::thread::Builder::new()
+        let consumer = match std::thread::Builder::new()
             .name("etw-isr".into())
             .spawn(move || {
                 let handles = [trace];
                 unsafe {
                     let _ = ProcessTrace(&handles, None, None);
                 }
-            })?;
+            }) {
+            Ok(consumer) => consumer,
+            Err(e) => {
+                // `self` owns the session, trace, and callback context already.  Tear them down
+                // in callback-safe order before reporting the thread creation failure.
+                let _ = <Self as CaptureSource>::stop(self);
+                return Err(e.into());
+            }
+        };
         self.consumer = Some(consumer);
 
         self.stop.store(false, Ordering::Relaxed);

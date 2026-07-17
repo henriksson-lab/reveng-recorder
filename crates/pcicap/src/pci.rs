@@ -117,7 +117,7 @@ mod imp {
     ) -> Option<String> {
         let raw = get_raw(hdev, info, prop)?;
         let u16s = bytes_to_u16(&raw);
-        Some(u16s.split(|&c| c == 0).next().map(from_u16)?)
+        u16s.split(|&c| c == 0).next().map(from_u16)
     }
 
     /// Read a `REG_MULTI_SZ` property as a Vec of strings.
