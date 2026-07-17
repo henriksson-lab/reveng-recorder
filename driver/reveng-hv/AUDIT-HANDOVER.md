@@ -1,5 +1,9 @@
 # reveng-hv — crash audit handover (2026-07-13)
 
+> Historical note: this records the pre-fix implementation. The controller-cleanup watchdog and
+> same-CPU legacy bugcheck callback described as missing below are now implemented; `README.md`
+> and `reveng-hv.c` define the current safety contract.
+
 **Status of this doc:** conclusions from a static audit of `reveng-hv.c` (1271 lines),
 `reveng-hv-asm.asm` (224 lines), `reveng_hv_abi.h`, and `reveng-hv.vcxproj`, triggered by
 "the hypervisor code crashed my computer." **No code changed** — this is the log written

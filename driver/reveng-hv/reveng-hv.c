@@ -1,14 +1,12 @@
 /*
- * reveng-hv — hypervisor tier (plan in README.md). H1 step 1: capability PROBE only.
+ * reveng-hv — experimental H1 hypervisor tier (see README.md).
  *
  * A non-PnP software control driver (\\.\RevengHv), DEMAND-START ONLY (boot-safety contract §0:
  * a bad build must never be auto-loaded, so the machine always boots). This first cut does NOT
  * enter VMX — it only reads CPUID + the VMX capability MSRs and reports them, so we can confirm
  * on real hardware that (a) Hyper-V released VT-x, (b) VMX is unlocked/allowed, and (c) EPT/MTF
- * are available — before writing a single VMXON. Zero risk.
- *
- * Next steps (separate, riskier commits): VMXON+VMXOFF all CPUs, then VMLAUNCH hyperjack (H1),
- * then EPT (H2), MMIO traps (H3), interrupt exiting (H4).
+ * are available before VMXON. The same driver also contains the one-CPU H1 VMLAUNCH self-test;
+ * H2 (EPT), H3 (MMIO traps), and H4 (interrupt exiting) are not implemented.
  */
 #include <ntddk.h>
 #include <wdmsec.h> /* IoCreateDeviceSecure (links against Wdmsec.lib) */
@@ -37,6 +35,7 @@
 #define MSR_IA32_FS_BASE  0xC0000100
 #define MSR_IA32_GS_BASE  0xC0000101
 #define MSR_IA32_DEBUGCTL 0x1D9
+#define MSR_IA32_XSS      0xDA0
 #define MSR_IA32_EFER     0xC0000080
 
 /* VMCS field encoding (Intel SDM Vol.3C §24.11.2 / Appendix B): a 16-bit value built from
@@ -204,6 +203,7 @@ C_ASSERT(VMCS_EXIT_REASON == 0x4402);
  * hypervisor reference implementation. RDTSCP's bit also covers RDPID (same TSC_AUX gate). */
 #define SECONDARY_ENABLE_RDTSCP  (1u << 3)
 #define SECONDARY_ENABLE_INVPCID (1u << 12)
+#define SECONDARY_ENABLE_XSAVES  (1u << 20)
 
 #define VMX_EXIT_REASON_EXCEPTION_NMI 0
 #define VMX_EXIT_REASON_CPUID  10
@@ -254,6 +254,8 @@ typedef struct _VCPU {
     ULONG64 XsaveMask;
     ULONG64 OriginalCr0;
     ULONG64 OriginalCr4;
+    PROCESSOR_NUMBER ProcessorNumber;
+    ULONG   ProcessorIndex;
     BOOLEAN Active;
 } VCPU, *PVCPU;
 
@@ -261,6 +263,10 @@ typedef struct _VCPU {
 static VCPU g_Vcpu[MAX_VCPUS];
 static LONG g_ActiveCount;
 static LONG g_VirtualizedCpuIndex = -1; /* H1: current-CPU-only, one at a time */
+/* Published before VMLAUNCH so the VM-exit path never has to call into the Windows kernel to
+ * discover its VCPU. H1 permits only one virtualized CPU, and the START/STOP state machine keeps
+ * this pointer stable until after VMXOFF. */
+static PVCPU g_ActiveVcpu;
 
 /* Distinguishes the two "returns" from RtlCaptureContext in VirtualizeCurrentCpu: 0 on the first
  * (setup) pass, 1 when the guest resumes after a successful VMLAUNCH. MUST be read as a plain
@@ -272,6 +278,10 @@ static LONG g_VirtualizedCpuIndex = -1; /* H1: current-CPU-only, one at a time *
  * VirtualizeCurrentCpu is ever in flight. This closes a confirmed miscompile (the compiler had
  * computed `vcpu->Active` via callee-saved r15+rbx, which are stale on resume). */
 static volatile LONG g_ResumeAfterLaunch;
+/* Distinguishes a published VCPU prepared in VMX root from one that has actually resumed in
+ * non-root mode. The bugcheck callback must never execute VMCALL in the former state. H1 has only
+ * one guest, so a single interlocked flag is sufficient. */
+static volatile LONG g_GuestRunning;
 
 /* CR3 to load on every VM-exit (VMCS_HOST_CR3). Captured in DriverEntry, which runs in the System
  * process context, so this is the System directory base — a page-table root that never dies. Using
@@ -293,11 +303,33 @@ static UNICODE_STRING g_SymLink;
  * to execute) inside it as a VMX guest — a genuine use-after-free-of-code, worse than the "clean
  * crash" this project's boot-safety contract accepts. Found via independent audit. */
 static IO_REMOVE_LOCK g_RemoveLock;
+/* IO_REMOVE_LOCK protects driver lifetime; it does not serialize requests. VMXTEST, START, and
+ * STOP all change per-CPU VMX state and must never overlap, including when callers share a handle. */
+static KMUTEX g_ControlMutex;
+
+/* Bugcheck callbacks execute at HIGH_LEVEL on the processor handling the crash, after the other
+ * processors have been stopped. They must not wait, allocate, change affinity, or try to run code
+ * on another processor. The legacy callback (rather than a bugcheck *reason* callback, whose
+ * contract is to supply dump data during dump processing) gives us the one useful safe case: if
+ * the bugcheck processor is our VMX guest, issue the existing VMCALL and return to the callback on
+ * bare metal. If a different processor owns the bugcheck, leave the stopped VMX CPU alone; all of
+ * its backing storage and this driver image remain resident until the machine resets. */
+static KBUGCHECK_CALLBACK_RECORD g_BugcheckCallbackRecord;
+static BOOLEAN g_BugcheckCallbackRegistered;
+/* The FILE_OBJECT that successfully issued START owns the active H1 session. IRP_MJ_CLEANUP is
+ * delivered when its last user handle disappears (including process termination), so it is a
+ * precise controller-liveness watchdog without polling, timers, or callbacks racing driver
+ * teardown. Access is serialized by g_ControlMutex. The pointer is only compared while the file
+ * object is still alive; cleanup runs before the I/O manager destroys it. */
+static PFILE_OBJECT g_ControllerFileObject;
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD RevengHvUnload;
 DRIVER_DISPATCH RevengHvCreateClose;
+DRIVER_DISPATCH RevengHvCleanup;
 DRIVER_DISPATCH RevengHvDeviceControl;
+
+static VOID RevengHvBugcheckCallback(PVOID Buffer, ULONG Length);
 
 /* ASM (reveng-hv-asm.asm) */
 UCHAR AsmVmxLaunch(void);
@@ -311,6 +343,24 @@ USHORT AsmReadLdtr(void);
 VOID AsmReadGdtr(PSEUDO_DESC *out);
 VOID AsmReadIdtr(PSEUDO_DESC *out);
 
+static VOID RevengHvBugcheckCallback(PVOID Buffer, ULONG Length)
+{
+    PVCPU vcpu;
+
+    UNREFERENCED_PARAMETER(Buffer);
+    UNREFERENCED_PARAMETER(Length);
+
+    /* The active pointer exists during VMX-root setup too, so it is not by itself proof that
+     * VMCALL is safe. g_GuestRunning is published only by the successful guest-resume path.
+     * Unlike g_VirtualizedCpuIndex, this pair also covers START's post-launch/pre-index window and
+     * STOP's post-claim/pre-VMCALL window. The callback may only devirtualize its own CPU. */
+    vcpu = g_ActiveVcpu;
+    if (vcpu != NULL && InterlockedCompareExchange(&g_GuestRunning, 1, 1) == 1 &&
+        vcpu->ProcessorIndex == KeGetCurrentProcessorIndex()) {
+        AsmVmCallDevirtualize();
+    }
+}
+
 static void FillProbe(REVENG_HV_PROBE *p)
 {
     int regs[4] = {0, 0, 0, 0};
@@ -323,8 +373,9 @@ static void FillProbe(REVENG_HV_PROBE *p)
     p->hv_present = (ULONG)(regs[2] >> 31) & 1; /* ECX bit 31 = hypervisor present */
 
     p->logical_cpus = KeQueryActiveProcessorCountEx(ALL_PROCESSOR_GROUPS);
-    /* The VMX capability MSRs are not safe to read on a CPU that does not advertise VMX. */
-    if (!p->vmx_cpuid) {
+    /* Bare-metal VMX capability MSRs are not safe to read when VMX is absent or another
+     * hypervisor owns it. A hypervisor may expose CPUID.VMX while making these MSRs fault. */
+    if (!p->vmx_cpuid || p->hv_present) {
         return;
     }
 
@@ -576,8 +627,8 @@ static void FreeVcpu(PVCPU vcpu)
 static NTSTATUS AllocateXsaveArea(PVCPU vcpu)
 {
     int regs[4] = { 0, 0, 0, 0 };
-    ULONG64 xcr0;
-    ULONG size;
+    ULONG64 xcr0, userMask, supervisorMask, supportedMask;
+    ULONG size, component;
     ULONG_PTR aligned;
 
     __cpuid(regs, 0);
@@ -593,8 +644,42 @@ static NTSTATUS AllocateXsaveArea(PVCPU vcpu)
         return STATUS_NOT_SUPPORTED;
     }
     __cpuidex(regs, 0xD, 0);
-    size = (ULONG)regs[1]; /* size for the XCR0-enabled feature set */
-    if (size == 0 || size > 0x10000) {
+    userMask = (ULONG)(regs[0]) | ((ULONG64)(ULONG)regs[3] << 32);
+    __cpuidex(regs, 0xD, 1);
+    if (!((ULONG)regs[0] & (1u << 3))) { /* XSAVES/XRSTORS instruction support. */
+        return STATUS_NOT_SUPPORTED;
+    }
+    supervisorMask = (ULONG)regs[2] | ((ULONG64)(ULONG)regs[3] << 32);
+    supportedMask = userMask | supervisorMask;
+    if ((xcr0 & ~userMask) != 0 || (__readmsr(MSR_IA32_XSS) & ~supervisorMask) != 0) {
+        return STATUS_NOT_SUPPORTED;
+    }
+
+    /* XSAVES uses compacted format. Size for the maximum supported RFBM, rather than merely the
+     * components enabled at START, so a later guest IA32_XSS change cannot make the exit stub
+     * write beyond this nonpaged allocation. Components 0/1 live in the fixed 576-byte legacy
+     * region; each later component is packed in increasing bit order and may request 64B alignment
+     * through CPUID.(EAX=0Dh,ECX=n):ECX[1]. */
+    size = 576;
+    for (component = 2; component < 64; ++component) {
+        ULONG componentSize;
+        if (!(supportedMask & (1ull << component))) {
+            continue;
+        }
+        __cpuidex(regs, 0xD, (int)component);
+        componentSize = (ULONG)regs[0];
+        if (componentSize == 0) {
+            return STATUS_NOT_SUPPORTED;
+        }
+        if ((ULONG)regs[2] & (1u << 1)) {
+            size = (size + 63u) & ~63u;
+        }
+        if (componentSize > 0x10000u - size) {
+            return STATUS_NOT_SUPPORTED;
+        }
+        size += componentSize;
+    }
+    if (size > 0x10000u) {
         return STATUS_NOT_SUPPORTED;
     }
     vcpu->XsaveAllocation = ExAllocatePool2(POOL_FLAG_NON_PAGED, size + 63,
@@ -604,7 +689,7 @@ static NTSTATUS AllocateXsaveArea(PVCPU vcpu)
     }
     aligned = ((ULONG_PTR)vcpu->XsaveAllocation + 63) & ~(ULONG_PTR)63;
     vcpu->XsaveArea = (PVOID)aligned;
-    vcpu->XsaveMask = xcr0;
+    vcpu->XsaveMask = supportedMask;
     RtlZeroMemory(vcpu->XsaveArea, size);
     return STATUS_SUCCESS;
 }
@@ -727,13 +812,13 @@ static NTSTATUS BuildVmcsAndLaunch(PVCPU vcpu, PCONTEXT ctx)
     /* System CR3 (never-dying), NOT the START-caller's — see g_HostCr3. */
     __vmx_vmwrite(VMCS_HOST_CR3, g_HostCr3);
     __vmx_vmwrite(VMCS_HOST_CR4, __readcr4());
-    __vmx_vmwrite(VMCS_HOST_ES_SELECTOR, ctx->SegEs & 0xF8);
-    __vmx_vmwrite(VMCS_HOST_CS_SELECTOR, ctx->SegCs & 0xF8);
-    __vmx_vmwrite(VMCS_HOST_SS_SELECTOR, ctx->SegSs & 0xF8);
-    __vmx_vmwrite(VMCS_HOST_DS_SELECTOR, ctx->SegDs & 0xF8);
-    __vmx_vmwrite(VMCS_HOST_FS_SELECTOR, ctx->SegFs & 0xF8);
-    __vmx_vmwrite(VMCS_HOST_GS_SELECTOR, ctx->SegGs & 0xF8);
-    __vmx_vmwrite(VMCS_HOST_TR_SELECTOR, tr.Selector & 0xF8);
+    __vmx_vmwrite(VMCS_HOST_ES_SELECTOR, ctx->SegEs & 0xFFF8);
+    __vmx_vmwrite(VMCS_HOST_CS_SELECTOR, ctx->SegCs & 0xFFF8);
+    __vmx_vmwrite(VMCS_HOST_SS_SELECTOR, ctx->SegSs & 0xFFF8);
+    __vmx_vmwrite(VMCS_HOST_DS_SELECTOR, ctx->SegDs & 0xFFF8);
+    __vmx_vmwrite(VMCS_HOST_FS_SELECTOR, ctx->SegFs & 0xFFF8);
+    __vmx_vmwrite(VMCS_HOST_GS_SELECTOR, ctx->SegGs & 0xFFF8);
+    __vmx_vmwrite(VMCS_HOST_TR_SELECTOR, tr.Selector & 0xFFF8);
     __vmx_vmwrite(VMCS_HOST_FS_BASE, __readmsr(MSR_IA32_FS_BASE));
     __vmx_vmwrite(VMCS_HOST_GS_BASE, __readmsr(MSR_IA32_GS_BASE));
     __vmx_vmwrite(VMCS_HOST_TR_BASE, tr.Base);
@@ -828,7 +913,7 @@ static NTSTATUS BuildVmcsAndLaunch(PVCPU vcpu, PCONTEXT ctx)
     {
         ULONG secondary = AdjustControls(
             __readmsr(MSR_IA32_VMX_PROCBASED_CTLS2),
-            SECONDARY_ENABLE_RDTSCP | SECONDARY_ENABLE_INVPCID);
+            SECONDARY_ENABLE_RDTSCP | SECONDARY_ENABLE_INVPCID | SECONDARY_ENABLE_XSAVES);
         __vmx_vmwrite(VMCS_SECONDARY_PROC_BASED_CTLS, secondary);
 
         /* AdjustControls silently masks off anything the hardware doesn't allow — verify what we
@@ -837,12 +922,14 @@ static NTSTATUS BuildVmcsAndLaunch(PVCPU vcpu, PCONTEXT ctx)
         g_Diag.secondary_ctls_requested_ok = (proc & PROC_BASED_ACTIVATE_SECONDARY_CTLS) ? 1 : 0;
         g_Diag.rdtscp_enabled = (secondary & SECONDARY_ENABLE_RDTSCP) ? 1 : 0;
         g_Diag.invpcid_enabled = (secondary & SECONDARY_ENABLE_INVPCID) ? 1 : 0;
-        g_Diag.xsaves_enabled = 0; /* XSAVES needs IA32_XSS-aware save/restore; not safe in H1. */
-        if (!g_Diag.secondary_ctls_requested_ok || !g_Diag.rdtscp_enabled) {
+        g_Diag.xsaves_enabled = (secondary & SECONDARY_ENABLE_XSAVES) ? 1 : 0;
+        if (!g_Diag.secondary_ctls_requested_ok || !g_Diag.rdtscp_enabled ||
+            !g_Diag.xsaves_enabled) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                      "reveng-hv: secondary-ctls=%u rdtscp=%u not actually enabled by hardware — "
-                      "refusing to VMLAUNCH (would reproduce the RDTSCP #UD crash)\n",
-                      g_Diag.secondary_ctls_requested_ok, g_Diag.rdtscp_enabled);
+                      "reveng-hv: required secondary controls unavailable "
+                      "(secondary=%u rdtscp=%u xsaves=%u) — refusing to VMLAUNCH\n",
+                      g_Diag.secondary_ctls_requested_ok, g_Diag.rdtscp_enabled,
+                      g_Diag.xsaves_enabled);
             __vmx_off();
             RestoreControlRegisters(vcpu);
             FreeVcpu(vcpu);
@@ -868,6 +955,7 @@ static NTSTATUS BuildVmcsAndLaunch(PVCPU vcpu, PCONTEXT ctx)
     }
 
     vcpu->Active = TRUE;
+    g_ActiveVcpu = vcpu;
     g_ExitXsaveArea = vcpu->XsaveArea;
     g_ExitXsaveMask = vcpu->XsaveMask;
     /* Set LAST, immediately before the launch: on a successful VMLAUNCH the guest resumes at the
@@ -879,6 +967,7 @@ static NTSTATUS BuildVmcsAndLaunch(PVCPU vcpu, PCONTEXT ctx)
      * VirtualizeCurrentCpu's RtlCaptureContext call site), never returning here. */
     g_ResumeAfterLaunch = 0; /* launch didn't take; keep the first-pass semantics consistent */
     vcpu->Active = FALSE;
+    g_ActiveVcpu = NULL;
     g_ExitXsaveArea = NULL;
     g_ExitXsaveMask = 0;
     {
@@ -908,16 +997,12 @@ static NTSTATUS VirtualizeCurrentCpu(PVCPU vcpu)
     /* Read ONLY this fixed-address volatile global here — see g_ResumeAfterLaunch's comment for
      * why the previous `vcpu->Active` (address built from callee-saved GPRs) miscompiled. */
     if (g_ResumeAfterLaunch != 0) {
+        /* First safe point at which VMCALL is guaranteed to be a guest hypercall. This fixed
+         * global write does not depend on the stale restored GPRs described above. */
+        InterlockedExchange(&g_GuestRunning, 1);
         return STATUS_SUCCESS; /* the guest resumed here via a successful VMLAUNCH */
     }
     return BuildVmcsAndLaunch(vcpu, &ctx);
-}
-
-static ULONG CurrentCpuIndex(void)
-{
-    PROCESSOR_NUMBER pn;
-    KeGetCurrentProcessorNumberEx(&pn);
-    return KeGetProcessorIndexFromNumber(&pn);
 }
 
 /* Shared devirtualize path: VMXOFF this CPU then jump straight to `resumeRip` on the guest's own
@@ -944,9 +1029,11 @@ static VOID Devirtualize(PVCPU vcpu, PGUEST_REGISTERS regs, ULONG64 resumeRip, U
     if (vcpu != NULL) {
         vcpu->Active = FALSE;
     }
+    InterlockedExchange(&g_GuestRunning, 0);
     AsmRestoreGuestXstate();
     __vmx_off();
     RestoreControlRegisters(vcpu);
+    g_ActiveVcpu = NULL;
     g_ExitXsaveArea = NULL;
     g_ExitXsaveMask = 0;
     AsmRestoreContextAndResume(regs, guestRsp, resumeRip, rflags); /* never returns */
@@ -964,15 +1051,11 @@ static VOID Devirtualize(PVCPU vcpu, PGUEST_REGISTERS regs, ULONG64 resumeRip, U
 VOID VmResumeFailed(PGUEST_REGISTERS regs)
 {
     ULONG64 guestRip = 0, errCode = 0;
-    ULONG idx = CurrentCpuIndex();
-    PVCPU vcpu = (idx < MAX_VCPUS) ? &g_Vcpu[idx] : NULL;
+    PVCPU vcpu = g_ActiveVcpu;
 
     __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &errCode);
     __vmx_vmread(VMCS_GUEST_RIP, &guestRip);
     g_Diag.launch_error = errCode; /* reused field: VM_INSTRUCTION_ERROR from the failed resume */
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-              "reveng-hv: VMRESUME failed, error=%llu at guest RIP %llx — recovering via "
-              "devirtualize instead of crashing\n", errCode, guestRip);
     Devirtualize(vcpu, regs, guestRip, DEVIRT_REASON_VMRESUME_FAILED, 0);
 }
 
@@ -985,8 +1068,7 @@ VOID VmResumeFailed(PGUEST_REGISTERS regs)
 VOID VmExitDispatcher(PGUEST_REGISTERS regs)
 {
     ULONG64 exitReason = 0, guestRip = 0, instrLen = 0;
-    ULONG idx = CurrentCpuIndex();
-    PVCPU vcpu = (idx < MAX_VCPUS) ? &g_Vcpu[idx] : NULL;
+    PVCPU vcpu = g_ActiveVcpu;
 
     __vmx_vmread(VMCS_EXIT_REASON, &exitReason);
     __vmx_vmread(VMCS_GUEST_RIP, &guestRip);
@@ -1020,25 +1102,19 @@ VOID VmExitDispatcher(PGUEST_REGISTERS regs)
 
     if (exitReason == VMX_EXIT_REASON_EXCEPTION_NMI) {
         ULONG64 intrInfo = 0;
+        UCHAR reason;
         __vmx_vmread(VMCS_EXIT_INTR_INFO, &intrInfo);
-        if (((intrInfo >> 31) & 1) && (intrInfo & 0xFF) == VECTOR_UD) {
-            DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-                      "reveng-hv: #UD trapped at guest RIP %llx — devirtualizing so bare metal "
-                      "re-presents the same instruction (this RIP is what to look up next)\n",
-                      guestRip);
-        }
+        reason = (((intrInfo >> 31) & 1) && (intrInfo & 0xFF) == VECTOR_UD)
+            ? DEVIRT_REASON_UD : DEVIRT_REASON_UNKNOWN;
         /* Whether #UD or some other exception under this config, don't try to be clever about
          * it: devirtualize WITHOUT advancing RIP, so the exact same instruction is re-presented
          * to normal (non-virtualized) fault handling — correct for both a genuine fault and any
          * instruction we didn't know needed a secondary-control bit. */
-        Devirtualize(vcpu, regs, guestRip, DEVIRT_REASON_UD, (ULONG)exitReason);
+        Devirtualize(vcpu, regs, guestRip, reason, (ULONG)exitReason);
         return; /* unreachable at runtime, see above */
     }
 
     /* Unexpected exit reason: devirtualize rather than risk a stuck loop. */
-    DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
-              "reveng-hv: unexpected VM-exit reason=%llu at RIP %llx — devirtualizing\n",
-              exitReason, guestRip);
     Devirtualize(vcpu, regs, guestRip, DEVIRT_REASON_UNKNOWN, (ULONG)exitReason);
     /* unreachable at runtime, see above */
 }
@@ -1078,6 +1154,9 @@ static NTSTATUS StartHv(void)
     KeSetSystemGroupAffinityThread(&aff, &old);
 
     RtlZeroMemory(&g_Vcpu[idx], sizeof(VCPU));
+    g_Vcpu[idx].ProcessorNumber = pn;
+    g_Vcpu[idx].ProcessorIndex = idx;
+    InterlockedExchange(&g_GuestRunning, 0);
     status = VirtualizeCurrentCpu(&g_Vcpu[idx]);
 
     KeRevertToUserGroupAffinityThread(&old);
@@ -1108,12 +1187,13 @@ static NTSTATUS StopHv(void)
     if (idx < 0) {
         return STATUS_SUCCESS; /* nothing virtualized, or another STOP already claimed it */
     }
-    if (!NT_SUCCESS(KeGetProcessorNumberFromIndex((ULONG)idx, &pn))) {
-        return STATUS_UNSUCCESSFUL;
-    }
     if (InterlockedCompareExchange(&g_VirtualizedCpuIndex, -1, idx) != idx) {
         return STATUS_DEVICE_BUSY;
     }
+    /* START stored the exact processor identity before VMLAUNCH. Do not re-resolve the global
+     * index here: CPU topology changes could make that lookup fail, after which cleanup has no
+     * later opportunity to retry and must not leave an active VMX session behind. */
+    pn = g_Vcpu[idx].ProcessorNumber;
     RtlZeroMemory(&aff, sizeof(aff));
     aff.Group = pn.Group;
     aff.Mask = (KAFFINITY)1 << pn.Number;
@@ -1139,6 +1219,37 @@ NTSTATUS RevengHvCreateClose(PDEVICE_OBJECT DeviceObject, PIRP Irp)
     return STATUS_SUCCESS;
 }
 
+/* Fail-safe controller watchdog. A process exit closes its handles and causes CLEANUP even if it
+ * never sends STOP. Hold both the remove lock (driver-image lifetime) and control mutex (VMX state)
+ * across StopHv so cleanup cannot race an IOCTL or unload. */
+NTSTATUS RevengHvCleanup(PDEVICE_OBJECT DeviceObject, PIRP Irp)
+{
+    PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
+    NTSTATUS status;
+
+    UNREFERENCED_PARAMETER(DeviceObject);
+
+    status = IoAcquireRemoveLock(&g_RemoveLock, Irp);
+    if (NT_SUCCESS(status)) {
+        status = KeWaitForSingleObject(&g_ControlMutex, Executive, KernelMode, FALSE, NULL);
+        if (NT_SUCCESS(status)) {
+            if (g_ControllerFileObject == sp->FileObject) {
+                status = StopHv();
+                g_ControllerFileObject = NULL;
+            } else {
+                status = STATUS_SUCCESS;
+            }
+            KeReleaseMutex(&g_ControlMutex, FALSE);
+        }
+        IoReleaseRemoveLock(&g_RemoveLock, Irp);
+    }
+
+    Irp->IoStatus.Status = status;
+    Irp->IoStatus.Information = 0;
+    IoCompleteRequest(Irp, IO_NO_INCREMENT);
+    return status;
+}
+
 NTSTATUS RevengHvDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 {
     PIO_STACK_LOCATION sp = IoGetCurrentIrpStackLocation(Irp);
@@ -1153,6 +1264,14 @@ NTSTATUS RevengHvDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
      * already started, this IOCTL is refused before touching any VMX state. */
     status = IoAcquireRemoveLock(&g_RemoveLock, Irp);
     if (!NT_SUCCESS(status)) {
+        Irp->IoStatus.Status = status;
+        Irp->IoStatus.Information = 0;
+        IoCompleteRequest(Irp, IO_NO_INCREMENT);
+        return status;
+    }
+    status = KeWaitForSingleObject(&g_ControlMutex, Executive, KernelMode, FALSE, NULL);
+    if (!NT_SUCCESS(status)) {
+        IoReleaseRemoveLock(&g_RemoveLock, Irp);
         Irp->IoStatus.Status = status;
         Irp->IoStatus.Information = 0;
         IoCompleteRequest(Irp, IO_NO_INCREMENT);
@@ -1188,15 +1307,28 @@ NTSTATUS RevengHvDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         }
         break;
     case IOCTL_REVENG_HV_START:
-        status = StartHv();
+        if (g_ControllerFileObject != NULL) {
+            status = STATUS_DEVICE_BUSY;
+        } else {
+            status = StartHv();
+            if (NT_SUCCESS(status)) {
+                g_ControllerFileObject = sp->FileObject;
+            }
+        }
         break;
     case IOCTL_REVENG_HV_STOP:
-        status = StopHv();
+        if (g_ControllerFileObject != NULL && g_ControllerFileObject != sp->FileObject) {
+            status = STATUS_ACCESS_DENIED;
+        } else {
+            status = StopHv();
+            g_ControllerFileObject = NULL;
+        }
         break;
     default:
         break;
     }
 
+    KeReleaseMutex(&g_ControlMutex, FALSE);
     IoReleaseRemoveLock(&g_RemoveLock, Irp);
     Irp->IoStatus.Status = status;
     Irp->IoStatus.Information = info;
@@ -1206,6 +1338,14 @@ NTSTATUS RevengHvDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
 
 VOID RevengHvUnload(PDRIVER_OBJECT DriverObject)
 {
+    /* Prevent a callback from entering code that is about to be unmapped. Deregistration occurs
+     * before the ordinary remove-lock drain because the callback cannot and must not take that
+     * lock at bugcheck IRQL. */
+    if (g_BugcheckCallbackRegistered) {
+        KeDeregisterBugCheckCallback(&g_BugcheckCallbackRecord);
+        g_BugcheckCallbackRegistered = FALSE;
+    }
+
     /* Drain + block FIRST: wait for any in-flight IOCTL (including a mid-flight START, which
      * holds the lock for the entire VMLAUNCH) to finish, and refuse any new ones from this point
      * on. Only once no RevengHvDeviceControl call can possibly be touching VMX/CPU state is it
@@ -1215,6 +1355,7 @@ VOID RevengHvUnload(PDRIVER_OBJECT DriverObject)
      * still virtualized — StopHv() is safe to call unconditionally regardless. */
     IoReleaseRemoveLockAndWait(&g_RemoveLock, DriverObject);
     StopHv();
+    g_ControllerFileObject = NULL;
     IoDeleteSymbolicLink(&g_SymLink);
     if (DriverObject->DeviceObject != NULL) {
         IoDeleteDevice(DriverObject->DeviceObject);
@@ -1256,15 +1397,26 @@ NTSTATUS DriverEntry(PDRIVER_OBJECT DriverObject, PUNICODE_STRING RegistryPath)
         return status;
     }
 
-    devObj->Flags |= DO_BUFFERED_IO;
-    devObj->Flags &= ~DO_DEVICE_INITIALIZING;
-
     IoInitializeRemoveLock(&g_RemoveLock, 'gveR', 0, 0);
+    KeInitializeMutex(&g_ControlMutex, 0);
+
+    KeInitializeCallbackRecord(&g_BugcheckCallbackRecord);
+    g_BugcheckCallbackRegistered = KeRegisterBugCheckCallback(
+        &g_BugcheckCallbackRecord, RevengHvBugcheckCallback, NULL, 0, (PUCHAR)"RevengHv");
+    if (!g_BugcheckCallbackRegistered) {
+        IoDeleteSymbolicLink(&g_SymLink);
+        IoDeleteDevice(devObj);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
 
     DriverObject->DriverUnload = RevengHvUnload;
     DriverObject->MajorFunction[IRP_MJ_CREATE] = RevengHvCreateClose;
     DriverObject->MajorFunction[IRP_MJ_CLOSE] = RevengHvCreateClose;
+    DriverObject->MajorFunction[IRP_MJ_CLEANUP] = RevengHvCleanup;
     DriverObject->MajorFunction[IRP_MJ_DEVICE_CONTROL] = RevengHvDeviceControl;
+
+    devObj->Flags |= DO_BUFFERED_IO;
+    devObj->Flags &= ~DO_DEVICE_INITIALIZING;
 
     return STATUS_SUCCESS;
 }

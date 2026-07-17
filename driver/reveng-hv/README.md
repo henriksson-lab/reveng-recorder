@@ -1,4 +1,4 @@
-# reveng-hv — the hypervisor tier (PLAN)
+# reveng-hv — the hypervisor tier (experimental H1)
 
 The heaviest PCIe capture tier (DESIGN.md §4a). A thin **type-2 "hyperjacking" hypervisor**: a
 Windows kernel driver that puts the *already-running* Windows into VMX non-root guest mode (nobody
@@ -13,11 +13,15 @@ controls to trap its interrupts. It exists to capture the two things the driver-
    (Stretch: trap DMA *writes* by the device via EPT write-traps on the ring pages — richer than
    M4's read-only ring following.)
 
-Status: **PLAN ONLY — not started.** Driver-only tiers M1/M3/M4 done, M2 blocked (see
-`../reveng-pcidrv/README.md`). `crates/pcicap::HvPcieSource` is the existing seam stub. The whole
-downstream pipeline (storage/index/checkpoints/decode/viewer, and `ReplayPcieSource` for
-kernel-free validation) is already built and proven — nothing above the `CaptureSource` seam should
-need to change.
+Status: **H1 is implemented as a one-CPU experimental hyperjack; H2–H5 are not implemented.**
+The current H1 code can VMXON/VMLAUNCH, handle CPUID, and devirtualize through VMCALL or its
+unexpected-exit safety path. Controller-handle cleanup now acts as a liveness watchdog, but it is
+still experimental and not ready for unattended use. A bugcheck callback devirtualizes when the
+crashing processor is the H1 VMX guest; if another processor crashes, the already-stopped guest is
+left resident until hardware reset. H1 enables native guest
+`XSAVES`/`XRSTORS` only when the CPU and
+VMCS secondary control support it, and preserves both XCR0 and IA32_XSS state across every exit.
+`crates/pcicap::HvPcieSource` remains a stub.
 
 **Prior art to study before writing a line:** SimpleVisor, hvpp, Bareflank, gbhv (all MIT/BSD-ish;
 gbhv and hvpp are the closest templates — EPT hooking on Windows).
@@ -35,10 +39,12 @@ Every choice below obeys these:
 - **Reversible preconditions only.** The one required host change (disable Hyper-V, §1) is a `bcdedit`
   toggle, trivially reversible, and does not affect the ability to boot.
 - **Devirtualize on every exit path:** IOCTL stop, `DriverUnload`, and a
-  **`KeRegisterBugCheckReasonCallback`** that runs `VMXOFF` on all CPUs during a bugcheck so the crash/
-  reboot path never sees a CPU still in VMX root. (CPU reset clears VMX anyway; this is hygiene.)
-- **Watchdog auto-devirtualize:** a timer that `VMXOFF`s if the user-mode controller dies without a
-  clean stop, so a wedged experiment self-heals instead of needing a reboot.
+  **`KeRegisterBugCheckCallback`** that devirtualizes when the callback runs on the H1 guest CPU.
+  Bugcheck callbacks run at `HIGH_LEVEL`, so they cannot migrate to a different stopped processor;
+  hardware reset clears VMX there without touching pageable driver state.
+- **Controller-liveness auto-devirtualize:** the handle that successfully sends `START` owns the
+  session. `IRP_MJ_CLEANUP` synchronously devirtualizes if that handle closes without a clean
+  `STOP`, including when its process terminates. Other handles cannot stop its session.
 - **Observe-only:** no writes to the target device, no kernel code patching → PatchGuard is a non-issue.
 - **Flush disk before every risky load:** `Write-VolumeCache C:` before each `sc start`, because a bad
   `VMLAUNCH` bugchecks instantly and can lose unsaved buffers.

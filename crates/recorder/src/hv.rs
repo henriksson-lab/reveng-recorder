@@ -6,7 +6,7 @@
 #![cfg(windows)]
 
 use windows::core::PCWSTR;
-use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
@@ -28,48 +28,78 @@ const HV_BACKDOOR_SIG_EBX: u32 = 0x676E_6576;
 const HV_BACKDOOR_SIG_ECX: u32 = 0x2D76_6568;
 const HV_BACKDOOR_SIG_EDX: u32 = 0x0000_0031;
 
+struct ThreadAffinityGuard {
+    thread: HANDLE,
+    previous: usize,
+}
+
+impl Drop for ThreadAffinityGuard {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = SetThreadAffinityMask(self.thread, self.previous);
+        }
+    }
+}
+
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+struct HvHandle(HANDLE);
+
+impl HvHandle {
+    fn open() -> anyhow::Result<Self> {
+        let path = wide("\\\\.\\RevengHv");
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                0xC000_0000u32,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_FLAGS_AND_ATTRIBUTES(0),
+                None,
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("open \\\\.\\RevengHv failed: {e} (is RevengHv started? `sc start RevengHv`)"))?;
+        if handle == INVALID_HANDLE_VALUE {
+            anyhow::bail!("\\\\.\\RevengHv returned an invalid handle");
+        }
+        Ok(Self(handle))
+    }
+
+    fn ioctl(&self, code: u32, out_len: usize) -> anyhow::Result<Vec<u8>> {
+        let mut buf = vec![0u8; out_len];
+        let mut returned = 0u32;
+        unsafe {
+            DeviceIoControl(
+                self.0,
+                code,
+                None,
+                0,
+                Some(buf.as_mut_ptr() as *mut _),
+                buf.len() as u32,
+                Some(&mut returned),
+                None,
+            )
+        }
+        .map_err(|e| anyhow::anyhow!("ioctl {code:#x} failed: {e}"))?;
+        buf.truncate(returned as usize);
+        Ok(buf)
+    }
+}
+
+impl Drop for HvHandle {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.0);
+        }
+    }
+}
+
 /// Open the reveng-hv control device, run one buffered IOCTL, return the output bytes.
 fn hv_ioctl(code: u32, out_len: usize) -> anyhow::Result<Vec<u8>> {
-    let path = wide("\\\\.\\RevengHv");
-    let handle = unsafe {
-        CreateFileW(
-            PCWSTR(path.as_ptr()),
-            0xC000_0000u32,
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None,
-            OPEN_EXISTING,
-            FILE_FLAGS_AND_ATTRIBUTES(0),
-            None,
-        )
-    }
-    .map_err(|e| anyhow::anyhow!("open \\\\.\\RevengHv failed: {e} (is RevengHv started? `sc start RevengHv`)"))?;
-    if handle == INVALID_HANDLE_VALUE {
-        anyhow::bail!("\\\\.\\RevengHv returned an invalid handle");
-    }
-    let mut buf = vec![0u8; out_len];
-    let mut returned = 0u32;
-    let res = unsafe {
-        DeviceIoControl(
-            handle,
-            code,
-            None,
-            0,
-            Some(buf.as_mut_ptr() as *mut _),
-            buf.len() as u32,
-            Some(&mut returned),
-            None,
-        )
-    };
-    unsafe {
-        let _ = CloseHandle(handle);
-    }
-    res.map_err(|e| anyhow::anyhow!("ioctl {code:#x} failed: {e}"))?;
-    buf.truncate(returned as usize);
-    Ok(buf)
+    HvHandle::open()?.ioctl(code, out_len)
 }
 
 pub fn probe() -> anyhow::Result<()> {
@@ -140,8 +170,8 @@ pub fn vmxtest() -> anyhow::Result<()> {
 
 /// Read the driver's diagnostic record — what happened on the most recent devirtualize (or failed
 /// VMLAUNCH), and whether the RDTSCP/INVPCID/XSAVES secondary controls actually took effect on
-/// this hardware. This is the only way to see that without a live kernel debugger attached, since
-/// DbgPrintEx output is otherwise unobservable (nothing is listening for it).
+/// this hardware. VM-exit paths record here instead of calling kernel logging routines from VMX
+/// root context.
 pub fn diag() -> anyhow::Result<()> {
     print_diag()
 }
@@ -185,10 +215,18 @@ pub fn selftest() -> anyhow::Result<()> {
     if prev == 0 {
         anyhow::bail!("SetThreadAffinityMask failed");
     }
+    let _affinity = ThreadAffinityGuard {
+        thread,
+        previous: prev,
+    };
     println!("  [1] pinned this thread to logical CPU 0");
 
+    /* START ownership is tied to this handle. If this function errors, panics, or the process is
+     * terminated, closing it causes the driver's cleanup watchdog to devirtualize immediately. */
+    let controller = HvHandle::open()?;
+
     println!("  [2] sending START (VMLAUNCH)...");
-    hv_ioctl(IOCTL_REVENG_HV_START, 0)?;
+    controller.ioctl(IOCTL_REVENG_HV_START, 0)?;
     println!("      START returned — if you're reading this, VMLAUNCH succeeded and we're running virtualized.");
 
     let backdoor_ok = {
@@ -200,14 +238,10 @@ pub fn selftest() -> anyhow::Result<()> {
     println!("  [4] CPUID.1 is left unmodified; this avoids making Windows consume an incomplete hypervisor CPUID ABI.");
 
     println!("  [5] sending STOP (devirtualize)...");
-    hv_ioctl(IOCTL_REVENG_HV_STOP, 0)?;
+    controller.ioctl(IOCTL_REVENG_HV_STOP, 0)?;
     println!("      STOP returned — back to bare metal.");
 
     println!("  [6] STOP returned without a VM-exit failure.");
-
-    unsafe {
-        let _ = SetThreadAffinityMask(thread, prev);
-    }
 
     if backdoor_ok {
         println!("  => SUCCESS: hyperjack verified end-to-end on CPU 0, cleanly devirtualized.");

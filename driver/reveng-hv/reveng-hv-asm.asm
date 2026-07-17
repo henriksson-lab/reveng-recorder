@@ -36,15 +36,15 @@ EXTERN g_ExitXsaveArea:QWORD
 EXTERN g_ExitXsaveMask:QWORD
 
 AsmVmExitHandler PROC
-    ; VM exits do not save x87/SSE/AVX state. Preserve every XCR0-enabled component before
-    ; entering compiler-generated code, which may freely overwrite volatile vector registers.
+    ; VM exits do not save extended state. XSAVES preserves both XCR0-managed user state and
+    ; IA32_XSS-managed supervisor state (notably CET) in compacted format before C can touch it.
     push    rax
     push    rdx
     push    rcx
     mov     rcx, qword ptr [g_ExitXsaveArea]
     mov     eax, dword ptr [g_ExitXsaveMask]
     mov     edx, dword ptr [g_ExitXsaveMask+4]
-    xsave   [rcx]
+    xsaves  [rcx]
     pop     rcx
     pop     rdx
     pop     rax
@@ -80,7 +80,7 @@ AsmVmExitHandler PROC
     mov     rcx, qword ptr [g_ExitXsaveArea]
     mov     eax, dword ptr [g_ExitXsaveMask]
     mov     edx, dword ptr [g_ExitXsaveMask+4]
-    xrstor  [rcx]
+    xrstors [rcx]
     pop     rcx
     pop     rdx
     pop     rax
@@ -175,7 +175,7 @@ AsmVmCallDevirtualize PROC
     ret
 AsmVmCallDevirtualize ENDP
 
-; Restore the XCR0-enabled guest state before VMXOFF. Devirtualization tail-resumes directly
+; Restore all guest user and supervisor state before VMXOFF. Devirtualization tail-resumes directly
 ; into guest code, so unlike the normal VMRESUME path it does not return through the exit stub.
 PUBLIC AsmRestoreGuestXstate
 AsmRestoreGuestXstate PROC
@@ -185,7 +185,7 @@ AsmRestoreGuestXstate PROC
     mov     rcx, qword ptr [g_ExitXsaveArea]
     mov     eax, dword ptr [g_ExitXsaveMask]
     mov     edx, dword ptr [g_ExitXsaveMask+4]
-    xrstor  [rcx]
+    xrstors [rcx]
     pop     rcx
     pop     rdx
     pop     rax
