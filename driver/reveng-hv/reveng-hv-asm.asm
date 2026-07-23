@@ -7,10 +7,17 @@
 .CODE
 
 ; UCHAR AsmVmxLaunch(void)
-; Executes VMLAUNCH. On SUCCESS control never returns here — it jumps to the guest RIP programmed
-; into the VMCS (the resume point captured by RtlCaptureContext in C). On FAILURE, VMLAUNCH just
-; falls through to the next instruction with CF/ZF indicating the error class.
+; Executes VMLAUNCH. On success VM entry lands at AsmVmxLaunchResume and returns through the
+; original call frame. On failure, VMLAUNCH falls through with CF/ZF indicating the error class.
 AsmVmxLaunch PROC
+    ; Preserve this exact call frame across VM entry. VMLAUNCH does not load GPRs, and guest entry
+    ; at AsmVmxLaunchResume therefore returns to the original C caller normally. VMCS_GUEST_RSP is
+    ; 681Ch. MASM syntax is VMWRITE field-encoding, value.
+    mov     rdx, rsp
+    mov     rax, 681Ch
+    vmwrite rax, rdx
+    jz      launch_fail_valid
+    jc      launch_fail_invalid
     vmlaunch
     jz      launch_fail_valid      ; ZF=1 -> VMfailValid (VM-instruction-error field is live)
     jc      launch_fail_invalid    ; CF=1 -> VMfailInvalid (no current VMCS)
@@ -24,6 +31,12 @@ launch_fail_valid:
     ret
 AsmVmxLaunch ENDP
 
+PUBLIC AsmVmxLaunchResume
+AsmVmxLaunchResume PROC
+    xor     eax, eax                ; launchResult = 0 (success)
+    ret
+AsmVmxLaunchResume ENDP
+
 ; VM-exit entry point. Set as the Host RIP field in the VMCS. The CPU jumps here on every VM-exit
 ; with RSP = the Host RSP field (our dedicated per-CPU host stack) and nothing else preserved.
 ; We push all 15 GPRs (RSP is tracked via the VMCS guest-state, not here), call the C dispatcher
@@ -34,6 +47,7 @@ EXTERN VmExitDispatcher:PROC
 EXTERN VmResumeFailed:PROC
 EXTERN g_ExitXsaveArea:QWORD
 EXTERN g_ExitXsaveMask:QWORD
+EXTERN g_DevirtResumeRip:QWORD
 
 AsmVmExitHandler PROC
     ; VM exits do not save extended state. XSAVES preserves both XCR0-managed user state and
@@ -141,10 +155,24 @@ AsmVmExitHandler ENDP
 PUBLIC AsmRestoreContextAndResume
 AsmRestoreContextAndResume PROC
     ; rcx = regs, rdx = guestRsp, r8 = guestRip, r9 = guestRflags
+    ; All C/root work is complete and VMXOFF has executed. Restore xstate at the last possible
+    ; moment so no compiler-generated code can clobber it before the bare-metal resume.
+    mov     qword ptr [g_DevirtResumeRip], r8
+    push    rax
+    push    rdx
+    push    rcx
+    mov     rcx, qword ptr [g_ExitXsaveArea]
+    mov     eax, dword ptr [g_ExitXsaveMask]
+    mov     edx, dword ptr [g_ExitXsaveMask+4]
+    xrstors [rcx]
+    pop     rcx
+    pop     rdx
+    pop     rax
+    mov     qword ptr [g_ExitXsaveArea], 0
+    mov     qword ptr [g_ExitXsaveMask], 0
     mov     rsp, rdx                ; onto the guest's stack
     push    r9
     popfq                           ; restore RFLAGS
-    push    r8                      ; will `ret` into this
     ; restore GPRs from the saved array (offsets match the push order in AsmVmExitHandler,
     ; i.e. GUEST_REGISTERS field order in the C header: Rax,Rcx,Rdx,Rbx,Rbp,Rsi,Rdi,R8..R15)
     mov     rax, [rcx +  0]
@@ -162,7 +190,9 @@ AsmRestoreContextAndResume PROC
     mov     r14, [rcx + 104]
     mov     r15, [rcx + 112]
     mov     rcx, [rcx +  8]         ; restore rcx last — we were using it as the base pointer
-    ret                             ; pops guestRip pushed above, RSP ends up == guestRsp
+    ; A synthetic push/ret would violate CET shadow-stack pairing. Jump without touching either
+    ; guest stack; a resumed AsmVmCallDevirtualize executes its original, properly paired RET.
+    jmp     qword ptr [g_DevirtResumeRip]
 AsmRestoreContextAndResume ENDP
 
 ; void AsmVmCallDevirtualize(void) — executed FROM inside the VMX guest (the pinned thread that
@@ -174,23 +204,6 @@ AsmVmCallDevirtualize PROC
     vmcall
     ret
 AsmVmCallDevirtualize ENDP
-
-; Restore all guest user and supervisor state before VMXOFF. Devirtualization tail-resumes directly
-; into guest code, so unlike the normal VMRESUME path it does not return through the exit stub.
-PUBLIC AsmRestoreGuestXstate
-AsmRestoreGuestXstate PROC
-    push    rax
-    push    rdx
-    push    rcx
-    mov     rcx, qword ptr [g_ExitXsaveArea]
-    mov     eax, dword ptr [g_ExitXsaveMask]
-    mov     edx, dword ptr [g_ExitXsaveMask+4]
-    xrstors [rcx]
-    pop     rcx
-    pop     rdx
-    pop     rax
-    ret
-AsmRestoreGuestXstate ENDP
 
 ; USHORT AsmReadTr(void) / AsmReadLdtr(void) — MSVC has no intrinsic for STR/SLDT.
 PUBLIC AsmReadTr

@@ -266,18 +266,8 @@ static LONG g_VirtualizedCpuIndex = -1; /* H1: current-CPU-only, one at a time *
 /* Published before VMLAUNCH so the VM-exit path never has to call into the Windows kernel to
  * discover its VCPU. H1 permits only one virtualized CPU, and the START/STOP state machine keeps
  * this pointer stable until after VMXOFF. */
-static PVCPU g_ActiveVcpu;
+static PVCPU volatile g_ActiveVcpu;
 
-/* Distinguishes the two "returns" from RtlCaptureContext in VirtualizeCurrentCpu: 0 on the first
- * (setup) pass, 1 when the guest resumes after a successful VMLAUNCH. MUST be read as a plain
- * global at a fixed (RIP-relative) address, NOT via any GPR: on the resume pass the CPU restores
- * RSP/RIP from the captured context but NOT the general-purpose registers, so any register the
- * resume-path code reads holds its VMLAUNCH-time (BuildVmcsAndLaunch-internal) value, not what the
- * source thinks. `volatile` forces the store-before-launch and the load-after to real memory. A
- * single global is safe because H1 serializes START (atomic claim + remove-lock) — only one
- * VirtualizeCurrentCpu is ever in flight. This closes a confirmed miscompile (the compiler had
- * computed `vcpu->Active` via callee-saved r15+rbx, which are stale on resume). */
-static volatile LONG g_ResumeAfterLaunch;
 /* Distinguishes a published VCPU prepared in VMX root from one that has actually resumed in
  * non-root mode. The bugcheck callback must never execute VMCALL in the former state. H1 has only
  * one guest, so a single interlocked flag is sufficient. */
@@ -294,7 +284,7 @@ static ULONG64 g_HostCr3;
 /* H1 virtualizes only one CPU, so the assembly entry path can use this published per-vCPU area. */
 PVOID g_ExitXsaveArea;
 ULONG64 g_ExitXsaveMask;
-
+ULONG64 g_DevirtResumeRip;
 static UNICODE_STRING g_SymLink;
 
 /* Coordinates RevengHvUnload against in-flight RevengHvDeviceControl calls (same pattern already
@@ -325,8 +315,12 @@ static PFILE_OBJECT g_ControllerFileObject;
 
 DRIVER_INITIALIZE DriverEntry;
 DRIVER_UNLOAD RevengHvUnload;
+_Dispatch_type_(IRP_MJ_CREATE)
+_Dispatch_type_(IRP_MJ_CLOSE)
 DRIVER_DISPATCH RevengHvCreateClose;
+_Dispatch_type_(IRP_MJ_CLEANUP)
 DRIVER_DISPATCH RevengHvCleanup;
+_Dispatch_type_(IRP_MJ_DEVICE_CONTROL)
 DRIVER_DISPATCH RevengHvDeviceControl;
 
 static VOID RevengHvBugcheckCallback(PVOID Buffer, ULONG Length);
@@ -334,10 +328,10 @@ static VOID RevengHvBugcheckCallback(PVOID Buffer, ULONG Length);
 /* ASM (reveng-hv-asm.asm) */
 UCHAR AsmVmxLaunch(void);
 VOID AsmVmExitHandler(void);
+VOID AsmVmxLaunchResume(void);
 VOID AsmRestoreContextAndResume(PGUEST_REGISTERS regs, ULONG64 guestRsp, ULONG64 guestRip,
                                 ULONG64 guestRflags);
 VOID AsmVmCallDevirtualize(void);
-VOID AsmRestoreGuestXstate(void);
 USHORT AsmReadTr(void);
 USHORT AsmReadLdtr(void);
 VOID AsmReadGdtr(PSEUDO_DESC *out);
@@ -540,6 +534,20 @@ static void DoVmxTest(REVENG_HV_VMXTEST *out)
 #define DEVIRT_REASON_LAUNCH_FAILED   4
 #define DEVIRT_REASON_VMRESUME_FAILED 5
 static REVENG_HV_DIAG g_Diag;
+/* Lock-free diagnostic publication. VM-exit code cannot take a Windows lock, so writers bracket
+ * each logical update with an odd/even generation. Readers accept a copy only when the same even
+ * generation is observed before and after it, which also detects torn unaligned 64-bit fields. */
+static volatile LONG g_DiagSequence;
+
+static __forceinline void DiagWriteBegin(void)
+{
+    InterlockedIncrement(&g_DiagSequence); /* even -> odd; full memory barrier */
+}
+
+static __forceinline void DiagWriteEnd(void)
+{
+    InterlockedIncrement(&g_DiagSequence); /* odd -> even; publishes the complete update */
+}
 
 static ULONG AdjustControls(ULONG64 capMsr, ULONG desired)
 {
@@ -840,8 +848,11 @@ static NTSTATUS BuildVmcsAndLaunch(PVCPU vcpu, PCONTEXT ctx)
     __vmx_vmwrite(VMCS_CR0_READ_SHADOW, __readcr0());
     __vmx_vmwrite(VMCS_CR4_READ_SHADOW, __readcr4());
     __vmx_vmwrite(VMCS_GUEST_DR7, __readdr(7));
-    __vmx_vmwrite(VMCS_GUEST_RSP, ctx->Rsp);
-    __vmx_vmwrite(VMCS_GUEST_RIP, ctx->Rip);
+    /* AsmVmxLaunch writes the exact call-frame RSP immediately before VMLAUNCH. Successful guest
+     * entry lands at its resume label and returns through every normal C epilogue, preserving
+     * compiler-managed GPR/SIMD state and /GS cookies. */
+    __vmx_vmwrite(VMCS_GUEST_RSP, 0); /* overwritten atomically by AsmVmxLaunch */
+    __vmx_vmwrite(VMCS_GUEST_RIP, (ULONG64)AsmVmxLaunchResume);
     __vmx_vmwrite(VMCS_GUEST_RFLAGS, ctx->EFlags);
     __vmx_vmwrite(VMCS_GUEST_ES_SELECTOR, ctx->SegEs);
     __vmx_vmwrite(VMCS_GUEST_CS_SELECTOR, ctx->SegCs);
@@ -919,10 +930,12 @@ static NTSTATUS BuildVmcsAndLaunch(PVCPU vcpu, PCONTEXT ctx)
         /* AdjustControls silently masks off anything the hardware doesn't allow — verify what we
          * ASKED for actually took effect before launching into a configuration that would just
          * reproduce the RDTSCP crash. Recorded either way so IOCTL_REVENG_HV_DIAG can show it. */
+        DiagWriteBegin();
         g_Diag.secondary_ctls_requested_ok = (proc & PROC_BASED_ACTIVATE_SECONDARY_CTLS) ? 1 : 0;
         g_Diag.rdtscp_enabled = (secondary & SECONDARY_ENABLE_RDTSCP) ? 1 : 0;
         g_Diag.invpcid_enabled = (secondary & SECONDARY_ENABLE_INVPCID) ? 1 : 0;
         g_Diag.xsaves_enabled = (secondary & SECONDARY_ENABLE_XSAVES) ? 1 : 0;
+        DiagWriteEnd();
         if (!g_Diag.secondary_ctls_requested_ok || !g_Diag.rdtscp_enabled ||
             !g_Diag.xsaves_enabled) {
             DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
@@ -958,14 +971,14 @@ static NTSTATUS BuildVmcsAndLaunch(PVCPU vcpu, PCONTEXT ctx)
     g_ActiveVcpu = vcpu;
     g_ExitXsaveArea = vcpu->XsaveArea;
     g_ExitXsaveMask = vcpu->XsaveMask;
-    /* Set LAST, immediately before the launch: on a successful VMLAUNCH the guest resumes at the
-     * RtlCaptureContext call site and reads this to know it's the resume pass (see its comment). */
-    g_ResumeAfterLaunch = 1;
     launchResult = AsmVmxLaunch();
 
-    /* Only reached if VMLAUNCH FAILED — success jumps to guest RIP (back into
-     * VirtualizeCurrentCpu's RtlCaptureContext call site), never returning here. */
-    g_ResumeAfterLaunch = 0; /* launch didn't take; keep the first-pass semantics consistent */
+    if (launchResult == 0) {
+        InterlockedExchange(&g_GuestRunning, 1);
+        return STATUS_SUCCESS; /* returned through the original call frame as a VMX guest */
+    }
+
+    /* VMLAUNCH failed in root mode. */
     vcpu->Active = FALSE;
     g_ActiveVcpu = NULL;
     g_ExitXsaveArea = NULL;
@@ -973,8 +986,10 @@ static NTSTATUS BuildVmcsAndLaunch(PVCPU vcpu, PCONTEXT ctx)
     {
         ULONG64 errCode = 0;
         __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &errCode);
+        DiagWriteBegin();
         g_Diag.last_devirt_reason = DEVIRT_REASON_LAUNCH_FAILED;
         g_Diag.launch_error = errCode;
+        DiagWriteEnd();
         DbgPrintEx(DPFLTR_IHVDRIVER_ID, DPFLTR_ERROR_LEVEL,
                   "reveng-hv: VMLAUNCH failed, result=%u error=%llu\n", launchResult, errCode);
     }
@@ -985,23 +1000,12 @@ static NTSTATUS BuildVmcsAndLaunch(PVCPU vcpu, PCONTEXT ctx)
 }
 #undef __vmx_vmwrite /* restore the real intrinsic for VmExitDispatcher's single vmwrite call */
 
-/* Entry point for virtualizing the CURRENT cpu. On the first pass this builds the VMCS and
- * launches; if VMLAUNCH succeeds, execution "returns" a SECOND time — via the guest RIP set to
- * right after RtlCaptureContext — at which point vcpu->Active is already TRUE and we just report
- * success. This is the whole hyperjack: no new context is created, the running thread continues. */
+/* Entry point for virtualizing the current CPU. RtlCaptureContext supplies architectural guest
+ * state; successful VMLAUNCH returns through AsmVmxLaunch's original call frame in non-root mode. */
 static NTSTATUS VirtualizeCurrentCpu(PVCPU vcpu)
 {
     CONTEXT ctx;
-    g_ResumeAfterLaunch = 0;         /* first pass */
     RtlCaptureContext(&ctx);
-    /* Read ONLY this fixed-address volatile global here — see g_ResumeAfterLaunch's comment for
-     * why the previous `vcpu->Active` (address built from callee-saved GPRs) miscompiled. */
-    if (g_ResumeAfterLaunch != 0) {
-        /* First safe point at which VMCALL is guaranteed to be a guest hypercall. This fixed
-         * global write does not depend on the stale restored GPRs described above. */
-        InterlockedExchange(&g_GuestRunning, 1);
-        return STATUS_SUCCESS; /* the guest resumed here via a successful VMLAUNCH */
-    }
     return BuildVmcsAndLaunch(vcpu, &ctx);
 }
 
@@ -1013,7 +1017,7 @@ static NTSTATUS VirtualizeCurrentCpu(PVCPU vcpu)
  * unknown exits) — the latter is what makes the #UD trap "get out of the way" correctly instead
  * of silently swallowing a genuine fault. */
 static VOID Devirtualize(PVCPU vcpu, PGUEST_REGISTERS regs, ULONG64 resumeRip, UCHAR reason,
-                         ULONG rawExitReason)
+                         ULONG rawExitReason, ULONG64 instructionError)
 {
     ULONG64 guestRsp = 0, rflags = 0;
     __vmx_vmread(VMCS_GUEST_RSP, &guestRsp);
@@ -1022,20 +1026,22 @@ static VOID Devirtualize(PVCPU vcpu, PGUEST_REGISTERS regs, ULONG64 resumeRip, U
     /* Record BEFORE VMXOFF so this is visible via IOCTL_REVENG_HV_DIAG even without a live
      * kernel debugger attached — this is what makes a future gap diagnosable without another
      * crash-dump forensics exercise. */
+    DiagWriteBegin();
     g_Diag.last_devirt_reason = reason;
     g_Diag.last_exit_reason = rawExitReason;
     g_Diag.last_devirt_rip = resumeRip;
+    if (reason == DEVIRT_REASON_VMRESUME_FAILED) {
+        g_Diag.launch_error = instructionError;
+    }
+    DiagWriteEnd();
 
     if (vcpu != NULL) {
         vcpu->Active = FALSE;
     }
     InterlockedExchange(&g_GuestRunning, 0);
-    AsmRestoreGuestXstate();
     __vmx_off();
     RestoreControlRegisters(vcpu);
     g_ActiveVcpu = NULL;
-    g_ExitXsaveArea = NULL;
-    g_ExitXsaveMask = 0;
     AsmRestoreContextAndResume(regs, guestRsp, resumeRip, rflags); /* never returns */
 }
 
@@ -1055,8 +1061,7 @@ VOID VmResumeFailed(PGUEST_REGISTERS regs)
 
     __vmx_vmread(VMCS_VM_INSTRUCTION_ERROR, &errCode);
     __vmx_vmread(VMCS_GUEST_RIP, &guestRip);
-    g_Diag.launch_error = errCode; /* reused field: VM_INSTRUCTION_ERROR from the failed resume */
-    Devirtualize(vcpu, regs, guestRip, DEVIRT_REASON_VMRESUME_FAILED, 0);
+    Devirtualize(vcpu, regs, guestRip, DEVIRT_REASON_VMRESUME_FAILED, 0, errCode);
 }
 
 /* VM-exit dispatcher, called from the AsmVmExitHandler trampoline for every VM-exit on a
@@ -1096,7 +1101,7 @@ VOID VmExitDispatcher(PGUEST_REGISTERS regs)
     }
 
     if (exitReason == VMX_EXIT_REASON_VMCALL && regs->Rcx == HV_DEVIRT_MAGIC && vcpu != NULL) {
-        Devirtualize(vcpu, regs, guestRip + instrLen, DEVIRT_REASON_VMCALL, (ULONG)exitReason);
+        Devirtualize(vcpu, regs, guestRip + instrLen, DEVIRT_REASON_VMCALL, (ULONG)exitReason, 0);
         return; /* unreachable at runtime — Devirtualize's asm tail jumps away; kept for clarity */
     }
 
@@ -1110,12 +1115,12 @@ VOID VmExitDispatcher(PGUEST_REGISTERS regs)
          * it: devirtualize WITHOUT advancing RIP, so the exact same instruction is re-presented
          * to normal (non-virtualized) fault handling — correct for both a genuine fault and any
          * instruction we didn't know needed a secondary-control bit. */
-        Devirtualize(vcpu, regs, guestRip, reason, (ULONG)exitReason);
+        Devirtualize(vcpu, regs, guestRip, reason, (ULONG)exitReason, 0);
         return; /* unreachable at runtime, see above */
     }
 
     /* Unexpected exit reason: devirtualize rather than risk a stuck loop. */
-    Devirtualize(vcpu, regs, guestRip, DEVIRT_REASON_UNKNOWN, (ULONG)exitReason);
+    Devirtualize(vcpu, regs, guestRip, DEVIRT_REASON_UNKNOWN, (ULONG)exitReason, 0);
     /* unreachable at runtime, see above */
 }
 
@@ -1299,9 +1304,25 @@ NTSTATUS RevengHvDeviceControl(PDEVICE_OBJECT DeviceObject, PIRP Irp)
         break;
     case IOCTL_REVENG_HV_DIAG:
         if (sp->Parameters.DeviceIoControl.OutputBufferLength >= sizeof(REVENG_HV_DIAG)) {
-            RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, &g_Diag, sizeof(REVENG_HV_DIAG));
-            info = sizeof(REVENG_HV_DIAG);
-            status = STATUS_SUCCESS;
+            LONG before, after;
+            ULONG attempt;
+
+            status = STATUS_RETRY;
+            for (attempt = 0; attempt < 8; ++attempt) {
+                before = InterlockedCompareExchange(&g_DiagSequence, 0, 0);
+                if (before & 1) {
+                    continue; /* a root-mode writer is in progress */
+                }
+                RtlCopyMemory(Irp->AssociatedIrp.SystemBuffer, &g_Diag,
+                              sizeof(REVENG_HV_DIAG));
+                KeMemoryBarrier();
+                after = InterlockedCompareExchange(&g_DiagSequence, 0, 0);
+                if (before == after && !(after & 1)) {
+                    info = sizeof(REVENG_HV_DIAG);
+                    status = STATUS_SUCCESS;
+                    break;
+                }
+            }
         } else {
             status = STATUS_BUFFER_TOO_SMALL;
         }
