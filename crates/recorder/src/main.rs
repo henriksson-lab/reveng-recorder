@@ -4,6 +4,7 @@
 //! in this scaffold; the flag set is complete so `--help` documents the intended tool.
 
 mod elevate;
+#[cfg(windows)]
 mod hv;
 #[cfg(windows)]
 mod notes_ui;
@@ -443,10 +444,10 @@ fn run() -> anyhow::Result<()> {
         } => run_export(&session, checkpoint, range.as_deref(), out, wireshark),
         Cmd::PciAttach { pci_bdf } => run_pci_filter(&pci_bdf, true),
         Cmd::PciDetach { pci_bdf } => run_pci_filter(&pci_bdf, false),
-        Cmd::HvProbe => run_hv_op(hv::probe),
-        Cmd::HvVmxtest => run_hv_op(hv::vmxtest),
-        Cmd::HvSelftest => run_hv_op(hv::selftest),
-        Cmd::HvDiag => run_hv_op(hv::diag),
+        Cmd::HvProbe => run_hv_probe(),
+        Cmd::HvVmxtest => run_hv_vmxtest(),
+        Cmd::HvSelftest => run_hv_selftest(),
+        Cmd::HvDiag => run_hv_diag(),
         Cmd::Mem { cmd } => match cmd {
             MemCmd::Ls { session } => query::mem_ls(&session),
             MemCmd::Regions { session, id } => query::mem_regions(&session, id),
@@ -458,22 +459,55 @@ fn run() -> anyhow::Result<()> {
 }
 
 /// Run a reveng-hv control op, self-elevating first (the control device needs admin).
-#[allow(unused_variables)]
+#[cfg(windows)]
 fn run_hv_op(op: fn() -> anyhow::Result<()>) -> anyhow::Result<()> {
-    #[cfg(windows)]
-    {
-        if !elevate::is_elevated() && std::env::var_os("REVENG_NO_ELEVATE").is_none() {
-            eprintln!("reveng-hv control needs administrator rights — requesting elevation…");
-            let forward: Vec<String> = std::env::args().skip(1).collect();
-            let code = elevate::relaunch_elevated(&forward)?;
-            std::process::exit(code as i32);
-        }
-        op()
+    if !elevate::is_elevated() && std::env::var_os("REVENG_NO_ELEVATE").is_none() {
+        eprintln!("reveng-hv control needs administrator rights — requesting elevation…");
+        let forward: Vec<String> = std::env::args().skip(1).collect();
+        let code = elevate::relaunch_elevated(&forward)?;
+        std::process::exit(code as i32);
     }
-    #[cfg(not(windows))]
-    {
-        anyhow::bail!("reveng-hv control requires Windows")
-    }
+    op()
+}
+
+#[cfg(windows)]
+fn run_hv_probe() -> anyhow::Result<()> {
+    run_hv_op(hv::probe)
+}
+
+#[cfg(not(windows))]
+fn run_hv_probe() -> anyhow::Result<()> {
+    anyhow::bail!("reveng-hv control requires Windows")
+}
+
+#[cfg(windows)]
+fn run_hv_vmxtest() -> anyhow::Result<()> {
+    run_hv_op(hv::vmxtest)
+}
+
+#[cfg(not(windows))]
+fn run_hv_vmxtest() -> anyhow::Result<()> {
+    anyhow::bail!("reveng-hv control requires Windows")
+}
+
+#[cfg(windows)]
+fn run_hv_selftest() -> anyhow::Result<()> {
+    run_hv_op(hv::selftest)
+}
+
+#[cfg(not(windows))]
+fn run_hv_selftest() -> anyhow::Result<()> {
+    anyhow::bail!("reveng-hv control requires Windows")
+}
+
+#[cfg(windows)]
+fn run_hv_diag() -> anyhow::Result<()> {
+    run_hv_op(hv::diag)
+}
+
+#[cfg(not(windows))]
+fn run_hv_diag() -> anyhow::Result<()> {
+    anyhow::bail!("reveng-hv control requires Windows")
 }
 
 /// Install or remove the reveng-pcidrv upper filter on a PCI device (M2). Needs admin; the
@@ -685,16 +719,15 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             let out = args.out.clone().unwrap_or_else(default_session_dir);
             let opts = build_usb_opts(&args, cfg)?;
 
-            // A live PCIe co-capture (drv backend, not replay) also opens a kernel device that
-            // needs admin.
-            let pcie_live = args.with_pcie && args.pcie_replay.is_none();
-
             // USBPcap + the PCIe driver open kernel devices that need admin. Only elevate when we
             // actually have something live to open — a window-only run (no matching device, or
             // --no-capture) with no live PCIe needs no admin. If not elevated, relaunch through
             // UAC rather than making the user open an elevated shell. `REVENG_NO_ELEVATE` opts out.
             #[cfg(windows)]
             {
+                // A live PCIe co-capture (drv backend, not replay) also opens a kernel device that
+                // needs admin.
+                let pcie_live = args.with_pcie && args.pcie_replay.is_none();
                 if (!opts.selections.is_empty() || pcie_live)
                     && !elevate::is_elevated()
                     && std::env::var_os("REVENG_NO_ELEVATE").is_none()
@@ -735,7 +768,6 @@ fn run_engine_session(
 ) -> anyhow::Result<()> {
     let usb_active = !opts.selections.is_empty();
     let pcie_active = pcie.is_some();
-    let mem_active = opts.mem_pid.is_some() || opts.mem_process.is_some();
     let headless =
         opts.max_duration.is_some() || std::env::var_os("REVENG_NO_NOTES_UI").is_some();
 
@@ -744,6 +776,7 @@ fn run_engine_session(
     } else {
         #[cfg(windows)]
         {
+            let mem_active = opts.mem_pid.is_some() || opts.mem_process.is_some();
             let worker_clock = clock.clone();
             let out2 = out.to_path_buf();
             // Live MMIO/DMA toggles reach the window only for the drv backend (both handles set).
