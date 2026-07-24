@@ -82,6 +82,17 @@ cargo test  --workspace      # 41 tests: index, checkpoints, USBPcap/pcapng pars
 ./target/debug/reveng-rec --help
 ```
 
+Windows release artifacts are built by GitHub Actions on `windows-latest` and can also be made on a
+Windows build machine with GNU Make:
+
+```powershell
+make windows-zip
+```
+
+That produces `target/windows/reveng-recorder-<version>-windows-x64.zip` containing
+`reveng-rec.exe`, `reveng-viewer.exe`, `README.md`, and `get-usbpcap.ps1`. This is a user-mode
+build only; the kernel drivers under `driver/` still require MSBuild + WDK and separate signing.
+
 ## Try the working pipeline (any OS, no hardware)
 
 ```bash

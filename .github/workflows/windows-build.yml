@@ -1,0 +1,53 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main, master]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_INCREMENTAL: "0"
+  RUSTFLAGS: "-C target-feature=+crt-static"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows-user-binaries:
+    name: Windows user-mode binaries
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build
+        run: cargo build --workspace --release --bins
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $version = (Select-String -Path Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $dist = "dist/reveng-recorder-$version-windows-x64"
+          New-Item -ItemType Directory -Force -Path $dist | Out-Null
+          Copy-Item target/release/reveng-rec.exe "$dist/reveng-rec.exe"
+          Copy-Item target/release/reveng-viewer.exe "$dist/reveng-viewer.exe"
+          Copy-Item README.md "$dist/README.md"
+          Copy-Item scripts/get-usbpcap.ps1 "$dist/get-usbpcap.ps1"
+          Compress-Archive -Path "$dist/*" -DestinationPath "reveng-recorder-$version-windows-x64.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: reveng-recorder-windows-x64
+          path: reveng-recorder-*-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14
