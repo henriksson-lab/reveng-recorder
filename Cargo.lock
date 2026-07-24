@@ -2923,6 +2923,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "io-kit-sys"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "617ee6cf8e3f66f3b4ea67a4058564628cde41901316e19f559e14c7c72c5e7b"
+dependencies = [
+ "core-foundation-sys",
+ "mach2",
+]
+
+[[package]]
 name = "io-lifetimes"
 version = "1.0.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3282,6 +3292,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mach2"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "maybe-rayon"
 version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3561,6 +3580,25 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
+]
+
+[[package]]
+name = "nusb"
+version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2f861541f15de120eae5982923d073bfc0c1a65466561988c82d6e197734c19e"
+dependencies = [
+ "atomic-waker",
+ "core-foundation 0.9.4",
+ "core-foundation-sys",
+ "futures-core",
+ "io-kit-sys",
+ "libc",
+ "log",
+ "once_cell",
+ "rustix 0.38.44",
+ "slab",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]
@@ -4704,17 +4742,23 @@ dependencies = [
  "anyhow",
  "base64",
  "clap",
+ "futures-lite",
+ "image",
+ "nusb",
  "reveng-core",
  "reveng-export",
  "reveng-memcap",
  "reveng-pcicap",
  "reveng-usbcap",
+ "reveng-winocr",
  "reveng-winput",
  "reveng-winshot",
+ "reveng-winui",
  "serde",
  "serde_json",
  "slint",
  "slint-build",
+ "toml",
  "windows",
 ]
 
@@ -4746,6 +4790,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "reveng-winocr"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "windows",
+ "windows-future",
+]
+
+[[package]]
 name = "reveng-winput"
 version = "0.0.1"
 dependencies = [
@@ -4762,6 +4816,17 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "image",
+ "serde",
+ "windows",
+]
+
+[[package]]
+name = "reveng-winui"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
  "windows",
 ]
 

@@ -19,6 +19,74 @@ use std::path::Path;
 const BT_EPB: u32 = 0x0000_0006;
 const MAX_PACKET_LEN: usize = 64 * 1024 * 1024;
 
+/// A decoded USB control-transfer SETUP packet (the 8-byte `bmRequestType`… header),
+/// with the type/recipient/direction fields broken out. This is the *command* layer of a
+/// vendor protocol — for a device like a Cypress-based camera almost the entire control
+/// vocabulary is vendor requests on EP0, so decoding this is what turns a byte firehose
+/// into a readable command log.
+#[derive(Debug, Clone, Serialize)]
+pub struct Setup {
+    /// `bmRequestType`, rendered as `0xNN`.
+    pub bm_request_type: String,
+    /// `bRequest`, rendered as `0xNN`.
+    pub b_request: String,
+    /// `wValue`, rendered as `0xNNNN`.
+    pub w_value: String,
+    /// `wIndex`, rendered as `0xNNNN`.
+    pub w_index: String,
+    pub w_length: u16,
+    pub dir: &'static str,       // "in" | "out"  (from bmRequestType bit 7)
+    pub req_type: &'static str,  // "standard" | "class" | "vendor" | "reserved"
+    pub recipient: &'static str, // "device" | "interface" | "endpoint" | "other"
+}
+
+/// USBPcap control-transfer stage codes (USBPcap.h `USBPCAP_CONTROL_STAGE_*`).
+pub const CTRL_STAGE_SETUP: u8 = 0;
+pub const CTRL_STAGE_DATA: u8 = 1;
+pub const CTRL_STAGE_STATUS: u8 = 2;
+pub const CTRL_STAGE_COMPLETE: u8 = 3;
+
+fn ctrl_stage_name(s: u8) -> &'static str {
+    match s {
+        CTRL_STAGE_SETUP => "setup",
+        CTRL_STAGE_DATA => "data",
+        CTRL_STAGE_STATUS => "status",
+        CTRL_STAGE_COMPLETE => "complete",
+        _ => "unknown",
+    }
+}
+
+/// Decode an 8-byte USB SETUP packet, if `bytes` is long enough to contain one.
+pub fn decode_setup(bytes: &[u8]) -> Option<Setup> {
+    if bytes.len() < 8 {
+        return None;
+    }
+    let bm = bytes[0];
+    let dir = if bm & 0x80 != 0 { "in" } else { "out" };
+    let req_type = match (bm >> 5) & 0x3 {
+        0 => "standard",
+        1 => "class",
+        2 => "vendor",
+        _ => "reserved",
+    };
+    let recipient = match bm & 0x1f {
+        0 => "device",
+        1 => "interface",
+        2 => "endpoint",
+        _ => "other",
+    };
+    Some(Setup {
+        bm_request_type: format!("0x{bm:02x}"),
+        b_request: format!("0x{:02x}", bytes[1]),
+        w_value: format!("0x{:04x}", u16::from_le_bytes([bytes[2], bytes[3]])),
+        w_index: format!("0x{:04x}", u16::from_le_bytes([bytes[4], bytes[5]])),
+        w_length: u16::from_le_bytes([bytes[6], bytes[7]]),
+        dir,
+        req_type,
+        recipient,
+    })
+}
+
 /// A decoded USB frame, ready to render as one JSON line (DESIGN.md §8a).
 #[derive(Debug, Clone, Serialize)]
 pub struct UsbFrame {
@@ -31,6 +99,16 @@ pub struct UsbFrame {
     pub xfer: &'static str, // "iso" | "interrupt" | "control" | "bulk"
     pub len: u32,
     pub status: u32,
+    /// USBPcap control-transfer stage ("setup"/"data"/"status"/"complete"), control frames only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<&'static str>,
+    /// The IRP id, rendered as `0xNN…` — pairs a SETUP frame with its later completion frame.
+    /// Present for control transfers; empty otherwise.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub irp: String,
+    /// Decoded SETUP packet, present on the SETUP stage of a control transfer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub setup: Option<Setup>,
     pub hex: String,
     pub ascii: String,
     /// base64 of the raw payload — the decoder-consumable form (§8b).
@@ -39,6 +117,12 @@ pub struct UsbFrame {
     pub payload: Vec<u8>,
     #[serde(skip)]
     pub endpoint: u8,
+    /// Raw control stage byte (for pairing logic); not serialized.
+    #[serde(skip)]
+    pub stage_raw: Option<u8>,
+    /// Raw IRP id (for pairing logic); not serialized.
+    #[serde(skip)]
+    pub irp_id: u64,
 }
 
 /// USBPcap transfer-type encoding (USBPcap.h: `USBPCAP_TRANSFER_*`).
@@ -106,10 +190,21 @@ impl UsbReader {
         Ok(self.idx.get(i)?.endpoint)
     }
 
+    /// Frame `i`'s USBPcap transfer type straight from the index record (0=iso 1=int
+    /// 2=control 3=bulk) — no pcapng read. Lets a control-only view skip bulk frames cheaply.
+    pub fn xfer_at(&mut self, i: u64) -> anyhow::Result<u8> {
+        Ok(self.idx.get(i)?.xfer)
+    }
+
     /// Frame `i`'s timestamp straight from the index record (for timeline density bucketing).
     pub fn ts_at(&mut self, i: u64) -> anyhow::Result<i64> {
         use reveng_core::index::FixedRecord;
         Ok(self.idx.get(i)?.ts_ns())
+    }
+
+    /// Frame `i`'s on-wire transfer length (`dataLength`) from the index record — no pcapng read.
+    pub fn len_at(&mut self, i: u64) -> anyhow::Result<u32> {
+        Ok(self.idx.get(i)?.data_length)
     }
 
     /// Just the raw payload bytes of frame `i` (no hex/ascii/base64 rendering).
@@ -188,7 +283,40 @@ impl UsbReader {
             .as_ref()
             .map(|h| (h.device, h.status))
             .unwrap_or((0, 0));
-        let dir = if rec.endpoint & 0x80 != 0 { "in" } else { "out" };
+
+        // Control transfers carry an IRP id (base header offset 2) and, after the base
+        // header, a 1-byte stage code. USBPcap splits one control transfer into a SETUP
+        // frame (payload = the 8-byte setup packet, plus any OUT data) and a later
+        // completion frame sharing the same IRP id (payload = returned IN data). Decode
+        // both so a caller can pair them and read the command layer.
+        let is_control = rec.xfer == crate::XFER_CONTROL;
+        let irp_id = if is_control && packet.len() >= 10 {
+            u64::from_le_bytes(packet[2..10].try_into().unwrap())
+        } else {
+            0
+        };
+        let stage_raw = if is_control && header_len > crate::parse::USBPCAP_HEADER_LEN {
+            packet.get(crate::parse::USBPCAP_HEADER_LEN).copied()
+        } else {
+            None
+        };
+        let setup = if is_control && stage_raw == Some(CTRL_STAGE_SETUP) {
+            decode_setup(&payload)
+        } else {
+            None
+        };
+        // Direction: for control transfers the endpoint address (0x00) never carries the
+        // direction — it lives in bmRequestType bit 7. Use the decoded setup when present.
+        let dir = match &setup {
+            Some(s) => s.dir,
+            None => {
+                if rec.endpoint & 0x80 != 0 {
+                    "in"
+                } else {
+                    "out"
+                }
+            }
+        };
         Ok(UsbFrame {
             i,
             ts_ns: rec.ts_ns,
@@ -198,10 +326,15 @@ impl UsbReader {
             xfer: xfer_name(rec.xfer),
             len: rec.data_length,
             status,
+            stage: stage_raw.map(ctrl_stage_name),
+            irp: if is_control { format!("0x{irp_id:x}") } else { String::new() },
+            setup,
             hex: hexdump(&payload),
             ascii: asciidump(&payload),
             b64: base64::engine::general_purpose::STANDARD.encode(&payload),
             endpoint: rec.endpoint,
+            stage_raw,
+            irp_id,
             payload,
         })
     }

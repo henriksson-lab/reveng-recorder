@@ -7,7 +7,8 @@ description = "Event-triggered screen capture (Windows: GDI default, DXGI option
 
 [dependencies]
 anyhow.workspace = true
+serde.workspace = true
 image = { version = "0.25.10", default-features = false, features = ["png"] }
 
 [target."cfg(windows)".dependencies]
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging"] }
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi"] }

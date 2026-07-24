@@ -49,8 +49,12 @@ pub struct UsbRecordOpts {
     pub min_interval_ms: u64,
     /// VK of the stop-hotkey trigger (fires with Ctrl+Alt held). Default VK_PAUSE (0x13).
     pub stop_vk: u16,
-    /// Optional bounded capture (for automation/tests); `None` = until stop hotkey.
+    /// Optional bounded capture: auto-stop after this long. Independent of `headless` — a
+    /// windowed run auto-closes when it fires. `None` = until stop hotkey / Stop button.
     pub max_duration: Option<Duration>,
+    /// Run without the Slint recording window (unattended automation). Orthogonal to
+    /// `max_duration`. `false` = show the window (the default interactive experience).
+    pub headless: bool,
     /// Driver snaplen in bytes (`0` = unlimited default). Truncates big transfers in the kernel.
     pub snaplen: u32,
     /// Driver kernel buffer size in bytes (`0` = default).
@@ -61,6 +65,11 @@ pub struct UsbRecordOpts {
     pub endpoints: Option<Vec<u8>>,
     /// Stop once total captured traffic bytes (USB + PCIe) reach this budget. `None` = no cap.
     pub max_bytes: Option<u64>,
+    /// Abort early if no new USB frame arrives for this long — kills the "0 frames after the full
+    /// timer" waste when the device wasn't actually streaming. `None` = wait for the real stop.
+    pub abort_if_idle: Option<Duration>,
+    /// Stop once this many USB frames have been captured (a bounded, traffic-driven run). `None` = no cap.
+    pub stop_after_frames: Option<u64>,
     /// Arm manual process-memory snapshots against this PID (the decoded-form oracle). The
     /// window shows a Snapshot button; each press dumps the target's memory + emits a checkpoint
     /// carrying `mem_snapshot_id`. `None` = feature off.
@@ -146,6 +155,23 @@ fn keep_packet(header: Option<&UsbFrameHeader>, filter: &PacketFilter) -> bool {
         }
     }
     true
+}
+
+/// Extra (traffic-driven) stop conditions beyond duration/byte budget. Pure — unit-tested.
+/// `since_last_frame` is time since the last USB frame arrived (or since start if none have).
+fn extra_stop_reason(
+    frames: u64,
+    since_last_frame: Duration,
+    abort_if_idle: Option<Duration>,
+    stop_after_frames: Option<u64>,
+) -> Option<&'static str> {
+    if stop_after_frames.is_some_and(|n| frames >= n) {
+        return Some("--stop-after-frames reached");
+    }
+    if abort_if_idle.is_some_and(|t| since_last_frame >= t) {
+        return Some("--abort-if-idle: no new traffic");
+    }
+    None
 }
 
 /// A PCIe source captured *concurrently* with USB (`--with-pcie`), folded into the same
@@ -329,15 +355,68 @@ pub fn run_usb_capture(
         }
     }
 
-    // --- screenshot worker ---
-    let (shot_tx, shot_rx) = std::sync::mpsc::channel::<(u64, reveng_winshot::Scope)>();
+    // --- monitor layout: logged once at session start, so screenshot coordinates are
+    //     interpretable later (which monitor, what bounds, DPI/scaling). ---
+    match reveng_winshot::enumerate_displays() {
+        Ok(displays) => {
+            if let Ok(json) = serde_json::to_string_pretty(&displays) {
+                let _ = std::fs::write(session.displays_json(), json);
+            }
+        }
+        Err(e) => eprintln!("display enumeration failed: {e}"),
+    }
+
+    // --- screenshot + UI-Automation worker ---
+    // Carries (id, ts_ns, scope, cursor). Per checkpoint it: (1) grabs the PNG and appends
+    // capture geometry to `screenshots.ndjson` (the spatial index), and (2) snapshots the
+    // UI-Automation widget tree of the clicked window to `ui/<id>.json` (typed controls +
+    // rects + live states/values — the structured screen-side oracle).
+    let shots_meta_path = session.screenshots_meta();
+    let ui_dir = session.ui_dir();
+    let _ = std::fs::create_dir_all(&ui_dir);
+    let (shot_tx, shot_rx) =
+        std::sync::mpsc::channel::<(u64, i64, reveng_winshot::Scope, (i32, i32))>();
     let shot_worker = std::thread::Builder::new()
         .name("winshot-worker".into())
         .spawn(move || {
-            while let Ok((id, scope)) = shot_rx.recv() {
+            let mut meta = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&shots_meta_path)
+                .ok();
+            while let Ok((id, ts_ns, scope, cursor)) = shot_rx.recv() {
                 let path = shots_dir.join(format!("{id:06}.png"));
-                if let Err(e) = reveng_winshot::capture_to(&path, scope) {
-                    eprintln!("screenshot {id} failed: {e}");
+                match reveng_winshot::capture_to(&path, scope) {
+                    Ok(geom) => {
+                        if let Some(f) = meta.as_mut() {
+                            let line = serde_json::json!({
+                                "id": id, "ts_ns": ts_ns,
+                                "origin_x": geom.origin_x, "origin_y": geom.origin_y,
+                                "width": geom.width, "height": geom.height,
+                                "cursor_x": geom.cursor_x, "cursor_y": geom.cursor_y,
+                                "monitor_index": geom.monitor_index, "dpi": geom.dpi,
+                                "scope": geom.scope,
+                            });
+                            use std::io::Write as _;
+                            let _ = writeln!(f, "{line}");
+                        }
+                    }
+                    Err(e) => eprintln!("screenshot {id} failed: {e}"),
+                }
+                // UIA snapshot of the window the user clicked (fall back to foreground when the
+                // cursor is unset, e.g. interval checkpoints). Best-effort — a thin/empty tree
+                // just means no `ui/<id>.json`.
+                let ui = if cursor != (0, 0) {
+                    reveng_winui::snapshot_at_point(cursor.0, cursor.1)
+                } else {
+                    reveng_winui::snapshot_foreground()
+                };
+                if let Ok(els) = ui {
+                    if !els.is_empty() {
+                        if let Ok(json) = serde_json::to_vec(&els) {
+                            let _ = std::fs::write(ui_dir.join(format!("{id:06}.json")), json);
+                        }
+                    }
                 }
             }
         })?;
@@ -421,6 +500,9 @@ pub fn run_usb_capture(
 
     let start = Instant::now();
     let interval_ns = (opts.cfg.interval_ms as i64).saturating_mul(1_000_000);
+    // Idle-abort / frame-cap bookkeeping: track the last time a new USB frame arrived.
+    let mut last_frames = 0u64;
+    let mut last_frame_at = start;
     let run_result = (|| -> Result<()> {
       loop {
         match in_rx.recv_timeout(Duration::from_millis(100)) {
@@ -478,22 +560,38 @@ pub fn run_usb_capture(
             }
         }
 
-        // Stop conditions: hotkey, notes-window Stop/close, reader EOF, bounded duration, or
-        // byte budget (USB + PCIe totals).
+        // Stop conditions: hotkey, notes-window Stop/close, reader EOF, bounded duration, byte
+        // budget (USB + PCIe totals), idle-abort, or frame cap.
         let over_budget = opts.max_bytes.is_some_and(|mb| {
             let usb = state.lock().unwrap().total_bytes;
             let pcie = pcie_state.as_ref().map_or(0, |p| p.lock().unwrap().total_bytes);
             usb + pcie >= mb
         });
+        // Refresh idle timer: a new frame since last poll resets the "no traffic" clock.
+        let frames_now = state.lock().unwrap().total_frames;
+        if frames_now != last_frames {
+            last_frames = frames_now;
+            last_frame_at = Instant::now();
+        }
+        let extra = extra_stop_reason(
+            frames_now,
+            last_frame_at.elapsed(),
+            opts.abort_if_idle,
+            opts.stop_after_frames,
+        );
         if engine.stop_requested
             || ui_stop.as_ref().map(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
             || state.lock().unwrap().done
             || state.lock().unwrap().error.is_some()
             || opts.max_duration.map(|d| start.elapsed() >= d).unwrap_or(false)
             || over_budget
+            || extra.is_some()
         {
             if over_budget {
                 eprintln!("reached --max-bytes budget; stopping");
+            }
+            if let Some(reason) = extra {
+                eprintln!("{reason} ({frames_now} frames captured); stopping");
             }
             break;
         }
@@ -674,7 +772,7 @@ struct Engine {
     last_ckpt_ts: i64,
     last_shot_ts: Option<i64>,
     min_interval_ns: i64,
-    shot_tx: Option<std::sync::mpsc::Sender<(u64, reveng_winshot::Scope)>>,
+    shot_tx: Option<std::sync::mpsc::Sender<(u64, i64, reveng_winshot::Scope, (i32, i32))>>,
     scope: reveng_winshot::Scope,
     cfg: CheckpointConfig,
     shot_when: ScreenshotWhen,
@@ -703,7 +801,7 @@ impl Engine {
     fn new(
         session: SessionWriter,
         opts: &UsbRecordOpts,
-        shot_tx: std::sync::mpsc::Sender<(u64, reveng_winshot::Scope)>,
+        shot_tx: std::sync::mpsc::Sender<(u64, i64, reveng_winshot::Scope, (i32, i32))>,
         clock: Clock,
         usb_active: bool,
         pcie_state: Option<Arc<Mutex<PcieState>>>,
@@ -772,7 +870,7 @@ impl Engine {
                 screenshot_id = Some(id);
                 self.last_shot_ts = Some(ts_ns);
                 if let Some(tx) = &self.shot_tx {
-                    let _ = tx.send((id, self.scope));
+                    let _ = tx.send((id, ts_ns, self.scope, cursor));
                 }
             } else {
                 note = Some("screenshot_skipped".to_string());
@@ -1041,6 +1139,31 @@ mod tests {
             status: 0,
             data_length: 0,
         }
+    }
+
+    #[test]
+    fn idle_abort_fires_when_no_frames_arrive() {
+        // No frames, no timer running long enough yet → keep going.
+        assert_eq!(
+            extra_stop_reason(0, Duration::from_secs(2), Some(Duration::from_secs(5)), None),
+            None
+        );
+        // No frames for longer than the idle timeout → abort.
+        assert_eq!(
+            extra_stop_reason(0, Duration::from_secs(6), Some(Duration::from_secs(5)), None),
+            Some("--abort-if-idle: no new traffic")
+        );
+    }
+
+    #[test]
+    fn frame_cap_takes_priority_and_idle_off_by_default() {
+        // No idle/cap configured → never an extra stop, however long idle.
+        assert_eq!(extra_stop_reason(0, Duration::from_secs(999), None, None), None);
+        // Frame cap reached, even while traffic is flowing (idle timer just reset).
+        assert_eq!(
+            extra_stop_reason(100, Duration::from_millis(0), Some(Duration::from_secs(5)), Some(100)),
+            Some("--stop-after-frames reached")
+        );
     }
 
     #[test]

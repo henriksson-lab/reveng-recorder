@@ -7,9 +7,15 @@ mod elevate;
 mod hv;
 #[cfg(windows)]
 mod notes_ui;
+mod annotate;
+mod monitor;
 mod query;
+mod frame;
 mod record;
 mod record_usb;
+mod solve;
+mod sweep;
+mod usbpoke;
 
 use clap::{Parser, Subcommand, ValueEnum};
 use reveng_core::checkpoint::CheckpointConfig;
@@ -26,7 +32,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Record a session (USB or PCIe traffic + input + screenshots).
-    Record(RecordArgs),
+    Record(Box<RecordArgs>),
     /// Enumerate USB devices (for picking a capture target).
     Devices {
         #[arg(long, value_enum, default_value_t = OutFormat::Text)]
@@ -56,6 +62,245 @@ enum Cmd {
         ep: Option<String>,
         #[arg(long, value_enum, default_value_t = OutFormat::Json)]
         format: OutFormat,
+    },
+    /// Decoded control-transfer command log: one line per EP0 vendor/class/standard request,
+    /// SETUP paired with its completion (bRequest/wValue/wIndex + data + status). The command
+    /// layer of a vendor USB protocol.
+    Ctrl {
+        session: PathBuf,
+        #[arg(long)]
+        around: Option<u64>,
+        #[arg(long, short = 'w', default_value_t = 40)]
+        window: u64,
+        #[arg(long)]
+        range: Option<String>,
+        /// Only requests of this type: standard | class | vendor.
+        #[arg(long)]
+        req_type: Option<String>,
+        /// Emit one JSON object per command instead of the text log.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Diff two sessions' control-command streams (align by request/value/index/dir): `-` only in
+    /// A, `+` only in B, `~` same command, different data. "What did the working run do differently?"
+    CtrlDiff {
+        session_a: PathBuf,
+        session_b: PathBuf,
+        /// Only requests of this type: standard | class | vendor.
+        #[arg(long)]
+        req_type: Option<String>,
+    },
+    /// Capture-integrity check: endpoint histogram, control SETUP↔completion pairing (unpaired =
+    /// likely dropped packets), non-zero statuses, timestamp ordering. Non-zero exit on problems.
+    Verify { session: PathBuf },
+    /// The device's reconstructed register map (last write per `(bRequest,wIndex)`) as of a
+    /// checkpoint, or end of session — the semantic device state, not a raw transfer dump.
+    RegState {
+        session: PathBuf,
+        /// Register state as of this checkpoint's anchor (default: end of session).
+        #[arg(long)]
+        at: Option<u64>,
+        /// Only requests of this type: standard | class | vendor.
+        #[arg(long)]
+        req_type: Option<String>,
+    },
+    /// Registers that changed between two checkpoints — the semantic layer above `ctrl-diff`
+    /// ("clicking X set register A and B", not a wall of transfers).
+    RegDiff {
+        session: PathBuf,
+        /// "Before" checkpoint.
+        a: u64,
+        /// "After" checkpoint.
+        b: u64,
+        #[arg(long)]
+        req_type: Option<String>,
+    },
+    /// Apply a device spec (TOML: requests/registers/fields) to a capture — decode raw control
+    /// transfers into meaning ("exposure = 178 ms"). Turns PROTOCOL.md prose into a reusable decoder.
+    Annotate {
+        session: PathBuf,
+        /// Device spec file(s), layered in order (later overrides names / appends fields) — a shared
+        /// sensor base can sit under a per-device spec (e.g. `sensor-base.toml` then `cam.toml`).
+        #[arg(long)]
+        spec: Vec<PathBuf>,
+        /// Decode state as of this checkpoint's timestamp (default: end of session).
+        #[arg(long)]
+        at: Option<u64>,
+        /// Restrict to this request type (default: vendor).
+        #[arg(long)]
+        req_type: Option<String>,
+        /// Also print the labeled register state (every folded register with its spec name).
+        #[arg(long)]
+        log: bool,
+    },
+    /// A value's time-series across a session's checkpoints: a UIA control's value (`--ui <name>`)
+    /// or a register's last-written byte (`--reg <bRequest:wIndex>`, e.g. `0x40:0x1000`).
+    Track {
+        session: PathBuf,
+        /// UIA control name substring whose value to follow across checkpoints.
+        #[arg(long)]
+        ui: Option<String>,
+        /// Register `bRequest:wIndex` (e.g. `0x40:0x1000`) whose byte to follow.
+        #[arg(long)]
+        reg: Option<String>,
+        /// Emit one JSON object per sample instead of the text table.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Infer a bulk endpoint's frame format: segment at short-packet boundaries, measure
+    /// bytes-per-frame, factor into candidate W×H×bpp near common aspect ratios (+ fps).
+    FrameGuess {
+        session: PathBuf,
+        /// Image endpoint, e.g. `0x81`.
+        #[arg(long, default_value = "0x81")]
+        ep: String,
+    },
+    /// Reassemble one logical frame from a bulk endpoint in a capture → raw file (validate a
+    /// camera/scanner frame format without a driver).
+    FrameExtract {
+        session: PathBuf,
+        /// Image endpoint, e.g. `0x81`.
+        #[arg(long, default_value = "0x81")]
+        ep: String,
+        /// Bytes per frame (e.g. width*height for RAW8).
+        #[arg(long)]
+        frame_bytes: usize,
+        #[arg(long)]
+        out: PathBuf,
+    },
+    /// Decode a RAW frame file into PNG(s): grayscale, plus (with --bayer) all 4 debayer phases.
+    FrameDecode {
+        raw: PathBuf,
+        #[arg(long)]
+        width: usize,
+        #[arg(long)]
+        height: usize,
+        /// Pixel format: `raw8` or `raw16le`.
+        #[arg(long, default_value = "raw8")]
+        pix: String,
+        /// Also emit the 4 debayered-phase PNGs (pick the correct one on a lit color scene).
+        #[arg(long)]
+        bayer: bool,
+        #[arg(long, default_value = "frame")]
+        out: String,
+    },
+    /// Single-variable capture: record USB while driving a UIA control across values, then
+    /// correlate each value with the control-transfer burst it produced → a CSV for `solve`.
+    Sweep {
+        #[arg(long)]
+        device_vidpid: String,
+        /// Window title substring of the app to drive.
+        #[arg(long)]
+        window: String,
+        /// Control (Slider/Spinner) name substring, e.g. "Exposure Time".
+        #[arg(long)]
+        control: String,
+        /// Comma-separated values to set the control to, in order.
+        #[arg(long)]
+        values: String,
+        /// Seconds to settle between values.
+        #[arg(long, default_value_t = 3.0)]
+        pause: f64,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long)]
+        req_type: Option<String>,
+        /// Which byte to tabulate per register: `val` (low byte of wValue, default) or `data`.
+        #[arg(long, default_value = "val")]
+        field: String,
+    },
+    /// Correlate known driven values with the last-N control-transfer bursts of an existing
+    /// session (the analysis half of `sweep`) → a `value → bytes` table + CSV for `solve`.
+    SweepCorrelate {
+        session: PathBuf,
+        /// Comma-separated values that were set, in order.
+        #[arg(long)]
+        values: String,
+        #[arg(long)]
+        req_type: Option<String>,
+        #[arg(long, default_value = "val")]
+        field: String,
+        #[arg(long)]
+        out_csv: Option<PathBuf>,
+    },
+    /// Brute-force the fixed transform behind an obfuscated field: given a CSV of (variable,
+    /// bytes…), find the XOR/pairing/inversion most linear in the variable, and fit the formula.
+    Solve {
+        csv: PathBuf,
+        /// Column index (0-based) of the known variable.
+        #[arg(long, default_value_t = 0)]
+        var: usize,
+        /// Comma-separated column indices of the wire bytes, e.g. `3,4,5,6`.
+        #[arg(long)]
+        bytes: String,
+        /// Optional row filter `COL=VALUE` (e.g. `0=expo`) to select a subset.
+        #[arg(long = "where", value_name = "COL=VAL")]
+        filter: Option<String>,
+    },
+    /// Live per-endpoint traffic dashboard (frames/s + bytes/s, IDLE flag) — NO session written.
+    /// Confirm the device is actually streaming before committing a real `record`.
+    Monitor {
+        /// Only this device, `VID:PID` (hex). Omit to monitor all USBPcap hubs.
+        #[arg(long)]
+        device_vidpid: Option<String>,
+        /// Stop after this many seconds (default: until Ctrl+C).
+        #[arg(long)]
+        max_seconds: Option<u64>,
+    },
+    /// Interactive/scripted control transfers + queued bulk reads against a live USB device (the
+    /// device oracle): probe determinism, replay a `ctrl --json` capture, bring up streaming.
+    UsbPoke {
+        /// Target device, `VID:PID` (hex), e.g. `1234:abcd`.
+        #[arg(long)]
+        vidpid: String,
+        /// Read commands from a file instead of the interactive REPL.
+        #[arg(long)]
+        script: Option<PathBuf>,
+        /// Determinism check: replay a `ctrl --json` capture and flag IN responses that differ
+        /// from the captured bytes (nonce/auth-reproducibility test). Overrides the REPL.
+        #[arg(long)]
+        check: Option<PathBuf>,
+        /// Streaming bring-up diagnosis on `--ep`: single vs queued bulk read → diagnosis + fix.
+        #[arg(long)]
+        doctor: bool,
+        /// Endpoint for `--doctor`, e.g. `0x81`.
+        #[arg(long, default_value = "0x81")]
+        ep: String,
+        /// Reset the device on open before `--doctor` (unwedge an aborted prior attempt).
+        #[arg(long)]
+        reset: bool,
+    },
+    /// OCR on-screen text in screenshots (Windows.Media.Ocr), words ordered by distance to the
+    /// cursor. Results cache under `ocr/<id>.json` for fast re-analysis of many screenshots.
+    Ocr {
+        session: PathBuf,
+        /// Screenshot / checkpoint id to OCR (omit with --all).
+        screenshot: Option<u64>,
+        /// OCR every screenshot in the session.
+        #[arg(long)]
+        all: bool,
+        /// Emit one JSON object per screenshot instead of the text view.
+        #[arg(long)]
+        json: bool,
+        /// Re-run OCR even if a cached result exists.
+        #[arg(long)]
+        refresh: bool,
+    },
+    /// Read the UI-Automation widget snapshot at a checkpoint: typed controls (buttons,
+    /// checkboxes, radios, sliders, edits…) with rects + live state/value, nearest-cursor first.
+    Ui {
+        session: PathBuf,
+        /// Checkpoint id to read (omit with --all).
+        checkpoint: Option<u64>,
+        /// Read every UI snapshot in the session.
+        #[arg(long)]
+        all: bool,
+        /// Only interactive controls (buttons/checkboxes/radios/sliders/edits/combos).
+        #[arg(long)]
+        interactive: bool,
+        /// Emit one JSON object per control instead of the text view.
+        #[arg(long)]
+        json: bool,
     },
     /// Reassembled logical messages on an endpoint.
     Stream {
@@ -351,14 +596,29 @@ struct RecordArgs {
     #[arg(long, default_value_t = 0)]
     rotate_mb: u64,
 
-    /// Stop automatically after this many seconds (for automation; default: run until the
-    /// stop hotkey Ctrl+Alt+Pause).
+    /// Stop automatically after this many seconds. Independent of the recording window:
+    /// combine with a windowed run for an auto-stopping GUI capture, or with --headless for
+    /// unattended automation. Default: run until the stop hotkey Ctrl+Alt+Pause / Stop button.
     #[arg(long)]
     max_seconds: Option<u64>,
+
+    /// Run without the recording window (no Slint UI / consent banner / Stop button). For
+    /// unattended automation. Orthogonal to --max-seconds. Same effect as REVENG_NO_NOTES_UI=1.
+    #[arg(long)]
+    headless: bool,
 
     /// Stop once total captured traffic (USB + PCIe) reaches this many bytes (size budget).
     #[arg(long)]
     max_bytes: Option<u64>,
+
+    /// Abort early if no new USB frame arrives for this many seconds — catches "device wasn't
+    /// streaming" immediately instead of after the full --max-seconds timer. (USB captures.)
+    #[arg(long)]
+    abort_if_idle: Option<u64>,
+
+    /// Stop once this many USB frames have been captured (bounded, traffic-driven run).
+    #[arg(long)]
+    stop_after_frames: Option<u64>,
 
     /// Arm manual process-memory snapshots against this PID: the recording window shows a
     /// Snapshot button; each press dumps the target's committed memory and emits a checkpoint
@@ -395,7 +655,7 @@ fn main() {
 fn run() -> anyhow::Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Record(args) => run_record(args),
+        Cmd::Record(args) => run_record(*args),
         Cmd::Devices { format } => run_devices(format),
         Cmd::PciDevices { format } => run_pci_devices(format),
         Cmd::Ls { session } => query::ls(&session, false),
@@ -407,8 +667,143 @@ fn run() -> anyhow::Result<()> {
             window,
             range,
             ep,
-            format: _,
-        } => query::frames(&session, around, window, range.as_deref(), parse_bar(ep.as_deref())),
+            format,
+        } => query::frames(
+            &session,
+            around,
+            window,
+            range.as_deref(),
+            parse_bar(ep.as_deref()),
+            payload_fmt(format),
+        ),
+        Cmd::Ctrl {
+            session,
+            around,
+            window,
+            range,
+            req_type,
+            json,
+        } => query::ctrl(&session, around, window, range.as_deref(), req_type.as_deref(), json),
+        Cmd::CtrlDiff {
+            session_a,
+            session_b,
+            req_type,
+        } => query::ctrl_diff(&session_a, &session_b, req_type.as_deref()),
+        Cmd::Verify { session } => query::verify(&session),
+        Cmd::RegState {
+            session,
+            at,
+            req_type,
+        } => query::reg_state(&session, at, req_type.as_deref()),
+        Cmd::RegDiff {
+            session,
+            a,
+            b,
+            req_type,
+        } => query::reg_diff(&session, a, b, req_type.as_deref()),
+        Cmd::Track {
+            session,
+            ui,
+            reg,
+            json,
+        } => query::track(&session, ui.as_deref(), reg.as_deref(), json),
+        Cmd::Annotate {
+            session,
+            spec,
+            at,
+            req_type,
+            log,
+        } => annotate::annotate(&session, &spec, at, req_type.as_deref(), log),
+        Cmd::FrameExtract {
+            session,
+            ep,
+            frame_bytes,
+            out,
+        } => frame::extract(&session, parse_bar(Some(&ep)).unwrap_or(0x81), frame_bytes, &out),
+        Cmd::FrameGuess { session, ep } => {
+            frame::guess(&session, parse_bar(Some(&ep)).unwrap_or(0x81))
+        }
+        Cmd::FrameDecode {
+            raw,
+            width,
+            height,
+            pix,
+            bayer,
+            out,
+        } => frame::decode(&raw, width, height, &pix, bayer, &out),
+        Cmd::Solve {
+            csv,
+            var,
+            bytes,
+            filter,
+        } => {
+            let byte_cols: Vec<usize> =
+                bytes.split(',').filter_map(|s| s.trim().parse().ok()).collect();
+            let f = filter.as_ref().and_then(|s| s.split_once('=')).and_then(|(c, v)| {
+                c.trim().parse::<usize>().ok().map(|c| (c, v.trim().to_string()))
+            });
+            solve::run(&csv, var, &byte_cols, f)
+        }
+        Cmd::Sweep {
+            device_vidpid,
+            window,
+            control,
+            values,
+            pause,
+            out,
+            req_type,
+            field,
+        } => {
+            let vals = parse_f64_list(&values);
+            sweep::run(&device_vidpid, &window, &control, &vals, pause, out, req_type.as_deref(), &field)
+        }
+        Cmd::SweepCorrelate {
+            session,
+            values,
+            req_type,
+            field,
+            out_csv,
+        } => query::sweep_correlate(
+            &session,
+            &parse_f64_list(&values),
+            req_type.as_deref(),
+            &field,
+            out_csv.as_deref(),
+        ),
+        Cmd::Monitor {
+            device_vidpid,
+            max_seconds,
+        } => monitor::run(device_vidpid.as_deref(), max_seconds),
+        Cmd::UsbPoke {
+            vidpid,
+            script,
+            check,
+            doctor,
+            ep,
+            reset,
+        } => {
+            if let Some(cap) = check {
+                usbpoke::check(&vidpid, &cap)
+            } else if doctor {
+                usbpoke::doctor(&vidpid, parse_bar(Some(&ep)).unwrap_or(0x81), reset)
+            } else {
+                usbpoke::run(&vidpid, script.as_deref())
+            }
+        }
+        Cmd::Ocr {
+            session,
+            screenshot,
+            all,
+            json,
+            refresh,
+        } => query::ocr(&session, screenshot, all, json, refresh),
+        Cmd::Ui {
+            session,
+            checkpoint,
+            all,
+            interactive,
+            json,
+        } => query::ui(&session, checkpoint, all, json, interactive),
         Cmd::Stream {
             session,
             ep,
@@ -599,8 +994,8 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             // the portable minimal loop (`record.rs`), which is cross-platform and captures no input.
             #[cfg(windows)]
             {
-                let headless = args.max_seconds.is_some()
-                    || std::env::var_os("REVENG_NO_NOTES_UI").is_some();
+                let headless =
+                    args.headless || std::env::var_os("REVENG_NO_NOTES_UI").is_some();
                 // drv/etw/replay all stop cleanly now, so all can drive the input engine.
                 if !headless {
                     return run_pcie_engine_session(&args, cfg.clone());
@@ -671,7 +1066,7 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                     && !args.no_capture
                     && !args.with_pcie
                     && args.pcie_replay.is_none();
-                let interactive = args.max_seconds.is_none()
+                let interactive = !args.headless
                     && std::env::var_os("REVENG_NO_NOTES_UI").is_none()
                     && std::env::var_os("REVENG_NO_PICKER").is_none();
                 if bare && interactive {
@@ -726,7 +1121,8 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
 
 /// Run the shared input-driven recording engine (clicks→checkpoint+screenshot, keyboard, notes)
 /// over whatever traffic sources `opts`/`pcie` carry — USB, PCIe, both, or neither. Interactive
-/// runs get the Slint window; headless (`--max-seconds`/`REVENG_NO_NOTES_UI`) runs windowless.
+/// runs get the Slint window; `--headless`/`REVENG_NO_NOTES_UI` runs windowless. `--max-seconds`
+/// is an independent auto-stop that applies to either (a windowed run auto-closes at the limit).
 fn run_engine_session(
     out: &std::path::Path,
     opts: record_usb::UsbRecordOpts,
@@ -736,8 +1132,7 @@ fn run_engine_session(
     let usb_active = !opts.selections.is_empty();
     let pcie_active = pcie.is_some();
     let mem_active = opts.mem_pid.is_some() || opts.mem_process.is_some();
-    let headless =
-        opts.max_duration.is_some() || std::env::var_os("REVENG_NO_NOTES_UI").is_some();
+    let headless = opts.headless;
 
     let summary = if headless {
         record_usb::run_usb_capture(clock, out, opts, None, pcie)?
@@ -975,11 +1370,14 @@ fn build_usb_opts(
         min_interval_ms: args.screenshot_min_interval_ms,
         stop_vk: 0x13, // VK_PAUSE (Ctrl+Alt+Pause)
         max_duration: args.max_seconds.map(std::time::Duration::from_secs),
+        headless: args.headless || std::env::var_os("REVENG_NO_NOTES_UI").is_some(),
         snaplen,
         buffer: args.usb_bufsize,
         drop_transfers,
         endpoints: parse_endpoints(args.endpoints.as_deref()),
         max_bytes: args.max_bytes,
+        abort_if_idle: args.abort_if_idle.map(std::time::Duration::from_secs),
+        stop_after_frames: args.stop_after_frames,
         mem_pid: args.mem_pid,
         mem_process: args.mem_process.clone(),
         mem_compress: args.mem_compress,
@@ -1373,6 +1771,11 @@ fn parse_bar(ep: Option<&str>) -> Option<u8> {
 }
 
 /// Map the CLI's output format onto the payload renderer.
+/// Parse a comma-separated list of numbers (for `--values`).
+fn parse_f64_list(s: &str) -> Vec<f64> {
+    s.split(',').filter_map(|x| x.trim().parse::<f64>().ok()).collect()
+}
+
 fn payload_fmt(f: OutFormat) -> query::PayloadFmt {
     match f {
         OutFormat::Hex => query::PayloadFmt::Hex,

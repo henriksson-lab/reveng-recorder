@@ -10,6 +10,22 @@ use reveng_pcicap::PcieLog;
 use reveng_usbcap::UsbReader;
 use std::path::{Path, PathBuf};
 
+/// Normalize a value track to `0.0..=1.0` for drawing (min→0, max→1); `None` stays `None`, and an
+/// all-equal (or empty) track normalizes every present value to `0.5`. Pure — unit-tested.
+pub fn normalize_track(track: &[Option<f64>]) -> Vec<Option<f32>> {
+    let vals: Vec<f64> = track.iter().flatten().copied().collect();
+    if vals.is_empty() {
+        return track.iter().map(|_| None).collect();
+    }
+    let min = vals.iter().cloned().fold(f64::INFINITY, f64::min);
+    let max = vals.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let span = max - min;
+    track
+        .iter()
+        .map(|o| o.map(|v| if span > 0.0 { ((v - min) / span) as f32 } else { 0.5 }))
+        .collect()
+}
+
 /// One row in the traffic inspector.
 pub struct InspectorRow {
     pub index: u64,
@@ -145,6 +161,28 @@ impl SessionModel {
         Ok(rows)
     }
 
+    /// A UIA value track: for each checkpoint, the named control's `range_value` from that
+    /// checkpoint's `ui/<screenshot_id>.json`, or `None` if absent. Same source as
+    /// `reveng-rec track --ui` — lets the timeline show a control's value (exposure/gain) curve.
+    pub fn value_track(&self, control: &str) -> Vec<Option<f64>> {
+        let needle = control.to_lowercase();
+        let ui_dir = self.root.join("ui");
+        self.checkpoints
+            .iter()
+            .map(|c| {
+                let sid = c.screenshot_id?;
+                let bytes = std::fs::read(ui_dir.join(format!("{sid:06}.json"))).ok()?;
+                let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+                v.as_array()?.iter().find_map(|el| {
+                    let name = el.get("name")?.as_str()?.to_lowercase();
+                    name.contains(&needle)
+                        .then(|| el.get("range_value").and_then(|x| x.as_f64()))
+                        .flatten()
+                })
+            })
+            .collect()
+    }
+
     /// Absolute path to a checkpoint's screenshot, if it has one and the file exists.
     pub fn screenshot_path(&self, ckpt: &Checkpoint) -> Option<PathBuf> {
         let id = ckpt.screenshot_id?;
@@ -225,6 +263,28 @@ mod tests {
     use reveng_core::event::{SourceKind, TrafficAnchor};
     use reveng_core::session::{SessionRecord, SessionWriter};
     use reveng_usbcap::UsbWriter;
+
+    #[test]
+    fn normalize_track_scales_and_preserves_gaps() {
+        let t = vec![Some(10.0), None, Some(20.0), Some(30.0)];
+        let n = normalize_track(&t);
+        assert_eq!(n[0], Some(0.0), "min → 0");
+        assert_eq!(n[1], None, "gap preserved");
+        assert_eq!(n[2], Some(0.5), "midpoint");
+        assert_eq!(n[3], Some(1.0), "max → 1");
+    }
+
+    #[test]
+    fn normalize_track_all_equal_is_midline() {
+        let n = normalize_track(&[Some(5.0), Some(5.0)]);
+        assert_eq!(n, vec![Some(0.5), Some(0.5)], "flat track draws mid-height");
+    }
+
+    #[test]
+    fn normalize_track_empty_or_all_none() {
+        assert_eq!(normalize_track(&[None, None]), vec![None, None]);
+        assert!(normalize_track(&[]).is_empty());
+    }
 
     fn packet(ep: u8, payload: &[u8]) -> Vec<u8> {
         let mut h = vec![0u8; 27];

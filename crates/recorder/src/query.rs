@@ -11,7 +11,9 @@ use anyhow::{Context, Result};
 use reveng_core::event::{PcieEvent, SourceKind};
 use reveng_core::session::SessionReader;
 use reveng_pcicap::PcieLog;
+use reveng_usbcap::reader::{Setup, CTRL_STAGE_COMPLETE, CTRL_STAGE_SETUP};
 use reveng_usbcap::UsbReader;
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
 
@@ -425,6 +427,7 @@ pub fn frames(
     window: u64,
     range: Option<&str>,
     filter: Option<u8>,
+    fmt: PayloadFmt,
 ) -> Result<()> {
     let s = SessionReader::open(session_dir)?;
     let mut log = open_log(&s)?;
@@ -455,9 +458,950 @@ pub fn frames(
                 continue;
             }
         }
-        writeln!(w, "{}", log.event_json(i)?)?;
+        // Render per --format. `text` (and the payload-ish formats) collapse the per-frame
+        // hex/ascii/base64 firehose into one scannable line — essential for a bulk endpoint
+        // where the default JSON is thousands of chars per frame.
+        let line = match &mut log {
+            Log::Usb(r) => {
+                let uf = r.frame_at(i)?;
+                match fmt {
+                    PayloadFmt::Json => serde_json::to_string(&uf)?,
+                    PayloadFmt::Hex => usb_hex_block(&uf),
+                    PayloadFmt::Base64 => format!("#{} {}", uf.i, uf.b64),
+                    _ => usb_text_line(&uf),
+                }
+            }
+            Log::Pcie(l) => serde_json::json!({"i": i, "event": l.event_at(i)?}).to_string(),
+        };
+        writeln!(w, "{line}")?;
     }
     Ok(())
+}
+
+/// One compact scannable line for a USB frame (`--format text`): identity + a short payload
+/// preview, and — for control transfers — the decoded SETUP command instead of raw bytes.
+fn usb_text_line(f: &reveng_usbcap::UsbFrame) -> String {
+    let mut s = format!(
+        "#{:<6} t={:>9.3}s {} {:<3} {:<9} len={}",
+        f.i,
+        f.ts_ns as f64 / 1e9,
+        f.ep,
+        f.dir.to_uppercase(),
+        f.xfer,
+        f.len
+    );
+    if let Some(setup) = &f.setup {
+        s += &format!(
+            "  {}/{} req={} val={} idx={} wlen={}",
+            setup.req_type, setup.recipient, setup.b_request, setup.w_value, setup.w_index,
+            setup.w_length
+        );
+    }
+    if !f.payload.is_empty() {
+        let preview: Vec<String> = f.payload.iter().take(24).map(|b| format!("{b:02x}")).collect();
+        let ell = if f.payload.len() > 24 { " …" } else { "" };
+        s += &format!("  {}{}", preview.join(" "), ell);
+    }
+    s
+}
+
+/// A USB frame as a header line + xxd-style payload dump (`--format hex`).
+fn usb_hex_block(f: &reveng_usbcap::UsbFrame) -> String {
+    let mut s = format!(
+        "#{} t={:.3}s {} {} {} len={}\n",
+        f.i,
+        f.ts_ns as f64 / 1e9,
+        f.ep,
+        f.dir,
+        f.xfer,
+        f.len
+    );
+    s.push_str(&hexdump(&f.payload));
+    s
+}
+
+/// One fully-paired control transfer (SETUP joined with its completion), ready to emit.
+struct CtrlCmd {
+    i: u64,
+    ts_ns: i64,
+    setup: Setup,
+    /// OUT data written by the host, or IN data returned by the device.
+    data: Vec<u8>,
+    /// Completion status, if the completion stage was seen within the range.
+    status: Option<u32>,
+}
+
+fn emit_ctrl(w: &mut dyn Write, c: &CtrlCmd, json: bool) -> Result<()> {
+    let data_hex: String = c.data.iter().map(|b| format!("{b:02x}")).collect();
+    if json {
+        let v = serde_json::json!({
+            "i": c.i,
+            "ts_ns": c.ts_ns,
+            "dir": c.setup.dir,
+            "req_type": c.setup.req_type,
+            "recipient": c.setup.recipient,
+            "bmRequestType": c.setup.bm_request_type,
+            "bRequest": c.setup.b_request,
+            "wValue": c.setup.w_value,
+            "wIndex": c.setup.w_index,
+            "wLength": c.setup.w_length,
+            "data": data_hex,
+            "status": c.status,
+        });
+        writeln!(w, "{v}")?;
+        return Ok(());
+    }
+    let dir = c.setup.dir.to_ascii_uppercase();
+    let status = match c.status {
+        None => "?".to_string(),
+        Some(0) => "ok".to_string(),
+        Some(x) => format!("ERR 0x{x:08x}"),
+    };
+    // Cap the inline data so a long OUT/IN blob doesn't wrap the line; full bytes are in `data=`
+    // via --json or the `payload` command.
+    let shown = if data_hex.len() > 64 {
+        format!("{}… ({} B)", &data_hex[..64], c.data.len())
+    } else {
+        data_hex
+    };
+    let data_field = if c.data.is_empty() {
+        String::new()
+    } else {
+        format!("  data={shown}")
+    };
+    writeln!(
+        w,
+        "#{:<6} t={:>9.3}s  {:<3} {}/{}  req={} val={} idx={} wlen={}{}  {}",
+        c.i,
+        c.ts_ns as f64 / 1e9,
+        dir,
+        c.setup.req_type,
+        c.setup.recipient,
+        c.setup.b_request,
+        c.setup.w_value,
+        c.setup.w_index,
+        c.setup.w_length,
+        data_field,
+        status,
+    )?;
+    Ok(())
+}
+
+/// `ctrl` — the control-transfer command log. Iterates control (EP0) frames, pairs each SETUP
+/// with its completion by IRP id, and prints one line per request: direction, type/recipient,
+/// `bRequest`/`wValue`/`wIndex`, the data payload, and completion status. This is the command
+/// layer of a vendor USB protocol — for a Cypress-based camera it's the whole control surface.
+pub fn ctrl(
+    session_dir: &Path,
+    around: Option<u64>,
+    window: u64,
+    range: Option<&str>,
+    req_type: Option<&str>,
+    json: bool,
+) -> Result<()> {
+    let s = SessionReader::open(session_dir)?;
+    if !s.usb_pcapng().exists() {
+        anyhow::bail!("`ctrl` is a USB view; this session has no usb.pcapng");
+    }
+    let mut reader = UsbReader::open(s.usb_pcapng(), s.frames_idx())?;
+    let total = reader.len();
+    if total == 0 {
+        return Ok(());
+    }
+    let (start, end) = if let Some(r) = range {
+        parse_range(r)?
+    } else if let Some(ckpt) = around {
+        let c = s.checkpoint(ckpt)?;
+        let center = c
+            .anchor
+            .map(|a| a.event_index)
+            .context("checkpoint has no traffic anchor")?;
+        (center.saturating_sub(window), center.saturating_add(window))
+    } else {
+        (0, total - 1)
+    };
+    let end = end.min(total - 1);
+    let cmds = collect_ctrl(&mut reader, start, end, req_type)?;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    for c in &cmds {
+        emit_ctrl(&mut w, c, json)?;
+    }
+    Ok(())
+}
+
+/// Collect the paired control-transfer commands in `start..=end` (ordered by SETUP index),
+/// filtered to `req_type` (standard|class|vendor) when given. Shared by `ctrl` and `ctrl-diff`.
+fn collect_ctrl(
+    reader: &mut UsbReader,
+    start: u64,
+    end: u64,
+    req_type: Option<&str>,
+) -> Result<Vec<CtrlCmd>> {
+    let type_filter = req_type.map(|t| t.to_ascii_lowercase());
+    let want = |c: &CtrlCmd| type_filter.as_deref().is_none_or(|t| c.setup.req_type == t);
+    let mut pending: HashMap<u64, CtrlCmd> = HashMap::new();
+    let mut done: Vec<CtrlCmd> = Vec::new();
+    for i in start..=end {
+        if reader.xfer_at(i)? != reveng_usbcap::XFER_CONTROL {
+            continue;
+        }
+        let f = reader.frame_at(i)?;
+        match f.stage_raw {
+            Some(CTRL_STAGE_SETUP) => {
+                if let Some(setup) = f.setup {
+                    let data = if setup.dir == "out" && f.payload.len() > 8 {
+                        f.payload[8..].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    pending.insert(f.irp_id, CtrlCmd { i, ts_ns: f.ts_ns, setup, data, status: None });
+                }
+            }
+            Some(stage) => {
+                if let Some(p) = pending.get_mut(&f.irp_id) {
+                    if p.setup.dir == "in" && !f.payload.is_empty() {
+                        p.data.extend_from_slice(&f.payload);
+                    }
+                    if stage == CTRL_STAGE_COMPLETE {
+                        let mut c = pending.remove(&f.irp_id).unwrap();
+                        c.status = Some(f.status);
+                        if want(&c) {
+                            done.push(c);
+                        }
+                    }
+                }
+            }
+            None => {}
+        }
+    }
+    done.extend(pending.into_values().filter(|c| want(c)));
+    done.sort_by_key(|c| c.i);
+    Ok(done)
+}
+
+/// All control commands for a whole session (for `ctrl-diff`).
+fn collect_ctrl_session(session_dir: &Path, req_type: Option<&str>) -> Result<Vec<CtrlCmd>> {
+    let s = SessionReader::open(session_dir)?;
+    if !s.usb_pcapng().exists() {
+        anyhow::bail!("{}: not a USB session (no usb.pcapng)", session_dir.display());
+    }
+    let mut reader = UsbReader::open(s.usb_pcapng(), s.frames_idx())?;
+    let total = reader.len();
+    if total == 0 {
+        return Ok(Vec::new());
+    }
+    collect_ctrl(&mut reader, 0, total - 1, req_type)
+}
+
+/// A command's alignment identity: `(bRequest, wValue, wIndex, dir)` — not data/status/timing.
+fn ctrl_key(c: &CtrlCmd) -> String {
+    format!("{} {} {} {}", c.setup.b_request, c.setup.w_value, c.setup.w_index, c.setup.dir)
+}
+
+/// Compact one-line rendering of a command (for diffs).
+fn ctrl_oneline(c: &CtrlCmd) -> String {
+    let data: String = c.data.iter().take(24).map(|b| format!("{b:02x}")).collect();
+    let ell = if c.data.len() > 24 { "…" } else { "" };
+    let d = if c.data.is_empty() { String::new() } else { format!(" data={data}{ell}") };
+    format!(
+        "{} {}/{} req={} val={} idx={} wlen={}{}",
+        c.setup.dir.to_uppercase(),
+        c.setup.req_type,
+        c.setup.recipient,
+        c.setup.b_request,
+        c.setup.w_value,
+        c.setup.w_index,
+        c.setup.w_length,
+        d
+    )
+}
+
+enum DiffOp {
+    Same(usize, usize),
+    Del(usize),
+    Add(usize),
+}
+
+/// LCS alignment of two key sequences → a diff op list.
+fn lcs_diff(a: &[String], b: &[String]) -> Vec<DiffOp> {
+    let (n, m) = (a.len(), b.len());
+    let mut dp = vec![vec![0u32; m + 1]; n + 1];
+    for i in (0..n).rev() {
+        for j in (0..m).rev() {
+            dp[i][j] = if a[i] == b[j] {
+                dp[i + 1][j + 1] + 1
+            } else {
+                dp[i + 1][j].max(dp[i][j + 1])
+            };
+        }
+    }
+    let (mut i, mut j) = (0usize, 0usize);
+    let mut ops = Vec::new();
+    while i < n && j < m {
+        if a[i] == b[j] {
+            ops.push(DiffOp::Same(i, j));
+            i += 1;
+            j += 1;
+        } else if dp[i + 1][j] >= dp[i][j + 1] {
+            ops.push(DiffOp::Del(i));
+            i += 1;
+        } else {
+            ops.push(DiffOp::Add(j));
+            j += 1;
+        }
+    }
+    while i < n {
+        ops.push(DiffOp::Del(i));
+        i += 1;
+    }
+    while j < m {
+        ops.push(DiffOp::Add(j));
+        j += 1;
+    }
+    ops
+}
+
+fn flush_same(w: &mut dyn Write, run: &mut u32) -> Result<()> {
+    if *run > 0 {
+        writeln!(w, "  … {run} identical")?;
+        *run = 0;
+    }
+    Ok(())
+}
+
+/// `ctrl-diff <A> <B>` — align two sessions' control-command streams (by request/value/index/dir)
+/// and show what differs: `-` only in A, `+` only in B, `~` same command but different data.
+/// Answers "what did the working run do that mine didn't?".
+pub fn ctrl_diff(a_dir: &Path, b_dir: &Path, req_type: Option<&str>) -> Result<()> {
+    let a = collect_ctrl_session(a_dir, req_type)?;
+    let b = collect_ctrl_session(b_dir, req_type)?;
+    let ka: Vec<String> = a.iter().map(ctrl_key).collect();
+    let kb: Vec<String> = b.iter().map(ctrl_key).collect();
+    let ops = lcs_diff(&ka, &kb);
+
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    writeln!(w, "--- A {}  ({} commands)", a_dir.display(), a.len())?;
+    writeln!(w, "+++ B {}  ({} commands)", b_dir.display(), b.len())?;
+    let (mut dels, mut adds, mut chg, mut same_run) = (0u32, 0u32, 0u32, 0u32);
+    for op in &ops {
+        match *op {
+            DiffOp::Same(ia, ib) => {
+                if a[ia].data != b[ib].data {
+                    flush_same(&mut w, &mut same_run)?;
+                    writeln!(w, "~ A {}", ctrl_oneline(&a[ia]))?;
+                    writeln!(w, "~ B {}", ctrl_oneline(&b[ib]))?;
+                    chg += 1;
+                } else {
+                    same_run += 1;
+                }
+            }
+            DiffOp::Del(ia) => {
+                flush_same(&mut w, &mut same_run)?;
+                writeln!(w, "- {}", ctrl_oneline(&a[ia]))?;
+                dels += 1;
+            }
+            DiffOp::Add(ib) => {
+                flush_same(&mut w, &mut same_run)?;
+                writeln!(w, "+ {}", ctrl_oneline(&b[ib]))?;
+                adds += 1;
+            }
+        }
+    }
+    flush_same(&mut w, &mut same_run)?;
+    writeln!(w, "\n{dels} only-in-A, {adds} only-in-B, {chg} changed-data")?;
+    Ok(())
+}
+
+/// Group a command list into bursts separated by inter-command gaps > `gap_ns` (one burst ≈ one
+/// parameter-change transaction).
+fn group_bursts(cmds: &[CtrlCmd], gap_ns: i64) -> Vec<std::ops::Range<usize>> {
+    let mut bursts = Vec::new();
+    let mut start = 0usize;
+    for i in 1..cmds.len() {
+        if cmds[i].ts_ns - cmds[i - 1].ts_ns > gap_ns {
+            bursts.push(start..i);
+            start = i;
+        }
+    }
+    if !cmds.is_empty() {
+        bursts.push(start..cmds.len());
+    }
+    bursts
+}
+
+fn wval_lo(c: &CtrlCmd) -> u8 {
+    u16::from_str_radix(c.setup.w_value.trim_start_matches("0x"), 16).unwrap_or(0) as u8
+}
+
+/// `sweep-correlate` — pair a known list of driven values with the control-transfer bursts they
+/// produced (the last N bursts in the session), and pivot to a `value, <byte per register>` table
+/// (and CSV) ready for `solve`. The analysis half of `sweep`; also usable on any capture where you
+/// know the values that were set, in order.
+pub fn sweep_correlate(
+    session_dir: &Path,
+    values: &[f64],
+    req_type: Option<&str>,
+    field: &str,
+    out_csv: Option<&Path>,
+) -> Result<()> {
+    let cmds = collect_ctrl_session(session_dir, req_type)?;
+    let bursts = group_bursts(&cmds, 500_000_000); // 0.5s gap between transactions
+    let n = values.len();
+    if bursts.len() < n {
+        anyhow::bail!("found only {} bursts for {n} values — widen the gap or check the capture", bursts.len());
+    }
+    let tail = &bursts[bursts.len() - n..]; // the driven sweep is the last N bursts
+
+    // Registers = unique (bRequest, wIndex) across the tail, in first-seen order.
+    let mut regs: Vec<(String, String)> = Vec::new();
+    for r in tail {
+        for c in &cmds[r.clone()] {
+            let key = (c.setup.b_request.clone(), c.setup.w_index.clone());
+            if !regs.contains(&key) {
+                regs.push(key);
+            }
+        }
+    }
+    let byte_of = |c: &CtrlCmd| -> u8 {
+        if field == "data" {
+            c.data.first().copied().unwrap_or(0)
+        } else {
+            wval_lo(c)
+        }
+    };
+
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    // Header
+    write!(w, "{:>14}", "value")?;
+    for (req, idx) in &regs {
+        write!(w, "  {req}@{idx}")?;
+    }
+    writeln!(w)?;
+    // Rows + optional CSV
+    let mut csv = String::from("value");
+    for (req, idx) in &regs {
+        csv += &format!(",{req}@{idx}");
+    }
+    csv.push('\n');
+    for (val, r) in values.iter().zip(tail) {
+        let mut row: std::collections::HashMap<(String, String), u8> = Default::default();
+        for c in &cmds[r.clone()] {
+            row.insert((c.setup.b_request.clone(), c.setup.w_index.clone()), byte_of(c));
+        }
+        write!(w, "{val:>14}")?;
+        csv += &format!("{val}");
+        for reg in &regs {
+            match row.get(reg) {
+                Some(b) => {
+                    write!(w, "  0x{b:02x}    ")?;
+                    csv += &format!(",{b}");
+                }
+                None => {
+                    write!(w, "  --      ")?;
+                    csv += ",";
+                }
+            }
+        }
+        writeln!(w)?;
+        csv.push('\n');
+    }
+    if let Some(p) = out_csv {
+        std::fs::write(p, &csv)?;
+        writeln!(w, "\nwrote {} — feed to `reveng-rec solve {} --var 0 --bytes 1{}`",
+            p.display(), p.display(),
+            (2..=regs.len()).map(|i| format!(",{i}")).collect::<String>())?;
+    }
+    Ok(())
+}
+
+/// Fold the control-write history into a register map: `(bRequest, wIndex) -> (last byte, ts)`,
+/// considering only commands at-or-before `up_to_ts` (`cmds` are in capture = time order). The
+/// "byte" is the low byte of `wValue` (covers both plain OUT register writes and the
+/// obfuscated-IN-carries-the-write style). Folding by timestamp — not the checkpoint's traffic
+/// `event_index`, which USB sessions often leave unset — makes this work on every session.
+fn register_map(cmds: &[CtrlCmd], up_to_ts: i64) -> std::collections::BTreeMap<(String, String), (u8, i64)> {
+    let mut m = std::collections::BTreeMap::new();
+    for c in cmds {
+        if c.ts_ns > up_to_ts {
+            break;
+        }
+        m.insert((c.setup.b_request.clone(), c.setup.w_index.clone()), (wval_lo(c), c.ts_ns));
+    }
+    m
+}
+
+/// A checkpoint's timestamp (ns), the fold cutoff for its register state.
+fn checkpoint_ts(s: &SessionReader, ckpt: u64) -> Result<i64> {
+    Ok(s.checkpoint(ckpt)?.ts_ns)
+}
+
+/// The folded register map `(bRequest, wIndex) -> (last byte, ts)` for a session as of a checkpoint
+/// (or end of session). Shared by `reg-state`/`reg-diff`/`track` and `annotate`.
+pub(crate) fn folded_registers(
+    session_dir: &Path,
+    at_ckpt: Option<u64>,
+    req_type: Option<&str>,
+) -> Result<std::collections::BTreeMap<(String, String), (u8, i64)>> {
+    let s = SessionReader::open(session_dir)?;
+    let cmds = collect_ctrl_session(session_dir, req_type)?;
+    let up_to = match at_ckpt {
+        Some(ck) => checkpoint_ts(&s, ck)?,
+        None => i64::MAX,
+    };
+    Ok(register_map(&cmds, up_to))
+}
+
+/// `reg-state` — the device's register map (last write per `(bRequest,wIndex)`) as of a checkpoint
+/// (or end of session). The semantic device state, reconstructed from the control-write history.
+pub fn reg_state(session_dir: &Path, at_ckpt: Option<u64>, req_type: Option<&str>) -> Result<()> {
+    let m = folded_registers(session_dir, at_ckpt, req_type)?;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    writeln!(w, "register state ({} registers){}:", m.len(),
+        at_ckpt.map(|c| format!(" as of checkpoint {c}")).unwrap_or_default())?;
+    for ((req, idx), (val, ts)) in &m {
+        writeln!(w, "  {req} {idx} = 0x{val:02x}   (last t={:.3}s)", *ts as f64 / 1e9)?;
+    }
+    Ok(())
+}
+
+/// `reg-diff` — registers that changed between two checkpoints (semantic layer above `ctrl-diff`:
+/// "clicking X changed registers A and B", not a wall of raw transfers).
+pub fn reg_diff(session_dir: &Path, a: u64, b: u64, req_type: Option<&str>) -> Result<()> {
+    let ma = folded_registers(session_dir, Some(a), req_type)?;
+    let mb = folded_registers(session_dir, Some(b), req_type)?;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    writeln!(w, "register changes between checkpoint {a} and {b}:")?;
+    let mut keys: Vec<&(String, String)> = ma.keys().chain(mb.keys()).collect();
+    keys.sort();
+    keys.dedup();
+    let mut changes = 0u32;
+    for k in keys {
+        let va = ma.get(k).map(|x| x.0);
+        let vb = mb.get(k).map(|x| x.0);
+        if va != vb {
+            let fmt = |v: Option<u8>| v.map(|x| format!("0x{x:02x}")).unwrap_or_else(|| "--".into());
+            writeln!(w, "  {} {}:  {} -> {}", k.0, k.1, fmt(va), fmt(vb))?;
+            changes += 1;
+        }
+    }
+    writeln!(w, "\n{changes} register(s) changed")?;
+    Ok(())
+}
+
+/// `track` — a value's time-series across the session: a UIA control's value (from `ui/<id>.json`)
+/// or a register's last-written byte at each checkpoint. Replaces per-checkpoint extraction loops.
+pub fn track(session_dir: &Path, ui_name: Option<&str>, reg: Option<&str>, json: bool) -> Result<()> {
+    let s = SessionReader::open(session_dir)?;
+    let checkpoints = s.checkpoints()?;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+
+    let mut emit = |id: u64, ts: i64, val: String| -> Result<()> {
+        if json {
+            writeln!(w, "{}", serde_json::json!({"checkpoint": id, "ts_ns": ts, "value": val}))
+                .map_err(Into::into)
+        } else {
+            writeln!(w, "  ckpt {id:<4} t={:>9.3}s   {val}", ts as f64 / 1e9).map_err(Into::into)
+        }
+    };
+
+    match (ui_name, reg) {
+        (Some(name), _) => {
+            let needle = name.to_lowercase();
+            for c in &checkpoints {
+                let Some(sid) = c.screenshot_id else { continue };
+                let Ok(bytes) = std::fs::read(s.ui_dir().join(format!("{sid:06}.json"))) else {
+                    continue;
+                };
+                let els: Vec<reveng_winui::UiElement> = serde_json::from_slice(&bytes).unwrap_or_default();
+                if let Some(el) = els.iter().find(|e| {
+                    e.name.to_lowercase().contains(&needle)
+                        && (e.range_value.is_some() || e.value.is_some())
+                }) {
+                    let v = el
+                        .range_value
+                        .map(|r| r.to_string())
+                        .or_else(|| el.value.clone())
+                        .unwrap_or_default();
+                    emit(c.id, c.ts_ns, v)?;
+                }
+            }
+        }
+        (None, Some(r)) => {
+            let (req, idx) = r.split_once(':').context("--reg must be REQ:IDX, e.g. 0x40:0x1000")?;
+            let key = (req.trim().to_string(), idx.trim().to_string());
+            let cmds = collect_ctrl_session(session_dir, None)?;
+            for c in &checkpoints {
+                if let Some((val, _)) = register_map(&cmds, c.ts_ns).get(&key) {
+                    emit(c.id, c.ts_ns, format!("0x{val:02x}"))?;
+                }
+            }
+        }
+        (None, None) => anyhow::bail!("give --ui <control-name> or --reg <bRequest:wIndex>"),
+    }
+    Ok(())
+}
+
+/// `verify` — capture-integrity health check for a USB session. Answers "is this capture
+/// complete?" so time isn't wasted chasing missing data that was really a dropped packet.
+/// Reports the endpoint histogram, control SETUP↔completion pairing (unpaired = likely drops),
+/// non-zero statuses, and timestamp ordering. Exits non-zero if integrity problems are found.
+pub fn verify(session_dir: &Path) -> Result<()> {
+    use std::collections::{BTreeMap, HashSet};
+    let s = SessionReader::open(session_dir)?;
+    let out = std::io::stdout();
+    let mut w = out.lock();
+    if !s.usb_pcapng().exists() {
+        writeln!(w, "{}: not a USB session (verify currently covers USB)", session_dir.display())?;
+        return Ok(());
+    }
+    let mut reader = UsbReader::open(s.usb_pcapng(), s.frames_idx())?;
+    let total = reader.len();
+    writeln!(w, "session {} — {total} USB frames", session_dir.display())?;
+    if total == 0 {
+        return Ok(());
+    }
+
+    let xname = |x: u8| match x {
+        0 => "iso",
+        1 => "interrupt",
+        2 => "control",
+        3 => "bulk",
+        _ => "?",
+    };
+    let mut hist: BTreeMap<(u8, u8), (u64, u64)> = BTreeMap::new();
+    let (mut prev_ts, mut backwards) = (i64::MIN, 0u64);
+    let (mut setups, mut completes, mut errs) = (0u64, 0u64, 0u64);
+    let mut pending: HashSet<u64> = HashSet::new();
+    for i in 0..total {
+        let (ep, xf) = (reader.endpoint_at(i)?, reader.xfer_at(i)?);
+        let e = hist.entry((ep, xf)).or_default();
+        e.0 += 1;
+        e.1 += reader.len_at(i)? as u64;
+        let ts = reader.ts_at(i)?;
+        if ts < prev_ts {
+            backwards += 1;
+        }
+        prev_ts = ts;
+        if xf == reveng_usbcap::XFER_CONTROL {
+            let f = reader.frame_at(i)?;
+            match f.stage_raw {
+                Some(CTRL_STAGE_SETUP) => {
+                    setups += 1;
+                    pending.insert(f.irp_id);
+                }
+                Some(CTRL_STAGE_COMPLETE) => {
+                    completes += 1;
+                    pending.remove(&f.irp_id);
+                    if f.status != 0 {
+                        errs += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let unpaired = pending.len() as u64;
+
+    writeln!(w, "\nendpoints  (ep dir xfer  frames  bytes):")?;
+    for ((ep, xf), (cnt, by)) in &hist {
+        let dir = if ep & 0x80 != 0 { "IN " } else { "OUT" };
+        writeln!(w, "  0x{ep:02x} {dir} {:<9} {cnt:>8}  {by}", xname(*xf))?;
+    }
+    writeln!(
+        w,
+        "\ncontrol: {setups} SETUP, {completes} complete, {unpaired} unpaired, {errs} non-zero status"
+    )?;
+    writeln!(w, "timeline: {backwards} out-of-order timestamp(s)")?;
+    writeln!(
+        w,
+        "note: USBPcap buffer-overflow drops aren't recorded in the pcapng; unpaired SETUPs are the\n      best proxy for lost control transfers (and gaps in a bulk stream for lost data)."
+    )?;
+
+    let mut issues = Vec::new();
+    if unpaired > 0 {
+        issues.push(format!(
+            "{unpaired} SETUP(s) with no completion — likely dropped/truncated control transfers"
+        ));
+    }
+    if backwards > 0 {
+        issues.push(format!("{backwards} frame(s) earlier than the previous — ordering/clock anomaly"));
+    }
+    writeln!(w)?;
+    if issues.is_empty() {
+        writeln!(w, "OK — no capture-integrity problems detected.")?;
+        if errs > 0 {
+            writeln!(w, "({errs} control transfer(s) returned a non-zero status — may be normal, e.g. capability probes.)")?;
+        }
+    } else {
+        for it in &issues {
+            writeln!(w, "⚠ {it}")?;
+        }
+        drop(w);
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Per-screenshot capture geometry, read back from `screenshots.ndjson`.
+struct ShotGeom {
+    origin_x: i32,
+    origin_y: i32,
+    cursor_x: i32,
+    cursor_y: i32,
+}
+
+/// Load `screenshots.ndjson` into a map: screenshot id → capture geometry.
+fn load_shot_geom(session: &SessionReader) -> HashMap<u64, ShotGeom> {
+    let mut out = HashMap::new();
+    let Ok(text) = std::fs::read_to_string(session.screenshots_meta()) else {
+        return out;
+    };
+    for line in text.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let get = |k: &str| v.get(k).and_then(|x| x.as_i64());
+        if let Some(id) = v.get("id").and_then(|x| x.as_u64()) {
+            out.insert(
+                id,
+                ShotGeom {
+                    origin_x: get("origin_x").unwrap_or(0) as i32,
+                    origin_y: get("origin_y").unwrap_or(0) as i32,
+                    cursor_x: get("cursor_x").unwrap_or(0) as i32,
+                    cursor_y: get("cursor_y").unwrap_or(0) as i32,
+                },
+            );
+        }
+    }
+    out
+}
+
+/// `ocr` — recognize on-screen text (Windows.Media.Ocr) in one or all screenshots, and emit each
+/// word with its pixel box, ordered by distance to the cursor at capture time. Results are cached
+/// under `ocr/<id>.json` so re-analysis of a large session is instant.
+///
+/// The cursor→pixel mapping uses `screenshots.ndjson` geometry (cursor − capture origin); for
+/// older sessions without it, the checkpoint cursor is used with a zero origin.
+pub fn ocr(
+    session_dir: &Path,
+    target: Option<u64>,
+    all: bool,
+    json: bool,
+    refresh: bool,
+) -> Result<()> {
+    let s = SessionReader::open(session_dir)?;
+    let shots_dir = s.screenshots_dir();
+    let geom = load_shot_geom(&s);
+
+    // Which screenshots to process.
+    let ids: Vec<u64> = if all {
+        let mut v: Vec<u64> = std::fs::read_dir(&shots_dir)
+            .with_context(|| format!("no screenshots dir at {}", shots_dir.display()))?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    } else {
+        vec![target.context("give a screenshot id, or --all")?]
+    };
+
+    std::fs::create_dir_all(s.ocr_dir()).ok();
+    let out = std::io::stdout();
+    let mut w = out.lock();
+
+    for id in ids {
+        // Cursor position in image pixels (word distances are measured from here).
+        let (cursor_px, cursor_py) = match geom.get(&id) {
+            Some(g) => (g.cursor_x - g.origin_x, g.cursor_y - g.origin_y),
+            None => s
+                .checkpoint(id)
+                .ok()
+                .map(|c| c.cursor)
+                .unwrap_or((0, 0)),
+        };
+
+        // Cache: ocr/<id>.json. Reuse unless --refresh.
+        let cache = s.ocr_dir().join(format!("{id:06}.json"));
+        let result: reveng_winocr::Ocr = if !refresh && cache.exists() {
+            serde_json::from_slice(&std::fs::read(&cache)?)?
+        } else {
+            let png_path = shots_dir.join(format!("{id:06}.png"));
+            let png = std::fs::read(&png_path)
+                .with_context(|| format!("no screenshot {}", png_path.display()))?;
+            let r = reveng_winocr::ocr_png(&png)
+                .with_context(|| format!("OCR of screenshot {id} failed"))?;
+            let _ = std::fs::write(&cache, serde_json::to_vec(&r)?);
+            r
+        };
+
+        // Order words by distance from their center to the cursor.
+        let dist = |wd: &reveng_winocr::Word| -> f64 {
+            let (cx, cy) = wd.center();
+            (((cx - cursor_px as f32).powi(2) + (cy - cursor_py as f32).powi(2)) as f64).sqrt()
+        };
+        let mut words = result.words.clone();
+        words.sort_by(|a, b| dist(a).total_cmp(&dist(b)));
+
+        if json {
+            let arr: Vec<serde_json::Value> = words
+                .iter()
+                .map(|wd| {
+                    serde_json::json!({
+                        "text": wd.text,
+                        "x": wd.x, "y": wd.y, "w": wd.w, "h": wd.h,
+                        "dist": dist(wd).round(),
+                    })
+                })
+                .collect();
+            let line = serde_json::json!({
+                "id": id,
+                "cursor_px": [cursor_px, cursor_py],
+                "n_words": words.len(),
+                "words": arr,
+            });
+            writeln!(w, "{line}")?;
+        } else {
+            writeln!(
+                w,
+                "# screenshot {id} — {} words, cursor at pixel ({cursor_px},{cursor_py})",
+                words.len()
+            )?;
+            for wd in &words {
+                writeln!(
+                    w,
+                    "  d={:>5}  ({:>4},{:>4}) {:>3}x{:<3}  {:?}",
+                    dist(wd).round() as i64,
+                    wd.x.round() as i64,
+                    wd.y.round() as i64,
+                    wd.w.round() as i64,
+                    wd.h.round() as i64,
+                    wd.text,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `ui` — read the UI-Automation widget snapshot captured at a checkpoint: typed controls
+/// (Button/CheckBox/RadioButton/Slider/Edit/ComboBox…) with their screen rects and live
+/// state/value, ordered by distance to the cursor. This is the structured screen-side oracle:
+/// it names exactly which widget a click hit and what its value was (e.g. an exposure slider's
+/// number), so a UI change can be correlated with the wire bytes at the same checkpoint.
+pub fn ui(
+    session_dir: &Path,
+    target: Option<u64>,
+    all: bool,
+    json: bool,
+    interactive_only: bool,
+) -> Result<()> {
+    let s = SessionReader::open(session_dir)?;
+    let ui_dir = s.ui_dir();
+    let geom = load_shot_geom(&s);
+
+    let ids: Vec<u64> = if all {
+        let mut v: Vec<u64> = std::fs::read_dir(&ui_dir)
+            .with_context(|| format!("no UI snapshots at {}", ui_dir.display()))?
+            .filter_map(|e| e.ok())
+            .filter_map(|e| {
+                e.path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .and_then(|s| s.parse::<u64>().ok())
+            })
+            .collect();
+        v.sort_unstable();
+        v
+    } else {
+        vec![target.context("give a checkpoint id, or --all")?]
+    };
+
+    let out = std::io::stdout();
+    let mut w = out.lock();
+
+    for id in ids {
+        let path = ui_dir.join(format!("{id:06}.json"));
+        let Ok(bytes) = std::fs::read(&path) else {
+            if !all {
+                anyhow::bail!("no UI snapshot for checkpoint {id} at {}", path.display());
+            }
+            continue;
+        };
+        let mut els: Vec<reveng_winui::UiElement> = serde_json::from_slice(&bytes)?;
+
+        // Cursor in absolute screen coords (UIA rects are absolute too, so distance is direct).
+        let (cx, cy) = match geom.get(&id) {
+            Some(g) => (g.cursor_x, g.cursor_y),
+            None => s.checkpoint(id).ok().map(|c| c.cursor).unwrap_or((0, 0)),
+        };
+        let dist = |e: &reveng_winui::UiElement| -> f64 {
+            let (ex, ey) = ((e.x + e.w / 2) as f64, (e.y + e.h / 2) as f64);
+            ((ex - cx as f64).powi(2) + (ey - cy as f64).powi(2)).sqrt()
+        };
+        if interactive_only {
+            els.retain(|e| e.is_interactive());
+        }
+        els.sort_by(|a, b| dist(a).total_cmp(&dist(b)));
+
+        if json {
+            for e in &els {
+                let mut v = serde_json::to_value(e)?;
+                v["dist"] = serde_json::json!(dist(e).round());
+                v["checkpoint"] = serde_json::json!(id);
+                writeln!(w, "{v}")?;
+            }
+        } else {
+            writeln!(
+                w,
+                "# checkpoint {id} — {} controls, cursor at screen ({cx},{cy})",
+                els.len()
+            )?;
+            for e in &els {
+                let mut state = String::new();
+                if let Some(t) = &e.toggle {
+                    state += &format!(" toggle={t}");
+                }
+                if let Some(sel) = e.selected {
+                    state += &format!(" selected={sel}");
+                }
+                if let Some(val) = &e.value {
+                    state += &format!(" value={val:?}");
+                }
+                if let Some(rv) = e.range_value {
+                    state += &format!(" range={rv}");
+                }
+                writeln!(
+                    w,
+                    "  d={:>5}  {:<11} {:<26}{}",
+                    dist(e).round() as i64,
+                    e.role,
+                    truncate_label(&e.name, 26),
+                    state,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn truncate_label(s: &str, n: usize) -> String {
+    if s.chars().count() <= n {
+        s.to_string()
+    } else {
+        format!("{}…", s.chars().take(n - 1).collect::<String>())
+    }
 }
 
 /// `stream` — reassembled logical messages on an endpoint (USB, DESIGN.md §8b). Without
@@ -478,7 +1422,7 @@ pub fn stream(session_dir: &Path, ep: Option<u8>, logical: bool, text: bool) -> 
     }
     // Non-logical, or non-USB: just the filtered frames.
     if !logical || matches!(log, Log::Pcie(_)) {
-        return frames(session_dir, None, 0, Some(&format!("0:{}", total - 1)), ep);
+        return frames(session_dir, None, 0, Some(&format!("0:{}", total - 1)), ep, PayloadFmt::Json);
     }
 
     // Logical reassembly (USB): concatenate consecutive frames sharing (endpoint, dir)
@@ -627,7 +1571,7 @@ pub fn diff(session_dir: &Path, a: u64, b: u64) -> Result<()> {
     let ia = ca.anchor.map(|x| x.event_index).context("checkpoint a has no anchor")?;
     let ib = cb.anchor.map(|x| x.event_index).context("checkpoint b has no anchor")?;
     let (lo, hi) = if ia <= ib { (ia, ib) } else { (ib, ia) };
-    frames(session_dir, None, 0, Some(&format!("{lo}:{hi}")), None)
+    frames(session_dir, None, 0, Some(&format!("{lo}:{hi}")), None, PayloadFmt::Json)
 }
 
 /// `grep` — USB: frames whose payload contains a hex byte pattern; PCIe: events whose

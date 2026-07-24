@@ -16,6 +16,44 @@ use std::path::PathBuf;
 struct Cli {
     /// Session directory to open.
     session: PathBuf,
+    /// Overlay a UIA control's value across the timeline (e.g. "Exposure Time"), read from
+    /// each checkpoint's `ui/<id>.json` — the semantic value curve alongside traffic density.
+    #[arg(long)]
+    track: Option<String>,
+}
+
+/// Paint a value-track sparkline: one point per checkpoint (evenly spaced to match the tick row),
+/// normalized 0..1, joined by lines; gaps (`None`) break the line. No-op for an all-empty track.
+fn draw_value_track(ui: &mut egui::Ui, track: &[Option<f32>], h: f32, label: &str) {
+    if track.iter().all(|v| v.is_none()) {
+        return;
+    }
+    let (rect, _) = ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+    let n = track.len().max(1);
+    let x_of = |i: usize| rect.left() + (i as f32 + 0.5) * rect.width() / n as f32;
+    let y_of = |v: f32| rect.bottom() - v.clamp(0.0, 1.0) * (h - 4.0) - 2.0;
+    let color = egui::Color32::from_rgb(240, 200, 90);
+    let mut prev: Option<egui::Pos2> = None;
+    for (i, v) in track.iter().enumerate() {
+        match v {
+            Some(v) => {
+                let p = egui::pos2(x_of(i), y_of(*v));
+                if let Some(pp) = prev {
+                    ui.painter().line_segment([pp, p], egui::Stroke::new(1.5, color));
+                }
+                ui.painter().circle_filled(p, 2.0, color);
+                prev = Some(p);
+            }
+            None => prev = None,
+        }
+    }
+    ui.painter().text(
+        rect.left_top() + egui::vec2(2.0, 0.0),
+        egui::Align2::LEFT_TOP,
+        label,
+        egui::FontId::proportional(10.0),
+        color,
+    );
 }
 
 /// Paint one traffic-density strip: a full-width histogram, bar height + colour intensity ∝
@@ -50,7 +88,7 @@ fn main() -> anyhow::Result<()> {
     eframe::run_native(
         "reveng-viewer",
         options,
-        Box::new(|_cc| Ok(Box::new(App::new(model)))),
+        Box::new(move |_cc| Ok(Box::new(App::new(model, cli.track)))),
     )
     .map_err(|e| anyhow::anyhow!("viewer failed: {e}"))
 }
@@ -67,11 +105,18 @@ struct App {
     /// `density` = primary source; `density_pcie` = co-logged PCIe (empty if none).
     density: Vec<u32>,
     density_pcie: Vec<u32>,
+    /// Optional UIA value track (`--track`): one normalized value per checkpoint, and its label.
+    track: Vec<Option<f32>>,
+    track_label: String,
 }
 
 impl App {
-    fn new(mut model: SessionModel) -> Self {
+    fn new(mut model: SessionModel, track_control: Option<String>) -> Self {
         let (density, density_pcie) = model.traffic_density_split(120);
+        let (track, track_label) = match &track_control {
+            Some(name) => (model::normalize_track(&model.value_track(name)), name.clone()),
+            None => (Vec::new(), String::new()),
+        };
         Self {
             model,
             sel: 0,
@@ -82,6 +127,8 @@ impl App {
             loaded_for: None,
             density,
             density_pcie,
+            track,
+            track_label,
         }
     }
 
@@ -146,6 +193,10 @@ impl eframe::App for App {
             // same time axis.
             draw_density_strip(ui, &self.density, 18.0, |s| egui::Color32::from_rgb(40, s, s));
             draw_density_strip(ui, &self.density_pcie, 12.0, |s| egui::Color32::from_rgb(s, 40, s));
+            // Value track (`--track`): the semantic value curve on the same axis as the ticks.
+            if !self.track.is_empty() {
+                draw_value_track(ui, &self.track, 28.0, &self.track_label);
+            }
             ui.add_space(2.0);
             egui::ScrollArea::horizontal().show(ui, |ui| {
                 ui.horizontal(|ui| {

@@ -43,6 +43,23 @@ impl SessionWriter {
     pub fn screenshots_dir(&self) -> PathBuf {
         self.root.join("screenshots")
     }
+    /// Per-screenshot spatial metadata log (one JSON line per PNG: id, capture rect, cursor,
+    /// monitor, DPI). Lets later analysis map cursor / OCR boxes to pixels.
+    pub fn screenshots_meta(&self) -> PathBuf {
+        self.root.join("screenshots.ndjson")
+    }
+    /// Monitor layout captured at session start (`enumerate_displays`).
+    pub fn displays_json(&self) -> PathBuf {
+        self.root.join("displays.json")
+    }
+    /// OCR result cache: `ocr/<id:06>.json` per screenshot.
+    pub fn ocr_dir(&self) -> PathBuf {
+        self.root.join("ocr")
+    }
+    /// UI-Automation widget-tree snapshots: `ui/<id:06>.json` per checkpoint.
+    pub fn ui_dir(&self) -> PathBuf {
+        self.root.join("ui")
+    }
     /// Directory holding process-memory snapshots (`memsnaps/<id:06>/`), created on first use.
     pub fn memsnaps_dir(&self) -> PathBuf {
         self.root.join("memsnaps")
@@ -112,6 +129,21 @@ impl SessionReader {
     /// Directory holding process-memory snapshots (`memsnaps/<id:06>/`).
     pub fn memsnaps_dir(&self) -> PathBuf {
         self.root.join("memsnaps")
+    }
+    pub fn screenshots_dir(&self) -> PathBuf {
+        self.root.join("screenshots")
+    }
+    pub fn screenshots_meta(&self) -> PathBuf {
+        self.root.join("screenshots.ndjson")
+    }
+    pub fn displays_json(&self) -> PathBuf {
+        self.root.join("displays.json")
+    }
+    pub fn ocr_dir(&self) -> PathBuf {
+        self.root.join("ocr")
+    }
+    pub fn ui_dir(&self) -> PathBuf {
+        self.root.join("ui")
     }
 
     pub fn meta(&self) -> anyhow::Result<serde_json::Value> {

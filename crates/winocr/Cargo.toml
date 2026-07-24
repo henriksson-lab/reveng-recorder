@@ -1,0 +1,23 @@
+[package]
+name = "reveng-winocr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "On-device OCR of screenshots via the built-in Windows.Media.Ocr engine (no install, no network)."
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+
+[target."cfg(windows)".dependencies]
+# Blocking `.get()` on WinRT async ops lives here and needs its `std` feature.
+windows-future = { version = "0.3", features = ["std"] }
+windows = { version = "0.62.2", features = [
+    "Media_Ocr",
+    "Graphics_Imaging",
+    "Storage_Streams",
+    "Foundation",
+    "Foundation_Collections",
+    "Globalization",
+    "Win32_System_Com",
+] }

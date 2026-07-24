@@ -6,6 +6,8 @@ members = [
     "crates/pcicap",
     "crates/winput",
     "crates/winshot",
+    "crates/winocr",
+    "crates/winui",
     "crates/memcap",
     "crates/export",
     "crates/recorder",
@@ -28,5 +30,7 @@ reveng-usbcap = { path = "crates/usbcap" }
 reveng-pcicap = { path = "crates/pcicap" }
 reveng-winput = { path = "crates/winput" }
 reveng-winshot = { path = "crates/winshot" }
+reveng-winocr = { path = "crates/winocr" }
+reveng-winui = { path = "crates/winui" }
 reveng-memcap = { path = "crates/memcap" }
 reveng-export = { path = "crates/export" }
