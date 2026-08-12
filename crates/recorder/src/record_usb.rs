@@ -1,14 +1,19 @@
 //! Live USB recording orchestration (DESIGN.md §3 thread model, §6, §7).
 //!
-//! Wires the four moving parts around the checkpoint engine:
-//! - a **reader thread** draining `USBPcapCMD` into `usb.pcapng` + `frames.idx`, bumping a
-//!   shared traffic counter (must never block — §3);
-//! - the **input hooks** (`winput`) feeding events over a channel;
-//! - a **screenshot worker** (`winshot`) grabbing PNGs off the hot path with burst
-//!   coalescing (§6);
+//! Wires the moving parts around the checkpoint engine:
+//! - one or more **reader threads** draining a [`CaptureSource`] into the shared
+//!   `usb.pcapng` + `frames.idx`, bumping a traffic counter (must never block — §3). The
+//!   source is either the USBPcap driver (whole transfers) or a Cynthion analyzer (raw wire
+//!   packets); see [`UsbBackend`], and §4.1 for what differs downstream;
 //! - the **engine**, which turns clicks / special keys / traffic-interval ticks into
 //!   checkpoints anchored to the nearest preceding frame, then finalizes the session by
 //!   injecting checkpoint comments into the pcapng (§4).
+//!
+//! Two more parts run only when the target is *this* machine — the **input hooks**
+//! (`winput`) feeding events over a channel, and the **screenshot worker** (`winshot`)
+//! grabbing PNGs off the hot path with burst coalescing (§6). Both are absent under
+//! [`UsbRecordOpts::traffic_only`], which exists because a hardware analyzer usually watches
+//! a bus belonging to some other computer (§4.4).
 
 use crate::record::RecordSummary;
 use anyhow::Result;
@@ -19,13 +24,52 @@ use reveng_core::index::IndexFile;
 use reveng_core::session::{SessionRecord, SessionWriter};
 use reveng_core::source::CaptureSource;
 use reveng_pcicap::PcieLog;
-use reveng_usbcap::{Killer, UsbCaptureSource, UsbIdxRecord, UsbSelection, UsbWriter};
+use reveng_usbcap::wire::PacketKind as WireKind;
+use reveng_usbcap::{UsbCaptureSource, UsbIdxRecord, UsbSelection, UsbWriter};
 use reveng_winput::{InputEvent, InputKind};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// A screenshot request: `(checkpoint id, ts_ns, capture scope, cursor position)`. Sent from
+/// the engine to the `winshot` worker so the grab happens off the hot path.
+type ShotRequest = (u64, i64, reveng_winshot::Scope, (i32, i32));
+
+/// Which USB capture backend this session records with.
+///
+/// Mutually exclusive by construction, which also settles a hazard the design worried about:
+/// a USBPcap source and a Cynthion source watching the same device would both report its
+/// traffic into the one `usb.pcapng`, at two different abstraction levels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UsbBackend {
+    /// The Windows USBPcap kernel driver: whole transfers, needs Administrator.
+    UsbPcap,
+    /// A Cynthion hardware analyzer: raw wire packets, no kernel driver, any OS.
+    Cynthion { speed: reveng_cynthion::Speed },
+}
+
+impl UsbBackend {
+    pub fn name(self) -> &'static str {
+        match self {
+            UsbBackend::UsbPcap => "usbpcap",
+            UsbBackend::Cynthion { .. } => "cynthion",
+        }
+    }
+
+    /// Only the USBPcap driver needs elevation; the analyzer is opened as a plain USB device.
+    pub fn needs_admin(self) -> bool {
+        matches!(self, UsbBackend::UsbPcap)
+    }
+
+    fn capture_format(self) -> reveng_usbcap::CaptureFormat {
+        match self {
+            UsbBackend::UsbPcap => reveng_usbcap::CaptureFormat::UsbPcap,
+            UsbBackend::Cynthion { .. } => reveng_usbcap::CaptureFormat::Wire,
+        }
+    }
+}
 
 /// When to grab a screenshot.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -36,12 +80,33 @@ pub enum ScreenshotWhen {
     None,
 }
 
+/// Sentinel file inside a session directory that asks a running capture to stop.
+/// A file rather than a signal or socket: it works from any process, needs no
+/// handle to the recorder, survives elevation boundaries, and is trivially
+/// inspectable when a run ends unexpectedly.
+pub const STOP_FILE: &str = ".stop";
+
 pub struct UsbRecordOpts {
     /// One capture per USBPcap control device (root hub) to record in parallel — each gets
     /// its own reader thread folding frames into the one `usb.pcapng` on the shared clock.
-    /// Empty = no capture at all: the pipeline still records input + screenshots + notes and
-    /// shows the window, so the UI runs with no USB device / no USBPcap / no admin.
+    ///
+    /// **Empty means "no traffic capture"**, and the run still produces a session from
+    /// whatever else is enabled — notes always, plus input and screenshots unless
+    /// [`Self::traffic_only`] is set. That is how the UI runs with no device, no USBPcap and
+    /// no admin.
+    ///
+    /// For [`UsbBackend::Cynthion`] there is nothing to select — the analyzer records
+    /// whatever is physically routed through it — so the list holds one placeholder entry
+    /// purely to mean "capture is on".
     pub selections: Vec<UsbSelection>,
+    /// Which capture backend to open. Decides the source, the pcapng link type, and how the
+    /// reader thread must interpret each packet — a USBPcap header parse over a wire packet
+    /// reads the PID and CRC as an endpoint and a length, and quietly produces nonsense.
+    pub backend: UsbBackend,
+    /// Keep Start-of-Frame packets in a wire capture. SOF carries no data and, at high speed,
+    /// arrives every 125 µs — it would dominate a capture's volume. Dropped by default (and
+    /// counted, so the reduction is visible); keep them for bus-timing work.
+    pub keep_sof: bool,
     pub cfg: CheckpointConfig,
     pub screenshot_on: ScreenshotWhen,
     pub screenshot_on_keys: bool,
@@ -55,6 +120,23 @@ pub struct UsbRecordOpts {
     /// Run without the Slint recording window (unattended automation). Orthogonal to
     /// `max_duration`. `false` = show the window (the default interactive experience).
     pub headless: bool,
+    /// **Remote-target mode**: record bus traffic and notes only — no input hooks, no
+    /// screenshots, no UI-Automation/OCR.
+    ///
+    /// With a hardware analyzer the capture host is usually *not* the machine being driven,
+    /// so the host-side correlation features would faithfully record the operator's own
+    /// desktop instead of the target's. Worse, they would do it while looking like they were
+    /// capturing the target.
+    ///
+    /// Notes stay. On a past camera bring-up they were the single most valuable correlation
+    /// signal ("usb is in", "starting software", "inserting the tray"), and they matter more
+    /// here, not less: when the operator is driving a second machine, nothing else on this
+    /// host knows what is happening over there.
+    ///
+    /// This also shrinks what the tool *is*: with input and screen capture off it is a
+    /// traffic sniffer and nothing else, and the consent banner says so rather than being
+    /// suppressed.
+    pub traffic_only: bool,
     /// Driver snaplen in bytes (`0` = unlimited default). Truncates big transfers in the kernel.
     pub snaplen: u32,
     /// Driver kernel buffer size in bytes (`0` = default).
@@ -68,6 +150,12 @@ pub struct UsbRecordOpts {
     /// Abort early if no new USB frame arrives for this long — kills the "0 frames after the full
     /// timer" waste when the device wasn't actually streaming. `None` = wait for the real stop.
     pub abort_if_idle: Option<Duration>,
+    /// Stop cleanly when this file appears. The out-of-band stop: a caller that
+    /// cannot press the hotkey (a script, another process, an agent driving the
+    /// bench) creates it with `reveng-rec stop <session>` when the interesting
+    /// part is over, instead of guessing a `--max-seconds` up front and either
+    /// truncating the run or waiting out a timer. `None` = no file watch.
+    pub stop_file: Option<std::path::PathBuf>,
     /// Stop once this many USB frames have been captured (a bounded, traffic-driven run). `None` = no cap.
     pub stop_after_frames: Option<u64>,
     /// Arm manual process-memory snapshots against this PID (the decoded-form oracle). The
@@ -222,7 +310,11 @@ struct TrafficState {
 
 struct UsbReaderGuard {
     stop: Arc<AtomicBool>,
-    killers: Vec<Killer>,
+    /// Out-of-band stop handles, one per source. `CaptureSource` has no cancellation
+    /// method, so a source parked in a blocking `next()` can only be unblocked from
+    /// outside — without these, finalize hangs. Boxed rather than `Killer` so any
+    /// backend can supply its own (the PCIe path already does exactly this).
+    killers: Vec<Box<dyn Fn() + Send + Sync>>,
     readers: Vec<std::thread::JoinHandle<Result<()>>>,
 }
 
@@ -238,7 +330,7 @@ impl UsbReaderGuard {
     fn stop_and_join(&mut self, state: &Arc<Mutex<TrafficState>>) {
         self.stop.store(true, Ordering::Relaxed);
         for killer in &self.killers {
-            killer.kill();
+            killer();
         }
         for reader in self.readers.drain(..) {
             if reader.join().is_err() {
@@ -253,7 +345,7 @@ impl Drop for UsbReaderGuard {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         for killer in &self.killers {
-            killer.kill();
+            killer();
         }
         for reader in self.readers.drain(..) {
             let _ = reader.join();
@@ -271,7 +363,11 @@ impl PcieReaderGuard {
         if let Some(stop) = self.stop.take() {
             stop();
         }
-        if self.reader.take().is_some_and(|reader| reader.join().is_err()) {
+        if self
+            .reader
+            .take()
+            .is_some_and(|reader| reader.join().is_err())
+        {
             record_reader_error(state, "PCIe reader thread panicked".into());
         }
     }
@@ -291,10 +387,16 @@ impl Drop for PcieReaderGuard {
 pub fn run_usb_capture(
     clock: Clock,
     out: &Path,
-    opts: UsbRecordOpts,
+    mut opts: UsbRecordOpts,
     ui: Option<NotesUi>,
     pcie: Option<PcieCapture>,
 ) -> Result<RecordSummary> {
+    // Every session is stoppable out-of-band by default: `reveng-rec stop <session>`
+    // drops this file in, and the poll loop finalizes cleanly. Placed here rather
+    // than in the option builder because only this layer knows the session path.
+    if opts.stop_file.is_none() {
+        opts.stop_file = Some(out.join(STOP_FILE));
+    }
     // The clock is created by the caller so the notes window shares this exact origin.
     let (note_rx, snap_rx, ui_stop, stats) = match ui {
         Some(u) => (Some(u.note_rx), u.snap_rx, Some(u.stop_flag), Some(u.stats)),
@@ -307,10 +409,10 @@ pub fn run_usb_capture(
     let state = Arc::new(Mutex::new(TrafficState::default()));
     let reader_stop = Arc::new(AtomicBool::new(false));
 
-    // --- readers: one per selected control device (root hub), captured in parallel and
-    // folded into the single shared `usb.pcapng`/`frames.idx`. Start them up front so
-    // spawn/open errors surface here. Empty `selections` = no capture at all (the window
-    // still runs: input + screenshots + notes only, no USB source, no admin needed).
+    // --- readers: one per USBPcap control device (root hub) captured in parallel, or the
+    // single Cynthion source, all folded into the shared `usb.pcapng`/`frames.idx`. Start
+    // them up front so open errors surface here. Empty `selections` = no capture at all; the
+    // window still runs on whatever else is enabled, needing no device and no admin.
     let mut usb_threads = UsbReaderGuard::new(reader_stop.clone());
 
     // Start each selected control device, skipping (not aborting on) any that fail — one hub
@@ -320,50 +422,107 @@ pub fn run_usb_capture(
         drop_transfers: opts.drop_transfers.clone(),
         endpoints: opts.endpoints.clone(),
     };
-    let mut sources = Vec::new();
-    for selection in &opts.selections {
-        let mut source = UsbCaptureSource::new(selection.clone(), clock.clone());
-        source.set_capture_opts(opts.snaplen, opts.buffer);
-        match source.start() {
-            Ok(()) => sources.push(source),
-            Err(e) => eprintln!(
-                "usb capture skipped for {}: {e}",
-                selection.usbpcap_device.as_deref().unwrap_or("?")
-            ),
+    // Started sources paired with their out-of-band stop handle. Boxed as
+    // `CaptureSource` so a second USB backend (a hardware sniffer) can be mixed in
+    // here without touching the reader thread, the writer, or anything downstream.
+    let mut sources: Vec<(Box<dyn CaptureSource + Send>, Box<dyn Fn() + Send + Sync>)> = Vec::new();
+    match opts.backend {
+        UsbBackend::UsbPcap => {
+            for selection in &opts.selections {
+                let mut source = UsbCaptureSource::new(selection.clone(), clock.clone());
+                source.set_capture_opts(opts.snaplen, opts.buffer);
+                match source.start() {
+                    Ok(()) => {
+                        let killer = source.killer();
+                        sources.push((Box::new(source), Box::new(move || killer.kill())));
+                    }
+                    Err(e) => eprintln!(
+                        "usb capture skipped for {}: {e}",
+                        selection.usbpcap_device.as_deref().unwrap_or("?")
+                    ),
+                }
+            }
+        }
+        // One analyzer taps one bus, so there is exactly one source — no per-hub selection,
+        // and `--device-*` has nothing to act on.
+        UsbBackend::Cynthion { speed } => {
+            if !opts.selections.is_empty() {
+                let mut source = reveng_cynthion::CynthionSource::new(clock.clone(), speed);
+                // Bus events have no place in a USB 2.0 pcapng, so they go beside it. Without
+                // this the capture keeps no record of a bus reset, a speed change, or the
+                // analyzer overflowing — and cannot tell an idle bus from a mis-sampled one.
+                let sidecar = reveng_cynthion::events::sidecar_path(&session.usb_pcapng());
+                if let Err(e) = source.log_events_to(&sidecar) {
+                    eprintln!("bus-event sidecar disabled: {e}");
+                }
+                match source.start() {
+                    Ok(()) => {
+                        let stopper = source.stopper();
+                        sources.push((Box::new(source), Box::new(move || stopper.stop())));
+                    }
+                    Err(e) => eprintln!("cynthion capture failed to start: {e}"),
+                }
+            }
         }
     }
     let writer = if sources.is_empty() {
         None
     } else {
-        let w = UsbWriter::create(session.usb_pcapng(), session.frames_idx())?;
+        // The link type is how the session records which backend wrote it — and, for a wire
+        // capture, the speed it was sampled at, which nothing in the packet bytes recovers.
+        let w = match opts.backend {
+            UsbBackend::UsbPcap => UsbWriter::create(session.usb_pcapng(), session.frames_idx())?,
+            UsbBackend::Cynthion { speed } => UsbWriter::create_wire(
+                session.usb_pcapng(),
+                session.frames_idx(),
+                speed.link_type(),
+            )?,
+        };
         Some(Arc::new(Mutex::new(w)))
     };
     if let Some(writer) = &writer {
         state.lock().unwrap().active_sources = sources.len();
-        for (i, source) in sources.into_iter().enumerate() {
-            usb_threads.killers.push(source.killer());
+        for (i, (source, killer)) in sources.into_iter().enumerate() {
+            usb_threads.killers.push(killer);
             let writer = writer.clone();
             let state = state.clone();
             let reader_stop = reader_stop.clone();
             let stats = stats.clone();
             let filter = filter.clone();
+            let format = opts.backend.capture_format();
+            let keep_sof = opts.keep_sof;
             usb_threads.readers.push(
                 std::thread::Builder::new()
                     .name(format!("usbcap-reader-{i}"))
-                    .spawn(move || reader_loop(source, writer, state, reader_stop, stats, filter))?,
+                    .spawn(move || {
+                        reader_loop(
+                            source,
+                            writer,
+                            state,
+                            reader_stop,
+                            stats,
+                            filter,
+                            format,
+                            keep_sof,
+                        )
+                    })?,
             );
         }
     }
 
     // --- monitor layout: logged once at session start, so screenshot coordinates are
     //     interpretable later (which monitor, what bounds, DPI/scaling). ---
-    match reveng_winshot::enumerate_displays() {
-        Ok(displays) => {
-            if let Ok(json) = serde_json::to_string_pretty(&displays) {
-                let _ = std::fs::write(session.displays_json(), json);
+    //     Skipped in --traffic-only: there are no screenshots to interpret, and enumerating
+    //     this host's displays would only describe the wrong machine.
+    if !opts.traffic_only {
+        match reveng_winshot::enumerate_displays() {
+            Ok(displays) => {
+                if let Ok(json) = serde_json::to_string_pretty(&displays) {
+                    let _ = std::fs::write(session.displays_json(), json);
+                }
             }
+            Err(e) => eprintln!("display enumeration failed: {e}"),
         }
-        Err(e) => eprintln!("display enumeration failed: {e}"),
     }
 
     // --- screenshot + UI-Automation worker ---
@@ -371,11 +530,24 @@ pub fn run_usb_capture(
     // capture geometry to `screenshots.ndjson` (the spatial index), and (2) snapshots the
     // UI-Automation widget tree of the clicked window to `ui/<id>.json` (typed controls +
     // rects + live states/values — the structured screen-side oracle).
+    // Not spawned in --traffic-only, which also disposes of the UI-Automation/OCR snapshot
+    // it performs: both describe *this* host's screen, which in remote-target mode is not
+    // the machine under test.
     let shots_meta_path = session.screenshots_meta();
     let ui_dir = session.ui_dir();
-    let _ = std::fs::create_dir_all(&ui_dir);
-    let (shot_tx, shot_rx) =
-        std::sync::mpsc::channel::<(u64, i64, reveng_winshot::Scope, (i32, i32))>();
+    let (shot_tx, shot_rx) = std::sync::mpsc::channel::<ShotRequest>();
+    // `drop` explicitly: shadowing the binding would leave the original Sender alive to the
+    // end of the function, so `shot_rx.recv()` would never return and the join below would
+    // hang forever.
+    let shot_tx = if opts.traffic_only {
+        drop(shot_tx);
+        None
+    } else {
+        Some(shot_tx)
+    };
+    if !opts.traffic_only {
+        let _ = std::fs::create_dir_all(&ui_dir);
+    }
     let shot_worker = std::thread::Builder::new()
         .name("winshot-worker".into())
         .spawn(move || {
@@ -458,10 +630,19 @@ pub fn run_usb_capture(
     let mut mem_next_id: u64 = 0;
 
     // --- input hooks ---
+    // Not installed in --traffic-only. This is the difference between "a traffic sniffer"
+    // and "a keylogger that also sniffs traffic", so it is a real absence, not a filter
+    // applied after capture: with the capture host separate from the target, every keystroke
+    // the hooks would see belongs to the operator, not to the experiment.
     let (in_tx, in_rx) = std::sync::mpsc::channel::<InputEvent>();
-    let hooks = reveng_winput::install(clock.clone(), move |ev| {
-        let _ = in_tx.send(ev);
-    })?;
+    let hooks = if opts.traffic_only {
+        drop(in_tx);
+        None
+    } else {
+        Some(reveng_winput::install(clock.clone(), move |ev| {
+            let _ = in_tx.send(ev);
+        })?)
+    };
 
     // --- concurrent PCIe capture (--with-pcie): its own reader thread writing pcie.bin, plus
     //     a shared latest-event cell so each checkpoint anchors to the nearest preceding PCIe
@@ -469,7 +650,9 @@ pub fn run_usb_capture(
     let mut pcie_meta: Option<serde_json::Value> = None;
     let (pcie_state, mut pcie_thread) = if let Some(pcie) = pcie {
         // trace_mmio/dma toggles are held by the source + window; not needed here.
-        let PcieCapture { source, stop, meta, .. } = pcie;
+        let PcieCapture {
+            source, stop, meta, ..
+        } = pcie;
         let log = PcieLog::create(session.pcie_bin(), session.pcie_idx())?;
         let st = Arc::new(Mutex::new(PcieState::default()));
         let handle = {
@@ -495,8 +678,23 @@ pub fn run_usb_capture(
 
     // --- the checkpoint engine --- (USB is primary when at least one USB source started)
     let usb_active = writer.is_some();
-    let mut engine = Engine::new(session, &opts, shot_tx, clock.clone(), usb_active, pcie_state.clone());
-    engine.emit(CheckpointType::SessionStart, "session_start", 0, None, false, (0, 0), None)?;
+    let mut engine = Engine::new(
+        session,
+        &opts,
+        shot_tx,
+        clock.clone(),
+        usb_active,
+        pcie_state.clone(),
+    );
+    engine.emit(
+        CheckpointType::SessionStart,
+        "session_start",
+        0,
+        None,
+        false,
+        (0, 0),
+        None,
+    )?;
 
     let start = Instant::now();
     let interval_ns = (opts.cfg.interval_ms as i64).saturating_mul(1_000_000);
@@ -504,103 +702,154 @@ pub fn run_usb_capture(
     let mut last_frames = 0u64;
     let mut last_frame_at = start;
     let run_result = (|| -> Result<()> {
-      loop {
-        match in_rx.recv_timeout(Duration::from_millis(100)) {
-            Ok(ev) => engine.on_input(&ev, &state)?,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        }
-
-        // Remember the target app's foreground so a note (typed into our own window) is
-        // attributed to what the user was actually working in.
-        if !reveng_winput::foreground_is_self() {
-            engine.last_foreign_fg = Some(reveng_winput::foreground_context());
-        }
-
-        // Notes typed into the recording window become Manual checkpoints, anchored to the
-        // frame live at the moment the user pressed Enter (the note-vs-wire correlation).
-        if let Some(rx) = &note_rx {
-            while let Ok((ts, text)) = rx.try_recv() {
-                let anchor = anchor_of(&state.lock().unwrap());
-                engine.emit(CheckpointType::Manual, "note", ts, anchor, false, (0, 0), Some(text))?;
-                state.lock().unwrap().bytes_since = 0;
+        loop {
+            match in_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(ev) => engine.on_input(&ev, &state)?,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                // In --traffic-only there are no input hooks, so the channel is closed from
+                // the start. That is not the end of the run — pace the loop and carry on, or
+                // every traffic-only session would finish the instant it began.
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) if opts.traffic_only => {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
             }
-        }
 
-        // A Snapshot-button press dumps the target's memory (on the worker) and emits a
-        // checkpoint carrying `mem_snapshot_id`, anchored to the frame live at that instant —
-        // so `mem diff`/`mem scan` pair the decoded memory with the on-the-wire bytes.
-        if let Some(rx) = &snap_rx {
-            while let Ok(ts) = rx.try_recv() {
-                let Some(tx) = &mem_tx else {
-                    eprintln!("memory snapshot requested but capture is disabled");
-                    continue;
-                };
-                let mem_id = mem_next_id;
-                mem_next_id += 1;
-                let _ = tx.send((mem_id, ts));
-                let anchor = anchor_of(&state.lock().unwrap());
-                engine.next_mem_snapshot_id = Some(mem_id);
-                engine.emit(CheckpointType::Manual, "mem_snapshot", ts, anchor, false, (0, 0), None)?;
+            // Remember the target app's foreground so a note (typed into our own window) is
+            // attributed to what the user was actually working in. Not in --traffic-only:
+            // the foreground window here belongs to the operator's machine, not the target,
+            // so recording it would be both useless and outside what that mode promises.
+            if !opts.traffic_only && !reveng_winput::foreground_is_self() {
+                engine.last_foreign_fg = Some(reveng_winput::foreground_context());
             }
-        }
 
-        // Interval checkpoint: only during sustained traffic with no user action (§7).
-        if opts.cfg.interval_ms > 0 {
-            let now = clock.now_ns();
-            if now - engine.last_ckpt_ts >= interval_ns {
-                let (fire, anchor) = {
-                    let s = state.lock().unwrap();
-                    (s.bytes_since >= opts.cfg.interval_bytes, anchor_of(&s))
-                };
-                if fire {
-                    engine.emit(CheckpointType::Interval, "interval", now, anchor, false, (0, 0), None)?;
+            // Notes typed into the recording window become Manual checkpoints, anchored to the
+            // frame live at the moment the user pressed Enter (the note-vs-wire correlation).
+            if let Some(rx) = &note_rx {
+                while let Ok((ts, text)) = rx.try_recv() {
+                    let anchor = anchor_of(&state.lock().unwrap());
+                    engine.emit(
+                        CheckpointType::Manual,
+                        "note",
+                        ts,
+                        anchor,
+                        false,
+                        (0, 0),
+                        Some(text),
+                    )?;
                     state.lock().unwrap().bytes_since = 0;
                 }
             }
-        }
 
-        // Stop conditions: hotkey, notes-window Stop/close, reader EOF, bounded duration, byte
-        // budget (USB + PCIe totals), idle-abort, or frame cap.
-        let over_budget = opts.max_bytes.is_some_and(|mb| {
-            let usb = state.lock().unwrap().total_bytes;
-            let pcie = pcie_state.as_ref().map_or(0, |p| p.lock().unwrap().total_bytes);
-            usb + pcie >= mb
-        });
-        // Refresh idle timer: a new frame since last poll resets the "no traffic" clock.
-        let frames_now = state.lock().unwrap().total_frames;
-        if frames_now != last_frames {
-            last_frames = frames_now;
-            last_frame_at = Instant::now();
-        }
-        let extra = extra_stop_reason(
-            frames_now,
-            last_frame_at.elapsed(),
-            opts.abort_if_idle,
-            opts.stop_after_frames,
-        );
-        if engine.stop_requested
-            || ui_stop.as_ref().map(|f| f.load(Ordering::Relaxed)).unwrap_or(false)
-            || state.lock().unwrap().done
-            || state.lock().unwrap().error.is_some()
-            || opts.max_duration.map(|d| start.elapsed() >= d).unwrap_or(false)
-            || over_budget
-            || extra.is_some()
-        {
-            if over_budget {
-                eprintln!("reached --max-bytes budget; stopping");
+            // A Snapshot-button press dumps the target's memory (on the worker) and emits a
+            // checkpoint carrying `mem_snapshot_id`, anchored to the frame live at that instant —
+            // so `mem diff`/`mem scan` pair the decoded memory with the on-the-wire bytes.
+            if let Some(rx) = &snap_rx {
+                while let Ok(ts) = rx.try_recv() {
+                    let Some(tx) = &mem_tx else {
+                        eprintln!("memory snapshot requested but capture is disabled");
+                        continue;
+                    };
+                    let mem_id = mem_next_id;
+                    mem_next_id += 1;
+                    let _ = tx.send((mem_id, ts));
+                    let anchor = anchor_of(&state.lock().unwrap());
+                    engine.next_mem_snapshot_id = Some(mem_id);
+                    engine.emit(
+                        CheckpointType::Manual,
+                        "mem_snapshot",
+                        ts,
+                        anchor,
+                        false,
+                        (0, 0),
+                        None,
+                    )?;
+                }
             }
-            if let Some(reason) = extra {
-                eprintln!("{reason} ({frames_now} frames captured); stopping");
+
+            // Interval checkpoint: only during sustained traffic with no user action (§7).
+            if opts.cfg.interval_ms > 0 {
+                let now = clock.now_ns();
+                if now - engine.last_ckpt_ts >= interval_ns {
+                    let (fire, anchor) = {
+                        let s = state.lock().unwrap();
+                        (s.bytes_since >= opts.cfg.interval_bytes, anchor_of(&s))
+                    };
+                    if fire {
+                        engine.emit(
+                            CheckpointType::Interval,
+                            "interval",
+                            now,
+                            anchor,
+                            false,
+                            (0, 0),
+                            None,
+                        )?;
+                        state.lock().unwrap().bytes_since = 0;
+                    }
+                }
             }
-            break;
+
+            // Stop conditions: hotkey, notes-window Stop/close, reader EOF, bounded duration, byte
+            // budget (USB + PCIe totals), idle-abort, or frame cap.
+            let over_budget = opts.max_bytes.is_some_and(|mb| {
+                let usb = state.lock().unwrap().total_bytes;
+                let pcie = pcie_state
+                    .as_ref()
+                    .map_or(0, |p| p.lock().unwrap().total_bytes);
+                usb + pcie >= mb
+            });
+            // Refresh idle timer: a new frame since last poll resets the "no traffic" clock.
+            let frames_now = state.lock().unwrap().total_frames;
+            if frames_now != last_frames {
+                last_frames = frames_now;
+                last_frame_at = Instant::now();
+            }
+            let extra = extra_stop_reason(
+                frames_now,
+                last_frame_at.elapsed(),
+                opts.abort_if_idle,
+                opts.stop_after_frames,
+            );
+            let stop_file_seen = opts
+                .stop_file
+                .as_ref()
+                .map(|path| path.exists())
+                .unwrap_or(false);
+            if engine.stop_requested
+                || stop_file_seen
+                || ui_stop
+                    .as_ref()
+                    .map(|f| f.load(Ordering::Relaxed))
+                    .unwrap_or(false)
+                || state.lock().unwrap().done
+                || state.lock().unwrap().error.is_some()
+                || opts
+                    .max_duration
+                    .map(|d| start.elapsed() >= d)
+                    .unwrap_or(false)
+                || over_budget
+                || extra.is_some()
+            {
+                if over_budget {
+                    eprintln!("reached --max-bytes budget; stopping");
+                }
+                if stop_file_seen {
+                    eprintln!("stop file seen; stopping");
+                }
+                if let Some(reason) = extra {
+                    eprintln!("{reason} ({frames_now} frames captured); stopping");
+                }
+                break;
+            }
         }
-      }
-      Ok(())
+        Ok(())
     })();
 
     // --- finalize: tear down threads, then inject checkpoint comments (§4) ---
-    hooks.stop();
+    if let Some(h) = hooks {
+        h.stop();
+    }
     usb_threads.stop_and_join(&state);
     if let Some(w) = writer {
         w.lock().unwrap().flush()?;
@@ -621,7 +870,15 @@ pub fn run_usb_capture(
 
     let final_ts = clock.now_ns();
     let stop_anchor = anchor_of(&state.lock().unwrap());
-    engine.emit(CheckpointType::SessionStop, "session_stop", final_ts, stop_anchor, false, (0, 0), None)?;
+    engine.emit(
+        CheckpointType::SessionStop,
+        "session_stop",
+        final_ts,
+        stop_anchor,
+        false,
+        (0, 0),
+        None,
+    )?;
 
     let (total_frames, dropped) = {
         let s = state.lock().unwrap();
@@ -661,7 +918,9 @@ fn open_mem_source(opts: &UsbRecordOpts) -> Option<Result<reveng_memcap::MemSnap
     if let Some(pid) = opts.mem_pid {
         Some(reveng_memcap::MemSnapshotSource::open(pid))
     } else {
-        Some(reveng_memcap::MemSnapshotSource::by_name(opts.mem_process.as_deref().unwrap()))
+        Some(reveng_memcap::MemSnapshotSource::by_name(
+            opts.mem_process.as_deref().unwrap(),
+        ))
     }
 }
 
@@ -669,14 +928,22 @@ fn open_mem_source(opts: &UsbRecordOpts) -> Option<Result<reveng_memcap::MemSnap
 /// the shared counter. Runs one per selected control device; the writer is shared so all
 /// hubs merge into one ordered index.
 fn reader_loop(
-    mut source: UsbCaptureSource,
+    mut source: Box<dyn CaptureSource + Send>,
     writer: Arc<Mutex<UsbWriter>>,
     state: Arc<Mutex<TrafficState>>,
     reader_stop: Arc<AtomicBool>,
     stats: Option<Arc<Mutex<LiveStats>>>,
     filter: PacketFilter,
+    format: reveng_usbcap::CaptureFormat,
+    keep_sof: bool,
 ) -> Result<()> {
+    let wire = format == reveng_usbcap::CaptureFormat::Wire;
     let filtering = filter.is_active();
+    // Wire-only: the endpoint of the transaction in progress. DATA and handshake packets
+    // carry no endpoint of their own, so per-endpoint stats need the last token carried
+    // forward — the same rule the index derivation follows.
+    let mut wire_endpoint: u8 = 0;
+    let mut wire_transfer: u8 = reveng_usbcap::XFER_UNKNOWN;
     loop {
         if reader_stop.load(Ordering::Relaxed) {
             break;
@@ -684,14 +951,41 @@ fn reader_loop(
         match source.next() {
             Ok(Some(rec)) => {
                 // Parse the header once if either the filter or the dashboard needs it.
-                let header = if filtering || stats.is_some() {
+                //
+                // Only for USBPcap. A wire packet has no such header — running the parser
+                // over one reads the PID byte and CRC as an endpoint and a length, and the
+                // result is not an error, just wrong: mis-filtered packets and a dashboard
+                // full of endpoints that were never on the bus.
+                let header = if !wire && (filtering || stats.is_some()) {
                     reveng_usbcap::parse::parse_packet_header(&rec.payload)
                 } else {
                     None
                 };
+                if wire {
+                    if let Some(p) = reveng_usbcap::wire::decode(&rec.payload) {
+                        if let (Some(ep), true) = (p.endpoint, p.kind == WireKind::Token) {
+                            wire_endpoint = ep;
+                            wire_transfer = if ep == 0 {
+                                reveng_usbcap::XFER_CONTROL
+                            } else {
+                                reveng_usbcap::XFER_UNKNOWN
+                            };
+                        }
+                        // SOF belongs to no transaction, so dropping it cannot break
+                        // reassembly — which is exactly why it is the one wire packet safe
+                        // to filter at the source.
+                        if !keep_sof && p.kind == WireKind::Sof {
+                            state.lock().unwrap().dropped += 1;
+                            if let Some(stats) = &stats {
+                                stats.lock().unwrap().usb_dropped += 1;
+                            }
+                            continue;
+                        }
+                    }
+                }
                 // Capture-side reduction (camera/isoc firehose): drop filtered packets before
                 // writing, but count them so the drop is visible, never silent.
-                if filtering && !keep_packet(header.as_ref(), &filter) {
+                if filtering && !wire && !keep_packet(header.as_ref(), &filter) {
                     state.lock().unwrap().dropped += 1;
                     if let Some(stats) = &stats {
                         stats.lock().unwrap().usb_dropped += 1;
@@ -723,7 +1017,12 @@ fn reader_loop(
                     let mut g = stats.lock().unwrap();
                     g.usb_frames += 1;
                     g.usb_bytes += payload_len;
-                    if let Some(h) = &header {
+                    if wire {
+                        let e = g.usb_by_ep.entry(wire_endpoint).or_default();
+                        e.frames += 1;
+                        e.bytes += payload_len;
+                        e.transfer = wire_transfer;
+                    } else if let Some(h) = &header {
                         let e = g.usb_by_ep.entry(h.endpoint).or_default();
                         e.frames += 1;
                         e.bytes += payload_len;
@@ -772,7 +1071,7 @@ struct Engine {
     last_ckpt_ts: i64,
     last_shot_ts: Option<i64>,
     min_interval_ns: i64,
-    shot_tx: Option<std::sync::mpsc::Sender<(u64, i64, reveng_winshot::Scope, (i32, i32))>>,
+    shot_tx: Option<std::sync::mpsc::Sender<ShotRequest>>,
     scope: reveng_winshot::Scope,
     cfg: CheckpointConfig,
     shot_when: ScreenshotWhen,
@@ -801,7 +1100,9 @@ impl Engine {
     fn new(
         session: SessionWriter,
         opts: &UsbRecordOpts,
-        shot_tx: std::sync::mpsc::Sender<(u64, i64, reveng_winshot::Scope, (i32, i32))>,
+        // `None` in --traffic-only: there is no screenshot worker to send to, so a
+        // checkpoint that would have carried a screenshot simply carries none.
+        shot_tx: Option<std::sync::mpsc::Sender<ShotRequest>>,
         clock: Clock,
         usb_active: bool,
         pcie_state: Option<Arc<Mutex<PcieState>>>,
@@ -814,7 +1115,7 @@ impl Engine {
             last_ckpt_ts: 0,
             last_shot_ts: None,
             min_interval_ns: (opts.min_interval_ms as i64) * 1_000_000,
-            shot_tx: Some(shot_tx),
+            shot_tx,
             scope: opts.scope,
             cfg: opts.cfg.clone(),
             shot_when: opts.screenshot_on,
@@ -895,8 +1196,10 @@ impl Engine {
         if self.usb_active {
             if let Some(a) = &anchor {
                 let proc = fg_process.clone().unwrap_or_else(|| "?".into());
-                self.comments
-                    .push((a.event_index, format!("CHECKPOINT #{id} — {cause} in {proc}")));
+                self.comments.push((
+                    a.event_index,
+                    format!("CHECKPOINT #{id} — {cause} in {proc}"),
+                ));
             }
         }
 
@@ -914,7 +1217,8 @@ impl Engine {
             cursor,
             note,
         };
-        self.session.append_record(&SessionRecord::Checkpoint(ckpt))?;
+        self.session
+            .append_record(&SessionRecord::Checkpoint(ckpt))?;
         self.checkpoints_written += 1;
         self.last_ckpt_ts = ts_ns;
         Ok(())
@@ -944,7 +1248,8 @@ impl Engine {
         }
 
         // Every input event is truth — persist it (§8).
-        self.session.append_record(&SessionRecord::Input(ev.clone()))?;
+        self.session
+            .append_record(&SessionRecord::Input(ev.clone()))?;
 
         let cfg = self.cfg.clone();
         let anchor = anchor_of(&state.lock().unwrap());
@@ -952,8 +1257,19 @@ impl Engine {
             InputKind::MouseDown => {
                 if let Some(btn) = &ev.button {
                     if cfg.mouse_triggers(btn) {
-                        let want = matches!(self.shot_when, ScreenshotWhen::Mousedown | ScreenshotWhen::Both);
-                        self.emit(CheckpointType::Click, &format!("{btn}ButtonDown"), ev.ts_ns, anchor, want, (ev.x, ev.y), None)?;
+                        let want = matches!(
+                            self.shot_when,
+                            ScreenshotWhen::Mousedown | ScreenshotWhen::Both
+                        );
+                        self.emit(
+                            CheckpointType::Click,
+                            &format!("{btn}ButtonDown"),
+                            ev.ts_ns,
+                            anchor,
+                            want,
+                            (ev.x, ev.y),
+                            None,
+                        )?;
                         state.lock().unwrap().bytes_since = 0;
                     }
                 }
@@ -961,26 +1277,55 @@ impl Engine {
             InputKind::MouseUp => {
                 if let Some(btn) = &ev.button {
                     if cfg.on_mouseup && cfg.mouse_triggers(btn) {
-                        let want = matches!(self.shot_when, ScreenshotWhen::Mouseup | ScreenshotWhen::Both);
-                        self.emit(CheckpointType::Click, &format!("{btn}ButtonUp"), ev.ts_ns, anchor, want, (ev.x, ev.y), None)?;
+                        let want = matches!(
+                            self.shot_when,
+                            ScreenshotWhen::Mouseup | ScreenshotWhen::Both
+                        );
+                        self.emit(
+                            CheckpointType::Click,
+                            &format!("{btn}ButtonUp"),
+                            ev.ts_ns,
+                            anchor,
+                            want,
+                            (ev.x, ev.y),
+                            None,
+                        )?;
                         state.lock().unwrap().bytes_since = 0;
                     }
                 }
             }
             InputKind::Wheel => {
                 if cfg.on_wheel {
-                    self.emit(CheckpointType::Click, "Wheel", ev.ts_ns, anchor, false, (ev.x, ev.y), None)?;
+                    self.emit(
+                        CheckpointType::Click,
+                        "Wheel",
+                        ev.ts_ns,
+                        anchor,
+                        false,
+                        (ev.x, ev.y),
+                        None,
+                    )?;
                     state.lock().unwrap().bytes_since = 0;
                 }
             }
             InputKind::KeyDown => {
                 if let Some(vk) = ev.vk {
                     let name = vk_name(vk);
-                    let triggers = cfg.on_any_key
-                        || name.map(|n| cfg.key_triggers(n)).unwrap_or(false);
+                    let triggers =
+                        cfg.on_any_key || name.map(|n| cfg.key_triggers(n)).unwrap_or(false);
                     if triggers {
-                        let label = name.map(|s| s.to_string()).unwrap_or_else(|| format!("VK_0x{vk:02X}"));
-                        self.emit(CheckpointType::KeyDown, &label, ev.ts_ns, anchor, self.shot_on_keys, (ev.x, ev.y), None)?;
+                        let label = name
+                            .map(|s| s.to_string())
+                            .unwrap_or_else(|| format!("VK_0x{vk:02X}"));
+                        self.emit(
+                            CheckpointType::KeyDown,
+                            &label,
+                            ev.ts_ns,
+                            anchor,
+                            self.shot_on_keys,
+                            (ev.x, ev.y),
+                            None,
+                        )?;
                         state.lock().unwrap().bytes_since = 0;
                     }
                 }
@@ -1037,7 +1382,26 @@ impl Engine {
             "tool": "reveng-rec",
             "version": env!("CARGO_PKG_VERSION"),
             "source": if pcie_meta.is_some() { "usb+pcie" } else { "usb" },
-            "acquisition": "usbpcap",
+            // Which backend recorded this, so a later reader knows what the packets are
+            // before decoding any. The pcapng link type says the same thing; this is the
+            // human-readable copy, and it carries the capture speed a wire session needs.
+            "acquisition": opts.backend.name(),
+            "capture_speed": match opts.backend {
+                UsbBackend::Cynthion { speed } => Some(format!("{speed:?}")),
+                UsbBackend::UsbPcap => None,
+            },
+            // Folded from the sidecar so the headline facts — did the analyzer overflow, was
+            // there a bus reset — are answerable without opening another file.
+            "bus_events": reveng_cynthion::events::read_summary(
+                reveng_cynthion::events::sidecar_path(&self.session.usb_pcapng()),
+            )
+            .ok()
+            .flatten(),
+            // Session provenance: what this recording actually contains. A later reader must
+            // not assume a session has input events or screenshots just because the schema
+            // has room for them — in traffic-only mode there are none, by design rather than
+            // by accident.
+            "traffic_only": opts.traffic_only,
             "clock": {
                 "kind": "QPC-backed monotonic (std::Instant)",
                 "wall_ns_at_origin": clock.wall_ns_at_origin(),
@@ -1145,12 +1509,22 @@ mod tests {
     fn idle_abort_fires_when_no_frames_arrive() {
         // No frames, no timer running long enough yet → keep going.
         assert_eq!(
-            extra_stop_reason(0, Duration::from_secs(2), Some(Duration::from_secs(5)), None),
+            extra_stop_reason(
+                0,
+                Duration::from_secs(2),
+                Some(Duration::from_secs(5)),
+                None
+            ),
             None
         );
         // No frames for longer than the idle timeout → abort.
         assert_eq!(
-            extra_stop_reason(0, Duration::from_secs(6), Some(Duration::from_secs(5)), None),
+            extra_stop_reason(
+                0,
+                Duration::from_secs(6),
+                Some(Duration::from_secs(5)),
+                None
+            ),
             Some("--abort-if-idle: no new traffic")
         );
     }
@@ -1158,10 +1532,18 @@ mod tests {
     #[test]
     fn frame_cap_takes_priority_and_idle_off_by_default() {
         // No idle/cap configured → never an extra stop, however long idle.
-        assert_eq!(extra_stop_reason(0, Duration::from_secs(999), None, None), None);
+        assert_eq!(
+            extra_stop_reason(0, Duration::from_secs(999), None, None),
+            None
+        );
         // Frame cap reached, even while traffic is flowing (idle timer just reset).
         assert_eq!(
-            extra_stop_reason(100, Duration::from_millis(0), Some(Duration::from_secs(5)), Some(100)),
+            extra_stop_reason(
+                100,
+                Duration::from_millis(0),
+                Some(Duration::from_secs(5)),
+                Some(100)
+            ),
             Some("--stop-after-frames reached")
         );
     }

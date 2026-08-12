@@ -24,7 +24,9 @@ fn heap_after() -> Vec<u8> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let out = std::env::args().nth(1).unwrap_or_else(|| "mem.session".into());
+    let out = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "mem.session".into());
     let zip = std::env::args().nth(2).as_deref() == Some("zip");
     let mut session = SessionWriter::create(&out)?;
     let snaps = session.memsnaps_dir();
@@ -59,7 +61,12 @@ fn main() -> anyhow::Result<()> {
         &[
             (STATIC_BASE, PAGE_RW, MEM_PRIVATE, static_region),
             (HEAP_BASE, PAGE_RW, MEM_PRIVATE, heap_after()),
-            (NEW_BASE, PAGE_RW, MEM_PRIVATE, b"frame#1 payload....".to_vec()),
+            (
+                NEW_BASE,
+                PAGE_RW,
+                MEM_PRIVATE,
+                b"frame#1 payload....".to_vec(),
+            ),
         ],
     )?;
 
@@ -80,8 +87,20 @@ fn main() -> anyhow::Result<()> {
         })
     };
     session.append_record(&mk(0, 0, CheckpointType::SessionStart, None, None))?;
-    session.append_record(&mk(1, 1_000_000, CheckpointType::Manual, Some("before acquire"), Some(0)))?;
-    session.append_record(&mk(2, 5_000_000, CheckpointType::Manual, Some("after acquire"), Some(1)))?;
+    session.append_record(&mk(
+        1,
+        1_000_000,
+        CheckpointType::Manual,
+        Some("before acquire"),
+        Some(0),
+    ))?;
+    session.append_record(&mk(
+        2,
+        5_000_000,
+        CheckpointType::Manual,
+        Some("after acquire"),
+        Some(1),
+    ))?;
     session.append_record(&mk(3, 6_000_000, CheckpointType::SessionStop, None, None))?;
 
     session.write_meta(&serde_json::json!({

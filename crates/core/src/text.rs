@@ -30,8 +30,10 @@ mod tests {
         assert!(is_texty(b"AT+CGMR\r\nOK\r\n"));
         assert!(!is_texty(&[0x00, 0x01, 0x02, 0xff, 0x80, 0x7f, 0x00, 0x13]));
         assert!(!is_texty(b"")); // empty is not text
-        // mostly-text with a couple of control bytes still reads as text
-        assert!(is_texty(b"hello world\x00\x01 this is mostly text and readable"));
+                                 // mostly-text with a couple of control bytes still reads as text
+        assert!(is_texty(
+            b"hello world\x00\x01 this is mostly text and readable"
+        ));
     }
 
     #[test]

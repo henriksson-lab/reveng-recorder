@@ -73,7 +73,9 @@ impl<R: Read> PcapReader<R> {
         let nanos = match magic {
             MAGIC_USEC => false,
             MAGIC_NSEC => true,
-            other => anyhow::bail!("unexpected pcap magic 0x{other:08x} (not little-endian libpcap)"),
+            other => {
+                anyhow::bail!("unexpected pcap magic 0x{other:08x} (not little-endian libpcap)")
+            }
         };
         let linktype = u32::from_le_bytes(gh[20..24].try_into().unwrap());
         Ok(Self {
@@ -106,7 +108,11 @@ impl<R: Read> PcapReader<R> {
         if incl_len > 0 && !read_exact_or_eof(&mut self.r, &mut data)? {
             anyhow::bail!("pcap record header promised {incl_len} bytes but stream ended");
         }
-        let frac_ns = if self.header.nanos { ts_frac } else { ts_frac * 1000 };
+        let frac_ns = if self.header.nanos {
+            ts_frac
+        } else {
+            ts_frac * 1000
+        };
         Ok(Some(PcapRecord {
             unix_ns: ts_sec * 1_000_000_000 + frac_ns,
             data,

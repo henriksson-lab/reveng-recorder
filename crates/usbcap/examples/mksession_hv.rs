@@ -1,7 +1,7 @@
 //! Build a HIGH-VOLUME, multi-endpoint synthetic USB session so the query CLI + volume
 //! features can be exercised end-to-end without USBPcap/hardware (this machine's input
 //! devices are PS/2 + I2C, its external ports sit on a controller USBPcap doesn't filter,
-//! and the one filtered hub delivers no live packets — see BACKLOG). Models an "Acme HD
+//! and the one filtered hub delivers no live packets). Models an "Acme HD
 //! Webcam": a control string descriptor, text bulk-OUT commands, a snaplen-truncated isoc
 //! video firehose, binary bulk-IN JPEG blobs, and small interrupt-IN status reports, with
 //! click checkpoints and typed notes anchored onto the same timeline.
@@ -38,7 +38,9 @@ const CTRL: u8 = 2;
 const BULK: u8 = 3;
 
 fn main() -> anyhow::Result<()> {
-    let out = std::env::args().nth(1).unwrap_or_else(|| "usb-hv.session".into());
+    let out = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "usb-hv.session".into());
     let mut session = SessionWriter::create(&out)?;
     let mut usb = UsbWriter::create(session.usb_pcapng(), session.frames_idx())?;
 
@@ -63,7 +65,14 @@ fn main() -> anyhow::Result<()> {
     ] {
         ts += 500_000;
         let a = append(&mut usb, ts, &packet(0x02, BULK, cmd.len() as u32, cmd))?;
-        anchor_at.insert(if cmd.starts_with(b"START") { "start_cmd" } else { "cmd" }, a);
+        anchor_at.insert(
+            if cmd.starts_with(b"START") {
+                "start_cmd"
+            } else {
+                "cmd"
+            },
+            a,
+        );
     }
 
     // 3) The isoc video firehose: 300 frames, each 3072 B on the wire but snaplen-truncated
@@ -71,7 +80,7 @@ fn main() -> anyhow::Result<()> {
     let mut first_iso = None;
     for i in 0..300u32 {
         ts += 33_000; // ~30 fps microframe pacing
-        // Deterministic pseudo-binary payload prefix (an MJPEG-ish frame start on the first).
+                      // Deterministic pseudo-binary payload prefix (an MJPEG-ish frame start on the first).
         let mut cap = vec![0u8; 256];
         cap[0] = 0xFF;
         cap[1] = 0xD8; // JPEG SOI so it reads clearly "binary"
@@ -142,14 +151,56 @@ fn main() -> anyhow::Result<()> {
         Ok(())
     };
 
-    push(&mut session, 0, CheckpointType::SessionStart, "session_start", None, None)?;
+    push(
+        &mut session,
+        0,
+        CheckpointType::SessionStart,
+        "session_start",
+        None,
+        None,
+    )?;
     // A click that starts the stream, anchored to the START_STREAM command frame.
-    push(&mut session, 2_100_000, CheckpointType::Click, "LButtonDown @ (960,540)", None, anchor("start_cmd"))?;
+    push(
+        &mut session,
+        2_100_000,
+        CheckpointType::Click,
+        "LButtonDown @ (960,540)",
+        None,
+        anchor("start_cmd"),
+    )?;
     // Typed notes — the human narrating in real time, each anchored to what was on the wire.
-    push(&mut session, 2_200_000, CheckpointType::Manual, "note", Some("clicked Start — stream should begin"), anchor("first_frame"))?;
-    push(&mut session, 5_000_000, CheckpointType::Manual, "note", Some("resolution set to 1080p MJPG"), anchor("mid_frame"))?;
-    push(&mut session, 12_000_000, CheckpointType::Manual, "note", Some("captured a still photo"), anchor("first_still"))?;
-    push(&mut session, ts, CheckpointType::SessionStop, "session_stop", None, None)?;
+    push(
+        &mut session,
+        2_200_000,
+        CheckpointType::Manual,
+        "note",
+        Some("clicked Start — stream should begin"),
+        anchor("first_frame"),
+    )?;
+    push(
+        &mut session,
+        5_000_000,
+        CheckpointType::Manual,
+        "note",
+        Some("resolution set to 1080p MJPG"),
+        anchor("mid_frame"),
+    )?;
+    push(
+        &mut session,
+        12_000_000,
+        CheckpointType::Manual,
+        "note",
+        Some("captured a still photo"),
+        anchor("first_still"),
+    )?;
+    push(
+        &mut session,
+        ts,
+        CheckpointType::SessionStop,
+        "session_stop",
+        None,
+        None,
+    )?;
 
     session.write_meta(&serde_json::json!({
         "tool": "reveng-rec",

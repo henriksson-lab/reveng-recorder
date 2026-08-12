@@ -42,7 +42,11 @@ fn hexdump(bytes: &[u8]) -> String {
                 hex.push(' ');
             }
             hex.push_str(&format!("{b:02x} "));
-            asc.push(if (0x20..=0x7e).contains(&b) { b as char } else { '.' });
+            asc.push(if (0x20..=0x7e).contains(&b) {
+                b as char
+            } else {
+                '.'
+            });
         }
         out.push_str(&format!("{:08x}  {hex:<49}|{asc}|\n", row * 16));
     }
@@ -61,8 +65,7 @@ impl Log {
             Ok(Log::Usb(UsbReader::open(s.usb_pcapng(), s.frames_idx())?))
         } else if s.pcie_bin().exists() {
             Ok(Log::Pcie(
-                PcieLog::open(s.pcie_bin(), s.pcie_idx())
-                    .context("opening pcie.bin/pcie.idx")?,
+                PcieLog::open(s.pcie_bin(), s.pcie_idx()).context("opening pcie.bin/pcie.idx")?,
             ))
         } else {
             anyhow::bail!("session has no traffic log (usb.pcapng or pcie.bin)")
@@ -156,7 +159,9 @@ pub fn ls(session_dir: &Path, json: bool) -> Result<()> {
                 c.ts_ns,
                 format!("{:?}", c.kind),
                 c.cause,
-                anchor_idx.map(|i| i.to_string()).unwrap_or_else(|| "-".into()),
+                anchor_idx
+                    .map(|i| i.to_string())
+                    .unwrap_or_else(|| "-".into()),
                 pcie,
                 note,
             )?;
@@ -212,7 +217,10 @@ fn load_meta(dir: &Path) -> Result<reveng_memcap::MemSnapshotMeta> {
 }
 
 fn hex_inline(b: &[u8]) -> String {
-    b.iter().map(|x| format!("{x:02x}")).collect::<Vec<_>>().join(" ")
+    b.iter()
+        .map(|x| format!("{x:02x}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn parse_addr(s: &str) -> Result<u64> {
@@ -231,7 +239,9 @@ pub fn mem_ls(session_dir: &Path) -> Result<()> {
     let out = std::io::stdout();
     let mut w = out.lock();
     for c in s.checkpoints()? {
-        let Some(mid) = c.mem_snapshot_id else { continue };
+        let Some(mid) = c.mem_snapshot_id else {
+            continue;
+        };
         let meta = load_meta(&snap_dir(&s, mid)).ok();
         let line = serde_json::json!({
             "snapshot": mid,
@@ -296,10 +306,18 @@ pub fn mem_diff(session_dir: &Path, a: u64, b: u64, max: usize) -> Result<()> {
                 "kind": "new", "base": format!("0x{base:x}"), "size": size }),
             RegionDelta::Freed { base, size } => serde_json::json!({
                 "kind": "freed", "base": format!("0x{base:x}"), "size": size }),
-            RegionDelta::Resized { base, old_size, new_size } => serde_json::json!({
+            RegionDelta::Resized {
+                base,
+                old_size,
+                new_size,
+            } => serde_json::json!({
                 "kind": "resized", "base": format!("0x{base:x}"),
                 "old_size": old_size, "new_size": new_size }),
-            RegionDelta::Changed { base, size, changes } => {
+            RegionDelta::Changed {
+                base,
+                size,
+                changes,
+            } => {
                 let cs: Vec<_> = changes
                     .iter()
                     .map(|c| {
@@ -327,7 +345,9 @@ pub fn mem_diff(session_dir: &Path, a: u64, b: u64, max: usize) -> Result<()> {
 fn delta_base(d: &reveng_memcap::RegionDelta) -> u64 {
     use reveng_memcap::RegionDelta::*;
     match d {
-        New { base, .. } | Freed { base, .. } | Resized { base, .. } | Changed { base, .. } => *base,
+        New { base, .. } | Freed { base, .. } | Resized { base, .. } | Changed { base, .. } => {
+            *base
+        }
     }
 }
 
@@ -355,16 +375,15 @@ pub fn mem_read(session_dir: &Path, id: u64, addr: &str, len: u64) -> Result<()>
     let s = SessionReader::open(session_dir)?;
     let snap = reveng_memcap::LoadedSnapshot::load(&snap_dir(&s, id))?;
     let addr = parse_addr(addr)?;
-    let Some(r) = snap
-        .meta
-        .regions
-        .iter()
-        .find(|r| addr.checked_sub(r.base).is_some_and(|offset| offset < r.size))
-    else {
+    let Some(r) = snap.meta.regions.iter().find(|r| {
+        addr.checked_sub(r.base)
+            .is_some_and(|offset| offset < r.size)
+    }) else {
         anyhow::bail!("address 0x{addr:x} is not inside any captured region");
     };
     let bytes = snap.region_bytes(r);
-    let start = usize::try_from(addr - r.base).context("address offset does not fit this platform")?;
+    let start =
+        usize::try_from(addr - r.base).context("address offset does not fit this platform")?;
     let requested = usize::try_from(len).unwrap_or(usize::MAX);
     let end = start.saturating_add(requested).min(bytes.len());
     let slice = &bytes[start..end];
@@ -487,18 +506,32 @@ fn usb_text_line(f: &reveng_usbcap::UsbFrame) -> String {
         f.ts_ns as f64 / 1e9,
         f.ep,
         f.dir.to_uppercase(),
-        f.xfer,
+        // For a wire capture the PID *is* the interesting identity: without it an IN token,
+        // its DATA and its ACK all render as "unknown len=0" and cannot be told apart.
+        f.pid.unwrap_or(f.xfer),
         f.len
     );
+    if f.crc_ok == Some(false) {
+        s += " CRC!";
+    }
     if let Some(setup) = &f.setup {
         s += &format!(
             "  {}/{} req={} val={} idx={} wlen={}",
-            setup.req_type, setup.recipient, setup.b_request, setup.w_value, setup.w_index,
+            setup.req_type,
+            setup.recipient,
+            setup.b_request,
+            setup.w_value,
+            setup.w_index,
             setup.w_length
         );
     }
     if !f.payload.is_empty() {
-        let preview: Vec<String> = f.payload.iter().take(24).map(|b| format!("{b:02x}")).collect();
+        let preview: Vec<String> = f
+            .payload
+            .iter()
+            .take(24)
+            .map(|b| format!("{b:02x}"))
+            .collect();
         let ell = if f.payload.len() > 24 { " …" } else { "" };
         s += &format!("  {}{}", preview.join(" "), ell);
     }
@@ -513,22 +546,30 @@ fn usb_hex_block(f: &reveng_usbcap::UsbFrame) -> String {
         f.ts_ns as f64 / 1e9,
         f.ep,
         f.dir,
-        f.xfer,
+        f.pid.unwrap_or(f.xfer),
         f.len
     );
     s.push_str(&hexdump(&f.payload));
     s
 }
 
-/// One fully-paired control transfer (SETUP joined with its completion), ready to emit.
+/// One fully-paired control transfer, ready to emit. Source-neutral: a USBPcap SETUP joined
+/// with its completion by IRP id, or a wire SETUP/data/status sequence rebuilt by
+/// [`reveng_usbcap::ControlReassembler`].
 struct CtrlCmd {
     i: u64,
     ts_ns: i64,
     setup: Setup,
     /// OUT data written by the host, or IN data returned by the device.
     data: Vec<u8>,
-    /// Completion status, if the completion stage was seen within the range.
+    /// Completion status, if the completion stage was seen within the range. USBPcap only —
+    /// a `USBD_STATUS`. A wire capture has no such code and uses `outcome` instead.
     status: Option<u32>,
+    /// Wire captures only: how the transfer ended (`ok` / `STALL` / `incomplete`), and how
+    /// many times the device NAKed before answering. Printing a `USBD_STATUS`-shaped code
+    /// for a bus-level outcome would be a lie in a familiar format, so they stay separate.
+    outcome: Option<&'static str>,
+    naks: u32,
 }
 
 fn emit_ctrl(w: &mut dyn Write, c: &CtrlCmd, json: bool) -> Result<()> {
@@ -547,15 +588,20 @@ fn emit_ctrl(w: &mut dyn Write, c: &CtrlCmd, json: bool) -> Result<()> {
             "wLength": c.setup.w_length,
             "data": data_hex,
             "status": c.status,
+            "outcome": c.outcome,
+            "naks": c.naks,
         });
         writeln!(w, "{v}")?;
         return Ok(());
     }
     let dir = c.setup.dir.to_ascii_uppercase();
-    let status = match c.status {
-        None => "?".to_string(),
-        Some(0) => "ok".to_string(),
-        Some(x) => format!("ERR 0x{x:08x}"),
+    let status = match (c.outcome, c.status) {
+        // A wire capture's outcome is its final handshake, not a Windows status code.
+        (Some(o), _) if c.naks > 0 => format!("{o} ({} NAK)", c.naks),
+        (Some(o), _) => o.to_string(),
+        (None, None) => "?".to_string(),
+        (None, Some(0)) => "ok".to_string(),
+        (None, Some(x)) => format!("ERR 0x{x:08x}"),
     };
     // Cap the inline data so a long OUT/IN blob doesn't wrap the line; full bytes are in `data=`
     // via --json or the `payload` command.
@@ -638,6 +684,66 @@ fn collect_ctrl(
     end: u64,
     req_type: Option<&str>,
 ) -> Result<Vec<CtrlCmd>> {
+    match reader.format() {
+        reveng_usbcap::CaptureFormat::UsbPcap => collect_ctrl_usbpcap(reader, start, end, req_type),
+        reveng_usbcap::CaptureFormat::Wire => collect_ctrl_wire(reader, start, end, req_type),
+    }
+}
+
+/// Rebuild control transfers from raw wire packets.
+///
+/// The bus-level differences from the USBPcap path are all absorbed by
+/// [`reveng_usbcap::ControlReassembler`]: there is no IRP id to pair on (the status stage
+/// ends a transfer), the OUT data is separate DATA packets rather than bytes appended to
+/// the setup record, and NAKed transactions are retries to coalesce rather than failures.
+fn collect_ctrl_wire(
+    reader: &mut UsbReader,
+    start: u64,
+    end: u64,
+    req_type: Option<&str>,
+) -> Result<Vec<CtrlCmd>> {
+    use reveng_usbcap::ControlReassembler;
+    let type_filter = req_type.map(|t| t.to_ascii_lowercase());
+    let mut asm = ControlReassembler::new();
+    let mut transfers = Vec::new();
+    for i in start..=end {
+        // Every packet has to be fed, not just control ones: the reassembler needs the
+        // handshakes, and a token's endpoint is only known by decoding it.
+        let packet = reader.raw_packet_bytes(i)?;
+        let ts = reader.ts_at(i)?;
+        if let Some(t) = asm.push(i, ts, &packet) {
+            transfers.push(t);
+        }
+    }
+    transfers.extend(asm.finish());
+
+    let mut done: Vec<CtrlCmd> = transfers
+        .into_iter()
+        .filter_map(|t| {
+            let setup = reveng_usbcap::reader::decode_setup(&t.setup)?;
+            Some(CtrlCmd {
+                i: t.frame,
+                ts_ns: t.ts_ns,
+                setup,
+                data: t.data,
+                status: None,
+                outcome: Some(t.outcome.as_str()),
+                naks: t.naks,
+            })
+        })
+        .filter(|c| type_filter.as_deref().is_none_or(|t| c.setup.req_type == t))
+        .collect();
+    done.sort_by_key(|c| c.i);
+    Ok(done)
+}
+
+/// Pair USBPcap SETUP frames with their completions by IRP id.
+fn collect_ctrl_usbpcap(
+    reader: &mut UsbReader,
+    start: u64,
+    end: u64,
+    req_type: Option<&str>,
+) -> Result<Vec<CtrlCmd>> {
     let type_filter = req_type.map(|t| t.to_ascii_lowercase());
     let want = |c: &CtrlCmd| type_filter.as_deref().is_none_or(|t| c.setup.req_type == t);
     let mut pending: HashMap<u64, CtrlCmd> = HashMap::new();
@@ -655,7 +761,18 @@ fn collect_ctrl(
                     } else {
                         Vec::new()
                     };
-                    pending.insert(f.irp_id, CtrlCmd { i, ts_ns: f.ts_ns, setup, data, status: None });
+                    pending.insert(
+                        f.irp_id,
+                        CtrlCmd {
+                            i,
+                            ts_ns: f.ts_ns,
+                            setup,
+                            data,
+                            status: None,
+                            outcome: None,
+                            naks: 0,
+                        },
+                    );
                 }
             }
             Some(stage) => {
@@ -684,7 +801,10 @@ fn collect_ctrl(
 fn collect_ctrl_session(session_dir: &Path, req_type: Option<&str>) -> Result<Vec<CtrlCmd>> {
     let s = SessionReader::open(session_dir)?;
     if !s.usb_pcapng().exists() {
-        anyhow::bail!("{}: not a USB session (no usb.pcapng)", session_dir.display());
+        anyhow::bail!(
+            "{}: not a USB session (no usb.pcapng)",
+            session_dir.display()
+        );
     }
     let mut reader = UsbReader::open(s.usb_pcapng(), s.frames_idx())?;
     let total = reader.len();
@@ -696,14 +816,21 @@ fn collect_ctrl_session(session_dir: &Path, req_type: Option<&str>) -> Result<Ve
 
 /// A command's alignment identity: `(bRequest, wValue, wIndex, dir)` — not data/status/timing.
 fn ctrl_key(c: &CtrlCmd) -> String {
-    format!("{} {} {} {}", c.setup.b_request, c.setup.w_value, c.setup.w_index, c.setup.dir)
+    format!(
+        "{} {} {} {}",
+        c.setup.b_request, c.setup.w_value, c.setup.w_index, c.setup.dir
+    )
 }
 
 /// Compact one-line rendering of a command (for diffs).
 fn ctrl_oneline(c: &CtrlCmd) -> String {
     let data: String = c.data.iter().take(24).map(|b| format!("{b:02x}")).collect();
     let ell = if c.data.len() > 24 { "…" } else { "" };
-    let d = if c.data.is_empty() { String::new() } else { format!(" data={data}{ell}") };
+    let d = if c.data.is_empty() {
+        String::new()
+    } else {
+        format!(" data={data}{ell}")
+    };
     format!(
         "{} {}/{} req={} val={} idx={} wlen={}{}",
         c.setup.dir.to_uppercase(),
@@ -810,7 +937,10 @@ pub fn ctrl_diff(a_dir: &Path, b_dir: &Path, req_type: Option<&str>) -> Result<(
         }
     }
     flush_same(&mut w, &mut same_run)?;
-    writeln!(w, "\n{dels} only-in-A, {adds} only-in-B, {chg} changed-data")?;
+    writeln!(
+        w,
+        "\n{dels} only-in-A, {adds} only-in-B, {chg} changed-data"
+    )?;
     Ok(())
 }
 
@@ -850,7 +980,10 @@ pub fn sweep_correlate(
     let bursts = group_bursts(&cmds, 500_000_000); // 0.5s gap between transactions
     let n = values.len();
     if bursts.len() < n {
-        anyhow::bail!("found only {} bursts for {n} values — widen the gap or check the capture", bursts.len());
+        anyhow::bail!(
+            "found only {} bursts for {n} values — widen the gap or check the capture",
+            bursts.len()
+        );
     }
     let tail = &bursts[bursts.len() - n..]; // the driven sweep is the last N bursts
 
@@ -889,7 +1022,10 @@ pub fn sweep_correlate(
     for (val, r) in values.iter().zip(tail) {
         let mut row: std::collections::HashMap<(String, String), u8> = Default::default();
         for c in &cmds[r.clone()] {
-            row.insert((c.setup.b_request.clone(), c.setup.w_index.clone()), byte_of(c));
+            row.insert(
+                (c.setup.b_request.clone(), c.setup.w_index.clone()),
+                byte_of(c),
+            );
         }
         write!(w, "{val:>14}")?;
         csv += &format!("{val}");
@@ -910,9 +1046,15 @@ pub fn sweep_correlate(
     }
     if let Some(p) = out_csv {
         std::fs::write(p, &csv)?;
-        writeln!(w, "\nwrote {} — feed to `reveng-rec solve {} --var 0 --bytes 1{}`",
-            p.display(), p.display(),
-            (2..=regs.len()).map(|i| format!(",{i}")).collect::<String>())?;
+        writeln!(
+            w,
+            "\nwrote {} — feed to `reveng-rec solve {} --var 0 --bytes 1{}`",
+            p.display(),
+            p.display(),
+            (2..=regs.len())
+                .map(|i| format!(",{i}"))
+                .collect::<String>()
+        )?;
     }
     Ok(())
 }
@@ -922,13 +1064,19 @@ pub fn sweep_correlate(
 /// "byte" is the low byte of `wValue` (covers both plain OUT register writes and the
 /// obfuscated-IN-carries-the-write style). Folding by timestamp — not the checkpoint's traffic
 /// `event_index`, which USB sessions often leave unset — makes this work on every session.
-fn register_map(cmds: &[CtrlCmd], up_to_ts: i64) -> std::collections::BTreeMap<(String, String), (u8, i64)> {
+fn register_map(
+    cmds: &[CtrlCmd],
+    up_to_ts: i64,
+) -> std::collections::BTreeMap<(String, String), (u8, i64)> {
     let mut m = std::collections::BTreeMap::new();
     for c in cmds {
         if c.ts_ns > up_to_ts {
             break;
         }
-        m.insert((c.setup.b_request.clone(), c.setup.w_index.clone()), (wval_lo(c), c.ts_ns));
+        m.insert(
+            (c.setup.b_request.clone(), c.setup.w_index.clone()),
+            (wval_lo(c), c.ts_ns),
+        );
     }
     m
 }
@@ -960,10 +1108,20 @@ pub fn reg_state(session_dir: &Path, at_ckpt: Option<u64>, req_type: Option<&str
     let m = folded_registers(session_dir, at_ckpt, req_type)?;
     let out = std::io::stdout();
     let mut w = out.lock();
-    writeln!(w, "register state ({} registers){}:", m.len(),
-        at_ckpt.map(|c| format!(" as of checkpoint {c}")).unwrap_or_default())?;
+    writeln!(
+        w,
+        "register state ({} registers){}:",
+        m.len(),
+        at_ckpt
+            .map(|c| format!(" as of checkpoint {c}"))
+            .unwrap_or_default()
+    )?;
     for ((req, idx), (val, ts)) in &m {
-        writeln!(w, "  {req} {idx} = 0x{val:02x}   (last t={:.3}s)", *ts as f64 / 1e9)?;
+        writeln!(
+            w,
+            "  {req} {idx} = 0x{val:02x}   (last t={:.3}s)",
+            *ts as f64 / 1e9
+        )?;
     }
     Ok(())
 }
@@ -984,7 +1142,10 @@ pub fn reg_diff(session_dir: &Path, a: u64, b: u64, req_type: Option<&str>) -> R
         let va = ma.get(k).map(|x| x.0);
         let vb = mb.get(k).map(|x| x.0);
         if va != vb {
-            let fmt = |v: Option<u8>| v.map(|x| format!("0x{x:02x}")).unwrap_or_else(|| "--".into());
+            let fmt = |v: Option<u8>| {
+                v.map(|x| format!("0x{x:02x}"))
+                    .unwrap_or_else(|| "--".into())
+            };
             writeln!(w, "  {} {}:  {} -> {}", k.0, k.1, fmt(va), fmt(vb))?;
             changes += 1;
         }
@@ -995,7 +1156,12 @@ pub fn reg_diff(session_dir: &Path, a: u64, b: u64, req_type: Option<&str>) -> R
 
 /// `track` — a value's time-series across the session: a UIA control's value (from `ui/<id>.json`)
 /// or a register's last-written byte at each checkpoint. Replaces per-checkpoint extraction loops.
-pub fn track(session_dir: &Path, ui_name: Option<&str>, reg: Option<&str>, json: bool) -> Result<()> {
+pub fn track(
+    session_dir: &Path,
+    ui_name: Option<&str>,
+    reg: Option<&str>,
+    json: bool,
+) -> Result<()> {
     let s = SessionReader::open(session_dir)?;
     let checkpoints = s.checkpoints()?;
     let out = std::io::stdout();
@@ -1003,8 +1169,12 @@ pub fn track(session_dir: &Path, ui_name: Option<&str>, reg: Option<&str>, json:
 
     let mut emit = |id: u64, ts: i64, val: String| -> Result<()> {
         if json {
-            writeln!(w, "{}", serde_json::json!({"checkpoint": id, "ts_ns": ts, "value": val}))
-                .map_err(Into::into)
+            writeln!(
+                w,
+                "{}",
+                serde_json::json!({"checkpoint": id, "ts_ns": ts, "value": val})
+            )
+            .map_err(Into::into)
         } else {
             writeln!(w, "  ckpt {id:<4} t={:>9.3}s   {val}", ts as f64 / 1e9).map_err(Into::into)
         }
@@ -1018,7 +1188,8 @@ pub fn track(session_dir: &Path, ui_name: Option<&str>, reg: Option<&str>, json:
                 let Ok(bytes) = std::fs::read(s.ui_dir().join(format!("{sid:06}.json"))) else {
                     continue;
                 };
-                let els: Vec<reveng_winui::UiElement> = serde_json::from_slice(&bytes).unwrap_or_default();
+                let els: Vec<reveng_winui::UiElement> =
+                    serde_json::from_slice(&bytes).unwrap_or_default();
                 if let Some(el) = els.iter().find(|e| {
                     e.name.to_lowercase().contains(&needle)
                         && (e.range_value.is_some() || e.value.is_some())
@@ -1033,7 +1204,9 @@ pub fn track(session_dir: &Path, ui_name: Option<&str>, reg: Option<&str>, json:
             }
         }
         (None, Some(r)) => {
-            let (req, idx) = r.split_once(':').context("--reg must be REQ:IDX, e.g. 0x40:0x1000")?;
+            let (req, idx) = r
+                .split_once(':')
+                .context("--reg must be REQ:IDX, e.g. 0x40:0x1000")?;
             let key = (req.trim().to_string(), idx.trim().to_string());
             let cmds = collect_ctrl_session(session_dir, None)?;
             for c in &checkpoints {
@@ -1057,15 +1230,61 @@ pub fn verify(session_dir: &Path) -> Result<()> {
     let out = std::io::stdout();
     let mut w = out.lock();
     if !s.usb_pcapng().exists() {
-        writeln!(w, "{}: not a USB session (verify currently covers USB)", session_dir.display())?;
+        writeln!(
+            w,
+            "{}: not a USB session (verify currently covers USB)",
+            session_dir.display()
+        )?;
         return Ok(());
     }
     let mut reader = UsbReader::open(s.usb_pcapng(), s.frames_idx())?;
     let total = reader.len();
     writeln!(w, "session {} — {total} USB frames", session_dir.display())?;
     if total == 0 {
+        // An empty wire capture is not evidence of a quiet bus. Setting the wrong capture
+        // speed produces exactly this: the analyzer reports tens of thousands of line-state
+        // *events* it could not frame into packets, and those events are not stored in the
+        // pcapng — so the file that survives is indistinguishable from a clean recording of
+        // an idle bus. Measured: 3 s of a Low-speed keyboard captured as Full gave 0 packets
+        // and 42112 events. Never call that OK.
+        if reader.format() == reveng_usbcap::CaptureFormat::Wire {
+            // With the sidecar this is answerable rather than ambiguous: a capture that is
+            // nothing but line-state churn was sampled at the wrong speed; one with almost
+            // no events saw a genuinely quiet bus.
+            match reveng_cynthion::events::read_summary(reveng_cynthion::events::sidecar_path(
+                &s.usb_pcapng(),
+            ))? {
+                Some(ev) if ev.line_state_changes > 0 => writeln!(
+                    w,
+                    "\n⚠ no packets, but {} line-state transition(s) in {} bus event(s) — the\n  \
+                     analyzer saw signalling it could not frame. That is what a wrong capture\n  \
+                     speed looks like; try another --cynthion-speed.",
+                    ev.line_state_changes, ev.total
+                )?,
+                Some(ev) => writeln!(
+                    w,
+                    "\n⚠ no packets, and {} bus event(s) with no line-state churn — the bus\n  \
+                     looks genuinely idle rather than mis-sampled. Was the target powered and\n  \
+                     routed through the analyzer?",
+                    ev.total
+                )?,
+                None => writeln!(
+                    w,
+                    "\n⚠ a wire capture with no packets, and no bus-event sidecar to say why.\n  \
+                     Either nothing was on the bus or the capture speed was wrong; a capture\n  \
+                     recorded with a current build would record which."
+                )?,
+            }
+            drop(w);
+            std::process::exit(1);
+        }
         return Ok(());
     }
+    // What "integrity" means depends entirely on the backend. USBPcap's failure mode is the
+    // kernel buffer overflowing and dropping whole transfers, detected by SETUPs left
+    // unpaired. A wire capture cannot lose a transfer that way — it can mis-sample, corrupt
+    // or lose individual packets. Different questions, so different checks.
+    let wire_capture = reader.format() == reveng_usbcap::CaptureFormat::Wire;
 
     let xname = |x: u8| match x {
         0 => "iso",
@@ -1074,13 +1293,17 @@ pub fn verify(session_dir: &Path) -> Result<()> {
         3 => "bulk",
         _ => "?",
     };
-    let mut hist: BTreeMap<(u8, u8), (u64, u64)> = BTreeMap::new();
+    // The endpoint histogram and the timeline check are the source-neutral part: both
+    // formats index an endpoint, a direction, a length and a timestamp.
+    let mut hist: BTreeMap<(u8, bool, u8), (u64, u64)> = BTreeMap::new();
     let (mut prev_ts, mut backwards) = (i64::MIN, 0u64);
     let (mut setups, mut completes, mut errs) = (0u64, 0u64, 0u64);
     let mut pending: HashSet<u64> = HashSet::new();
     for i in 0..total {
         let (ep, xf) = (reader.endpoint_at(i)?, reader.xfer_at(i)?);
-        let e = hist.entry((ep, xf)).or_default();
+        // From the index, not from bit 7 of the endpoint: a wire endpoint number carries no
+        // direction bit, so the old derivation labelled every wire frame OUT.
+        let e = hist.entry((ep, reader.dir_in_at(i)?, xf)).or_default();
         e.0 += 1;
         e.1 += reader.len_at(i)? as u64;
         let ts = reader.ts_at(i)?;
@@ -1088,7 +1311,7 @@ pub fn verify(session_dir: &Path) -> Result<()> {
             backwards += 1;
         }
         prev_ts = ts;
-        if xf == reveng_usbcap::XFER_CONTROL {
+        if !wire_capture && xf == reveng_usbcap::XFER_CONTROL {
             let f = reader.frame_at(i)?;
             match f.stage_raw {
                 Some(CTRL_STAGE_SETUP) => {
@@ -1109,33 +1332,41 @@ pub fn verify(session_dir: &Path) -> Result<()> {
     let unpaired = pending.len() as u64;
 
     writeln!(w, "\nendpoints  (ep dir xfer  frames  bytes):")?;
-    for ((ep, xf), (cnt, by)) in &hist {
-        let dir = if ep & 0x80 != 0 { "IN " } else { "OUT" };
+    for ((ep, dir_in, xf), (cnt, by)) in &hist {
+        let dir = if *dir_in { "IN " } else { "OUT" };
         writeln!(w, "  0x{ep:02x} {dir} {:<9} {cnt:>8}  {by}", xname(*xf))?;
     }
-    writeln!(
-        w,
-        "\ncontrol: {setups} SETUP, {completes} complete, {unpaired} unpaired, {errs} non-zero status"
-    )?;
     writeln!(w, "timeline: {backwards} out-of-order timestamp(s)")?;
-    writeln!(
-        w,
-        "note: USBPcap buffer-overflow drops aren't recorded in the pcapng; unpaired SETUPs are the\n      best proxy for lost control transfers (and gaps in a bulk stream for lost data)."
-    )?;
 
     let mut issues = Vec::new();
-    if unpaired > 0 {
+    if backwards > 0 {
         issues.push(format!(
-            "{unpaired} SETUP(s) with no completion — likely dropped/truncated control transfers"
+            "{backwards} frame(s) earlier than the previous — ordering/clock anomaly"
         ));
     }
-    if backwards > 0 {
-        issues.push(format!("{backwards} frame(s) earlier than the previous — ordering/clock anomaly"));
+
+    if wire_capture {
+        verify_wire(&mut w, &mut reader, total, &mut issues, &s.usb_pcapng())?;
+    } else {
+        writeln!(
+            w,
+            "control: {setups} SETUP, {completes} complete, {unpaired} unpaired, {errs} non-zero status"
+        )?;
+        writeln!(
+            w,
+            "note: USBPcap buffer-overflow drops aren't recorded in the pcapng; unpaired SETUPs are the\n      best proxy for lost control transfers (and gaps in a bulk stream for lost data)."
+        )?;
+        if unpaired > 0 {
+            issues.push(format!(
+                "{unpaired} SETUP(s) with no completion — likely dropped/truncated control transfers"
+            ));
+        }
     }
+
     writeln!(w)?;
     if issues.is_empty() {
         writeln!(w, "OK — no capture-integrity problems detected.")?;
-        if errs > 0 {
+        if !wire_capture && errs > 0 {
             writeln!(w, "({errs} control transfer(s) returned a non-zero status — may be normal, e.g. capability probes.)")?;
         }
     } else {
@@ -1144,6 +1375,137 @@ pub fn verify(session_dir: &Path) -> Result<()> {
         }
         drop(w);
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// Bus-level integrity for a wire capture: what can actually go wrong when an analyzer
+/// samples the bus, rather than what goes wrong when a kernel buffer overflows.
+fn verify_wire(
+    w: &mut dyn Write,
+    reader: &mut UsbReader,
+    total: u64,
+    issues: &mut Vec<String>,
+    pcapng: &std::path::Path,
+) -> Result<()> {
+    use reveng_usbcap::reassemble::{check_wire_integrity, ControlOutcome, ControlReassembler};
+
+    let mut packets: Vec<(i64, Vec<u8>)> = Vec::with_capacity(total as usize);
+    for i in 0..total {
+        packets.push((reader.ts_at(i)?, reader.raw_packet_bytes(i)?));
+    }
+
+    // Bus resets live in the event sidecar, not the packet file, but they belong in this
+    // scan: a reset returns every endpoint's data toggle to DATA0, so without them the first
+    // packet after each reset reads as a violation. Merged by timestamp.
+    let resets =
+        reveng_cynthion::events::read_bus_resets(reveng_cynthion::events::sidecar_path(pcapng))
+            .unwrap_or_default();
+    let mut stream: Vec<(i64, Option<&[u8]>)> = packets
+        .iter()
+        .map(|(ts, p)| (*ts, Some(p.as_slice())))
+        .chain(resets.iter().map(|ts| (*ts, None)))
+        .collect();
+    stream.sort_by_key(|(ts, p)| (*ts, p.is_some()));
+    let r = check_wire_integrity(stream.iter().map(|(_, p)| match p {
+        Some(bytes) => reveng_usbcap::reassemble::StreamItem::Packet(bytes),
+        None => reveng_usbcap::reassemble::StreamItem::BusReset,
+    }));
+
+    let mut asm = ControlReassembler::new();
+    let mut transfers = Vec::new();
+    for (i, p) in packets.iter().enumerate() {
+        if let Some(t) = asm.push(i as u64, p.0, &p.1) {
+            transfers.push(t);
+        }
+    }
+    transfers.extend(asm.finish());
+    let incomplete = transfers
+        .iter()
+        .filter(|t| t.outcome == ControlOutcome::Incomplete)
+        .count() as u64;
+    let stalled = transfers
+        .iter()
+        .filter(|t| t.outcome == ControlOutcome::Stall)
+        .count() as u64;
+
+    writeln!(
+        w,
+        "wire: {} undecodable, {} CRC error(s), {} DATA without handshake, {} toggle anomal{}",
+        r.undecodable,
+        r.crc_errors,
+        r.data_without_handshake,
+        r.toggle_anomalies,
+        if r.toggle_anomalies == 1 { "y" } else { "ies" }
+    )?;
+    writeln!(
+        w,
+        "bus:   {} NAK(s), {} SOF(s)  — normal traffic, reported because a host-stack capture hides it",
+        r.naks, r.sofs
+    )?;
+    writeln!(
+        w,
+        "control: {} transfer(s), {stalled} stalled, {incomplete} incomplete",
+        transfers.len()
+    )?;
+    // The bus events are the only place an analyzer-side gap is recorded: nothing in the
+    // packet stream shows that the analyzer overflowed and dropped data before we saw it.
+    match reveng_cynthion::events::read_summary(reveng_cynthion::events::sidecar_path(pcapng))? {
+        Some(ev) => {
+            writeln!(
+                w,
+                "bus events: {} total, {} reset(s), {} speed change(s), {} line-state change(s), {} overflow(s)",
+                ev.total, ev.bus_resets, ev.speed_changes, ev.line_state_changes, ev.overflows
+            )?;
+            if ev.overflows > 0 {
+                issues.push(format!(
+                    "{} analyzer buffer overflow(s) — the analyzer dropped data before it \
+                     reached us, so this capture has gaps nothing in the packets can reveal",
+                    ev.overflows
+                ));
+            }
+        }
+        None => writeln!(
+            w,
+            "note: no bus-event sidecar beside this capture, so an analyzer-side gap cannot be\n      detected — only packet-level damage. Captures recorded with a current build have one."
+        )?,
+    }
+
+    if r.undecodable > 0 {
+        // Note this is *not* the wrong-speed signature: an analyzer that cannot frame the
+        // signalling emits line-state events, not malformed packets, so a wrong speed shows
+        // up as an empty capture (handled above). Undecodable packets in a non-empty capture
+        // mean something damaged them after framing.
+        issues.push(format!(
+            "{} packet(s) did not decode — a bad PID byte or a truncated packet, meaning the \
+             analyzer framed something it could not deliver intact",
+            r.undecodable
+        ));
+    }
+    if r.crc_errors > 0 {
+        issues.push(format!(
+            "{} packet(s) failed CRC — bus errors, or the analyzer sampling badly",
+            r.crc_errors
+        ));
+    }
+    if r.data_without_handshake > 0 {
+        issues.push(format!(
+            "{} DATA packet(s) with no handshake — lost packets (or an isochronous endpoint, \
+             which has none by design)",
+            r.data_without_handshake
+        ));
+    }
+    if r.toggle_anomalies > 0 {
+        issues.push(format!(
+            "{} ACKed DATA packet(s) with an unexpected toggle — a packet was lost between \
+             them",
+            r.toggle_anomalies
+        ));
+    }
+    if incomplete > 0 {
+        issues.push(format!(
+            "{incomplete} control transfer(s) with no status stage — truncated capture"
+        ));
     }
     Ok(())
 }
@@ -1225,11 +1587,7 @@ pub fn ocr(
         // Cursor position in image pixels (word distances are measured from here).
         let (cursor_px, cursor_py) = match geom.get(&id) {
             Some(g) => (g.cursor_x - g.origin_x, g.cursor_y - g.origin_y),
-            None => s
-                .checkpoint(id)
-                .ok()
-                .map(|c| c.cursor)
-                .unwrap_or((0, 0)),
+            None => s.checkpoint(id).ok().map(|c| c.cursor).unwrap_or((0, 0)),
         };
 
         // Cache: ocr/<id>.json. Reuse unless --refresh.
@@ -1422,14 +1780,23 @@ pub fn stream(session_dir: &Path, ep: Option<u8>, logical: bool, text: bool) -> 
     }
     // Non-logical, or non-USB: just the filtered frames.
     if !logical || matches!(log, Log::Pcie(_)) {
-        return frames(session_dir, None, 0, Some(&format!("0:{}", total - 1)), ep, PayloadFmt::Json);
+        return frames(
+            session_dir,
+            None,
+            0,
+            Some(&format!("0:{}", total - 1)),
+            ep,
+            PayloadFmt::Json,
+        );
     }
 
     // Logical reassembly (USB): concatenate consecutive frames sharing (endpoint, dir)
     // into one message. Raw frames stay available; this is a view, never a mutation (§8b).
     // Note: a message accumulates until the endpoint changes, so a very long single-endpoint
     // stream yields one large in-memory message — use `--range` to bound huge captures.
-    let Log::Usb(reader) = &mut log else { unreachable!() };
+    let Log::Usb(reader) = &mut log else {
+        unreachable!()
+    };
     let out = std::io::stdout();
     let mut w = out.lock();
 
@@ -1542,7 +1909,10 @@ pub fn payload(session_dir: &Path, frame: u64, fmt: PayloadFmt) -> Result<()> {
         (_, PayloadFmt::Base64) => {
             use base64::Engine;
             let bytes = log.payload_bytes(frame)?;
-            println!("{}", base64::engine::general_purpose::STANDARD.encode(&bytes));
+            println!(
+                "{}",
+                base64::engine::general_purpose::STANDARD.encode(&bytes)
+            );
             Ok(())
         }
         (_, PayloadFmt::Text) => {
@@ -1568,10 +1938,23 @@ pub fn diff(session_dir: &Path, a: u64, b: u64) -> Result<()> {
     let s = SessionReader::open(session_dir)?;
     let ca = s.checkpoint(a)?;
     let cb = s.checkpoint(b)?;
-    let ia = ca.anchor.map(|x| x.event_index).context("checkpoint a has no anchor")?;
-    let ib = cb.anchor.map(|x| x.event_index).context("checkpoint b has no anchor")?;
+    let ia = ca
+        .anchor
+        .map(|x| x.event_index)
+        .context("checkpoint a has no anchor")?;
+    let ib = cb
+        .anchor
+        .map(|x| x.event_index)
+        .context("checkpoint b has no anchor")?;
     let (lo, hi) = if ia <= ib { (ia, ib) } else { (ib, ia) };
-    frames(session_dir, None, 0, Some(&format!("{lo}:{hi}")), None, PayloadFmt::Json)
+    frames(
+        session_dir,
+        None,
+        0,
+        Some(&format!("{lo}:{hi}")),
+        None,
+        PayloadFmt::Json,
+    )
 }
 
 /// `grep` — USB: frames whose payload contains a hex byte pattern; PCIe: events whose
@@ -1773,10 +2156,7 @@ fn parse_range(r: &str) -> Result<(u64, u64)> {
 
 /// Parse a hex byte pattern like `12 01` / `1201` / `0x12,0x01` into bytes.
 fn parse_hex_pattern(p: &str) -> Result<Vec<u8>> {
-    let cleaned: String = p
-        .chars()
-        .filter(|c| c.is_ascii_hexdigit())
-        .collect();
+    let cleaned: String = p.chars().filter(|c| c.is_ascii_hexdigit()).collect();
     if cleaned.is_empty() || !cleaned.len().is_multiple_of(2) {
         anyhow::bail!("hex pattern must be an even number of hex digits");
     }
@@ -1791,4 +2171,108 @@ fn contains_subslice(hay: &[u8], needle: &[u8]) -> bool {
         return false;
     }
     hay.windows(needle.len()).any(|w| w == needle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reveng_usbcap::{wire, UsbWriter};
+
+    fn token(pid: u8, addr: u8, ep: u8) -> Vec<u8> {
+        let f = wire::token_field(wire::token_payload(addr, ep));
+        vec![wire::pid_byte(pid), f[0], f[1]]
+    }
+    fn data(pid: u8, payload: &[u8]) -> Vec<u8> {
+        let mut v = vec![wire::pid_byte(pid)];
+        v.extend_from_slice(payload);
+        v.extend_from_slice(&wire::crc16(payload).to_le_bytes());
+        v
+    }
+    fn hs(pid: u8) -> Vec<u8> {
+        vec![wire::pid_byte(pid)]
+    }
+
+    /// End-to-end for the wire control path: packets → `usb.pcapng` → `UsbReader` →
+    /// reassembler → `CtrlCmd`. The reassembler's own logic is unit-tested in `usbcap`;
+    /// what this covers is the plumbing between them, including the outcome mapping that
+    /// must *not* render a bus handshake as a `USBD_STATUS`.
+    #[test]
+    fn wire_control_transfers_reach_ctrlcmd() {
+        let dir = std::env::temp_dir();
+        let pcapng = dir.join("reveng_q_wire_ctrl.pcapng");
+        let idx = dir.join("reveng_q_wire_ctrl.idx");
+        let _ = std::fs::remove_file(&pcapng);
+        let _ = std::fs::remove_file(&idx);
+
+        // GET_DESCRIPTOR(Device) that the device NAKs once before answering, then a
+        // vendor request it stalls.
+        let get_desc = [0x80u8, 0x06, 0x00, 0x01, 0x00, 0x00, 0x08, 0x00];
+        let vendor = [0xc0u8, 0x42, 0x34, 0x12, 0x00, 0x00, 0x01, 0x00];
+        let desc = [0x12, 0x01, 0x00, 0x02, 0x00, 0x00, 0x00, 0x40];
+        let packets: Vec<Vec<u8>> = vec![
+            token(wire::PID_SETUP, 1, 0),
+            data(wire::PID_DATA0, &get_desc),
+            hs(wire::PID_ACK),
+            token(wire::PID_IN, 1, 0),
+            hs(wire::PID_NAK),
+            token(wire::PID_IN, 1, 0),
+            data(wire::PID_DATA1, &desc),
+            hs(wire::PID_ACK),
+            token(wire::PID_OUT, 1, 0),
+            data(wire::PID_DATA1, &[]),
+            hs(wire::PID_ACK),
+            token(wire::PID_SETUP, 1, 0),
+            data(wire::PID_DATA0, &vendor),
+            hs(wire::PID_ACK),
+            token(wire::PID_IN, 1, 0),
+            hs(wire::PID_STALL),
+        ];
+        {
+            let mut w = UsbWriter::create_wire(
+                &pcapng,
+                &idx,
+                reveng_usbcap::pcapng::LINKTYPE_USB_2_0_HIGH_SPEED,
+            )
+            .unwrap();
+            for (i, p) in packets.iter().enumerate() {
+                w.append_packet((i as i64 + 1) * 1_000, p).unwrap();
+            }
+            w.flush().unwrap();
+        }
+
+        let mut r = UsbReader::open(&pcapng, &idx).unwrap();
+        let total = r.len();
+        let cmds = collect_ctrl(&mut r, 0, total - 1, None).unwrap();
+        assert_eq!(cmds.len(), 2);
+
+        assert_eq!(cmds[0].setup.b_request, "0x06");
+        assert_eq!(cmds[0].setup.dir, "in");
+        assert_eq!(cmds[0].data, desc);
+        assert_eq!(cmds[0].outcome, Some("ok"));
+        assert_eq!(cmds[0].naks, 1, "the retry is reported, not hidden");
+        assert_eq!(cmds[0].status, None, "no USBD_STATUS exists on the wire");
+
+        assert_eq!(cmds[1].setup.req_type, "vendor");
+        assert_eq!(cmds[1].setup.w_value, "0x1234");
+        assert_eq!(cmds[1].outcome, Some("STALL"));
+        assert!(cmds[1].data.is_empty());
+
+        // The rendered line must show the handshake, never an `ERR 0x…` NTSTATUS shape.
+        let mut buf: Vec<u8> = Vec::new();
+        emit_ctrl(&mut buf, &cmds[0], false).unwrap();
+        emit_ctrl(&mut buf, &cmds[1], false).unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("ok (1 NAK)"), "got: {text}");
+        assert!(text.contains("STALL"), "got: {text}");
+        assert!(!text.contains("ERR 0x"), "got: {text}");
+
+        // The type filter must work on a wire session too — `ctrl --type vendor` is how a
+        // vendor protocol gets isolated from enumeration noise.
+        let only_vendor = collect_ctrl(&mut r, 0, total - 1, Some("vendor")).unwrap();
+        assert_eq!(only_vendor.len(), 1);
+        assert_eq!(only_vendor[0].setup.b_request, "0x42");
+
+        let _ = std::fs::remove_file(&pcapng);
+        let _ = std::fs::remove_file(&idx);
+    }
 }

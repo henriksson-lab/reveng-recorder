@@ -54,7 +54,8 @@ pub fn run(
     byte_cols: &[usize],
     filter: Option<(usize, String)>,
 ) -> Result<()> {
-    let text = std::fs::read_to_string(csv).with_context(|| format!("reading {}", csv.display()))?;
+    let text =
+        std::fs::read_to_string(csv).with_context(|| format!("reading {}", csv.display()))?;
     let mut vars: Vec<f64> = Vec::new();
     let mut rows: Vec<Vec<u8>> = Vec::new();
     for line in text.lines() {
@@ -89,8 +90,18 @@ pub fn run(
     // linear in 1/var (e.g. an analog-gain register) or ln(var) is found too. Best form wins.
     let var_forms: Vec<(&'static str, Vec<f64>)> = vec![
         ("var", vars.clone()),
-        ("1/var", vars.iter().map(|&v| if v != 0.0 { 1.0 / v } else { f64::NAN }).collect()),
-        ("ln var", vars.iter().map(|&v| if v > 0.0 { v.ln() } else { f64::NAN }).collect()),
+        (
+            "1/var",
+            vars.iter()
+                .map(|&v| if v != 0.0 { 1.0 / v } else { f64::NAN })
+                .collect(),
+        ),
+        (
+            "ln var",
+            vars.iter()
+                .map(|&v| if v > 0.0 { v.ln() } else { f64::NAN })
+                .collect(),
+        ),
     ];
     let var_forms: Vec<(&'static str, Vec<f64>)> = var_forms
         .into_iter()
@@ -121,14 +132,22 @@ pub fn run(
     let mut best: Vec<Cand> = Vec::new();
     let mut push = |r: f64, desc: String, var_form: &'static str, slope: f64, intercept: f64| {
         if r > 0.9 {
-            best.push(Cand { r, desc, var_form, slope, intercept });
+            best.push(Cand {
+                r,
+                desc,
+                var_form,
+                slope,
+                intercept,
+            });
         }
     };
 
     // Single byte, XOR key.
     for bi in 0..nb {
         for k in 0u16..256 {
-            let ys: Vec<f64> = (0..nrows).map(|r| (byte(r, bi) ^ k as i64) as f64).collect();
+            let ys: Vec<f64> = (0..nrows)
+                .map(|r| (byte(r, bi) ^ k as i64) as f64)
+                .collect();
             let (r, vf, s, ic) = fit(&ys);
             push(r, format!("col{}^0x{:02x}", byte_cols[bi], k), vf, s, ic);
         }
@@ -153,7 +172,10 @@ pub fn run(
                         if r > 0.985 {
                             let d = format!(
                                 "(col{}^{:02x}:col{}^{:02x}){}",
-                                byte_cols[h], kh, byte_cols[l], kl,
+                                byte_cols[h],
+                                kh,
+                                byte_cols[l],
+                                kl,
                                 if inv { " inv16" } else { "" }
                             );
                             push(r, d, vf, s, ic);
@@ -165,7 +187,9 @@ pub fn run(
     }
 
     best.sort_by(|a, b| b.r.total_cmp(&a.r));
-    best.dedup_by(|a, b| (a.r - b.r).abs() < 1e-9 && a.desc.split('^').next() == b.desc.split('^').next());
+    best.dedup_by(|a, b| {
+        (a.r - b.r).abs() < 1e-9 && a.desc.split('^').next() == b.desc.split('^').next()
+    });
     println!("Top transforms (value = transform(bytes), by |Pearson r| vs the variable):\n");
     for c in best.iter().take(12) {
         let extra = if c.var_form == "var" && c.slope != 0.0 {

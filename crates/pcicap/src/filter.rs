@@ -122,8 +122,13 @@ unsafe fn update_upper_filters(
 
     if filters.is_empty() {
         // No remaining filters: delete the property.
-        return SetupDiSetDeviceRegistryPropertyW(hdev, info as *const _ as *mut _, SPDRP_UPPERFILTERS, None)
-            .map_err(|e| anyhow::anyhow!("clear UpperFilters failed: {e}"));
+        return SetupDiSetDeviceRegistryPropertyW(
+            hdev,
+            info as *const _ as *mut _,
+            SPDRP_UPPERFILTERS,
+            None,
+        )
+        .map_err(|e| anyhow::anyhow!("clear UpperFilters failed: {e}"));
     }
 
     // REG_MULTI_SZ: each entry is NUL-terminated, with one final NUL terminator.
@@ -134,8 +139,13 @@ unsafe fn update_upper_filters(
     }
     u16s.push(0);
     let bytes = u16_slice_as_bytes(&u16s);
-    SetupDiSetDeviceRegistryPropertyW(hdev, info as *const _ as *mut _, SPDRP_UPPERFILTERS, Some(bytes))
-        .map_err(|e| anyhow::anyhow!("set UpperFilters failed: {e}"))
+    SetupDiSetDeviceRegistryPropertyW(
+        hdev,
+        info as *const _ as *mut _,
+        SPDRP_UPPERFILTERS,
+        Some(bytes),
+    )
+    .map_err(|e| anyhow::anyhow!("set UpperFilters failed: {e}"))
 }
 
 /// Restart the device (DIF_PROPERTYCHANGE / DICS_PROPCHANGE) so the filter change takes effect.
@@ -165,7 +175,11 @@ fn u16_slice_as_bytes(s: &[u16]) -> &[u8] {
 }
 
 /// Read a REG_DWORD-ish property as u32 (first 4 bytes), via the two-call size/fetch pattern.
-unsafe fn get_u32(hdev: HDEVINFO, info: &SP_DEVINFO_DATA, prop: SETUP_DI_REGISTRY_PROPERTY) -> Option<u32> {
+unsafe fn get_u32(
+    hdev: HDEVINFO,
+    info: &SP_DEVINFO_DATA,
+    prop: SETUP_DI_REGISTRY_PROPERTY,
+) -> Option<u32> {
     let mut needed = 0u32;
     let _ = SetupDiGetDeviceRegistryPropertyW(hdev, info, prop, None, None, Some(&mut needed));
     if needed < 4 {
@@ -189,7 +203,11 @@ unsafe fn get_multi_sz(
         Ok(()) => {}
         Err(e) if e.code() == ERROR_INSUFFICIENT_BUFFER.to_hresult() => {}
         Err(e) if e.code() == ERROR_INVALID_DATA.to_hresult() => return Ok(Vec::new()),
-        Err(e) => return Err(anyhow::anyhow!("read existing UpperFilters size failed: {e}")),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "read existing UpperFilters size failed: {e}"
+            ))
+        }
     }
     if needed < 2 {
         return Ok(Vec::new());

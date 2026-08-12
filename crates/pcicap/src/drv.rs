@@ -232,7 +232,11 @@ impl CaptureSource for DrvPcieSource {
                 None,
             )
         }
-        .map_err(|e| anyhow::anyhow!("open \\\\.\\RevengPciCap failed: {e} (is reveng-pcidrv installed? admin?)"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "open \\\\.\\RevengPciCap failed: {e} (is reveng-pcidrv installed? admin?)"
+            )
+        })?;
         if handle == INVALID_HANDLE_VALUE {
             anyhow::bail!("\\\\.\\RevengPciCap returned an invalid handle");
         }
@@ -341,7 +345,16 @@ fn ioctl_snap(handle: &Option<Arc<OwnedHandle>>, code: u32, arg: u32) -> anyhow:
         (None, 0)
     };
     unsafe {
-        DeviceIoControl(h.0, code, in_ptr, in_len, None, 0, Some(&mut returned), None)
+        DeviceIoControl(
+            h.0,
+            code,
+            in_ptr,
+            in_len,
+            None,
+            0,
+            Some(&mut returned),
+            None,
+        )
     }
     .map_err(|e| anyhow::anyhow!("PCIe snapshot IOCTL 0x{code:08x} failed: {e}"))?;
     Ok(())
@@ -479,18 +492,37 @@ mod tests {
         let c = decode_event(&ev(KIND_CONFIG, 0, 4, 0, 0x04, 0x0010_0006, 0), 42).unwrap();
         assert_eq!(
             c,
-            PcieEvent::Config { ts_ns: 42, offset: 4, width: 4, value: 0x0010_0006, dir: Dir::In }
+            PcieEvent::Config {
+                ts_ns: 42,
+                offset: 4,
+                width: 4,
+                value: 0x0010_0006,
+                dir: Dir::In
+            }
         );
         let m = decode_event(&ev(KIND_MMIO, 1, 4, 2, 0x40, 1, 0), 7).unwrap();
         assert_eq!(
             m,
-            PcieEvent::Mmio { ts_ns: 7, bar: 2, offset: 0x40, width: 4, value: 1, dir: Dir::Out }
+            PcieEvent::Mmio {
+                ts_ns: 7,
+                bar: 2,
+                offset: 0x40,
+                width: 4,
+                value: 1,
+                dir: Dir::Out
+            }
         );
     }
 
     #[test]
     fn bdf_ioctl_bytes_layout() {
-        let b = Bdf { segment: 0, bus: 3, device: 0, function: 1 }.to_ioctl_bytes();
+        let b = Bdf {
+            segment: 0,
+            bus: 3,
+            device: 0,
+            function: 1,
+        }
+        .to_ioctl_bytes();
         assert_eq!(b[2], 3);
         assert_eq!(b[3], 0);
         assert_eq!(b[4], 1);

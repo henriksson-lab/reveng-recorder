@@ -1,0 +1,26 @@
+[package]
+name = "reveng-cynthion"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Hardware USB 2.0 analyzer backend. Unlike the USBPcap backend this needs no kernel
+# driver and no vendor SDK — it talks to the board over `nusb`, so capture works on
+# Linux, macOS and Windows alike.
+
+[dependencies]
+reveng-core.workspace = true
+reveng-usbcap.workspace = true
+anyhow.workspace = true
+serde.workspace = true
+nusb = "0.1"
+futures-lite = "2"
+futures-channel = "0.3"
+
+[[bin]]
+name = "cynthion-probe"
+path = "src/bin/probe.rs"
+
+[[bin]]
+name = "cynthion-capture"
+path = "src/bin/capture.rs"

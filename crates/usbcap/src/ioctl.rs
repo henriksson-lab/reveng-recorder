@@ -41,18 +41,25 @@ const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> 
     (device_type << 16) | (access << 14) | (function << 2) | method
 }
 
-const IOCTL_USBPCAP_SETUP_BUFFER: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, 0x800, METHOD_BUFFERED, FILE_READ_ACCESS);
+const IOCTL_USBPCAP_SETUP_BUFFER: u32 = ctl_code(
+    FILE_DEVICE_UNKNOWN,
+    0x800,
+    METHOD_BUFFERED,
+    FILE_READ_ACCESS,
+);
 const IOCTL_USBPCAP_START_FILTERING: u32 = ctl_code(
     FILE_DEVICE_UNKNOWN,
     0x801,
     METHOD_BUFFERED,
     FILE_READ_ACCESS | FILE_WRITE_ACCESS,
 );
-const IOCTL_USBPCAP_GET_HUB_SYMLINK: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, 0);
-const IOCTL_USBPCAP_SET_SNAPLEN_SIZE: u32 =
-    ctl_code(FILE_DEVICE_UNKNOWN, 0x804, METHOD_BUFFERED, FILE_READ_ACCESS);
+const IOCTL_USBPCAP_GET_HUB_SYMLINK: u32 = ctl_code(FILE_DEVICE_UNKNOWN, 0x803, METHOD_BUFFERED, 0);
+const IOCTL_USBPCAP_SET_SNAPLEN_SIZE: u32 = ctl_code(
+    FILE_DEVICE_UNKNOWN,
+    0x804,
+    METHOD_BUFFERED,
+    FILE_READ_ACCESS,
+);
 
 /// USBPcapCMD's defaults (`DEFAULT_SNAPSHOT_LENGTH`, `DEFAULT_INTERNAL_KERNEL_BUFFER_SIZE`).
 pub const DEFAULT_SNAPLEN: u32 = 65535;
@@ -198,8 +205,18 @@ pub fn open_capture(
     let owned = Arc::new(OwnedHandle(handle));
 
     // snaplen, then buffer size, then start filtering — order matters (see USBPcap thread.c).
-    ioctl_set_size(&owned, IOCTL_USBPCAP_SET_SNAPLEN_SIZE, snaplen, "set snaplen")?;
-    ioctl_set_size(&owned, IOCTL_USBPCAP_SETUP_BUFFER, buffer_bytes, "setup buffer")?;
+    ioctl_set_size(
+        &owned,
+        IOCTL_USBPCAP_SET_SNAPLEN_SIZE,
+        snaplen,
+        "set snaplen",
+    )?;
+    ioctl_set_size(
+        &owned,
+        IOCTL_USBPCAP_SETUP_BUFFER,
+        buffer_bytes,
+        "setup buffer",
+    )?;
 
     let filter = AddressFilter::new(addresses, filter_all);
     let mut returned = 0u32;

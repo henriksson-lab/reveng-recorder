@@ -11,9 +11,14 @@ use reveng_usbcap::UsbReader;
 
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let session = args.next().expect("usage: extract_frame <session> <out.raw> [frame_bytes]");
+    let session = args
+        .next()
+        .expect("usage: extract_frame <session> <out.raw> [frame_bytes]");
     let out = args.next().expect("need out path");
-    let frame_bytes: usize = args.next().and_then(|s| s.parse().ok()).unwrap_or(3328 * 2548);
+    let frame_bytes: usize = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(3328 * 2548);
 
     let s = SessionReader::open(&session)?;
     let mut r = UsbReader::open(s.usb_pcapng(), s.frames_idx())?;

@@ -92,7 +92,10 @@ mod imp {
             let looked = LookupPrivilegeValueW(None, w!("SeDebugPrivilege"), &mut luid);
             let tp = TOKEN_PRIVILEGES {
                 PrivilegeCount: 1,
-                Privileges: [LUID_AND_ATTRIBUTES { Luid: luid, Attributes: SE_PRIVILEGE_ENABLED }],
+                Privileges: [LUID_AND_ATTRIBUTES {
+                    Luid: luid,
+                    Attributes: SE_PRIVILEGE_ENABLED,
+                }],
             };
             let adjusted = AdjustTokenPrivileges(token, false, Some(&tp), 0, None, None);
             let adjust_error = GetLastError();

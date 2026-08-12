@@ -23,7 +23,9 @@ fn main() -> anyhow::Result<()> {
     let ctx = reveng_winput::foreground_context();
     println!("foreground context: process={:?} window={:?}", ctx.0, ctx.1);
 
-    let saw_key = events.iter().any(|e| matches!(e.kind, reveng_winput::InputKind::KeyDown));
+    let saw_key = events
+        .iter()
+        .any(|e| matches!(e.kind, reveng_winput::InputKind::KeyDown));
     if !saw_key {
         anyhow::bail!("FAIL: no KeyDown event captured from injected input");
     }

@@ -27,8 +27,8 @@ use windows::core::{GUID, PCWSTR, PWSTR};
 use windows::Win32::Foundation::ERROR_ALREADY_EXISTS;
 use windows::Win32::System::Diagnostics::Etw::{
     CloseTrace, ControlTraceW, OpenTraceW, ProcessTrace, StartTraceW, CONTROLTRACE_HANDLE,
-    EVENT_HEADER_FLAG_64_BIT_HEADER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP,
-    EVENT_TRACE_FLAG_DPC, EVENT_TRACE_FLAG_INTERRUPT, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
+    EVENT_HEADER_FLAG_64_BIT_HEADER, EVENT_RECORD, EVENT_TRACE_CONTROL_STOP, EVENT_TRACE_FLAG_DPC,
+    EVENT_TRACE_FLAG_INTERRUPT, EVENT_TRACE_LOGFILEW, EVENT_TRACE_PROPERTIES,
     EVENT_TRACE_REAL_TIME_MODE, PROCESSTRACE_HANDLE, PROCESS_TRACE_MODE_EVENT_RECORD,
     PROCESS_TRACE_MODE_REAL_TIME, WNODE_FLAG_TRACED_GUID,
 };
@@ -135,7 +135,8 @@ struct TraceProps {
 impl TraceProps {
     fn new() -> Self {
         // Space for the fixed struct + a generous logger-name tail.
-        let size = std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 2 * (KERNEL_LOGGER_NAME.len() + 1) * 2;
+        let size =
+            std::mem::size_of::<EVENT_TRACE_PROPERTIES>() + 2 * (KERNEL_LOGGER_NAME.len() + 1) * 2;
         Self {
             buf: vec![0u64; size.div_ceil(std::mem::size_of::<u64>())],
         }
@@ -214,7 +215,11 @@ unsafe extern "system" fn event_callback(record: *mut EVENT_RECORD) {
             } else {
                 0
             };
-            let vec = if opcode == OPCODE_ISR && len >= 18 { *data.add(17) } else { 0 };
+            let vec = if opcode == OPCODE_ISR && len >= 18 {
+                *data.add(17)
+            } else {
+                0
+            };
             eprintln!("[etw] op={opcode} routine={routine:#018x} vec={vec:#04x} len={len}");
         }
     }

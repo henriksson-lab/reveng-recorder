@@ -98,9 +98,9 @@ impl<R: FixedRecord> IndexFile<R> {
             ));
         }
         let mut buf = vec![0u8; R::SIZE];
-        let offset = index
-            .checked_mul(R::SIZE as u64)
-            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "index offset overflow"))?;
+        let offset = index.checked_mul(R::SIZE as u64).ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidInput, "index offset overflow")
+        })?;
         self.file.seek(SeekFrom::Start(offset))?;
         self.file.read_exact(&mut buf)?;
         Ok(R::read_from(&buf))
@@ -160,11 +160,12 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let mut idx = IndexFile::<Rec>::create(&path).unwrap();
         for (i, ts) in [10i64, 20, 30, 40].iter().enumerate() {
-            let n = idx.append(&Rec {
-                ts: *ts,
-                v: i as u32,
-            })
-            .unwrap();
+            let n = idx
+                .append(&Rec {
+                    ts: *ts,
+                    v: i as u32,
+                })
+                .unwrap();
             assert_eq!(n, i as u64);
         }
         assert_eq!(idx.len(), 4);
@@ -185,14 +186,20 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         std::fs::write(&path, [0u8; 1]).unwrap();
         assert_eq!(
-            IndexFile::<Rec>::open(&path).err().expect("partial index must fail").kind(),
+            IndexFile::<Rec>::open(&path)
+                .err()
+                .expect("partial index must fail")
+                .kind(),
             std::io::ErrorKind::InvalidData
         );
 
         let mut idx = IndexFile::<Rec>::create(&path).unwrap();
         idx.append(&Rec { ts: 1, v: 1 }).unwrap();
         assert_eq!(
-            idx.get(1).err().expect("out-of-bounds get must fail").kind(),
+            idx.get(1)
+                .err()
+                .expect("out-of-bounds get must fail")
+                .kind(),
             std::io::ErrorKind::UnexpectedEof
         );
         let _ = std::fs::remove_file(&path);

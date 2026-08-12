@@ -188,7 +188,11 @@ pub fn snapshot_foreground() -> anyhow::Result<Vec<UiElement>> {
 /// This lets a capture drive an app to precise, known values while recording the wire.
 ///
 /// `set_range` sets a Slider/Spinner via the RangeValue pattern and returns the value read back.
-pub fn set_range(window_substr: &str, name_substr: &str, value: f64) -> anyhow::Result<Option<f64>> {
+pub fn set_range(
+    window_substr: &str,
+    name_substr: &str,
+    value: f64,
+) -> anyhow::Result<Option<f64>> {
     #[cfg(windows)]
     {
         imp::set_range(window_substr, name_substr, value)
@@ -201,7 +205,11 @@ pub fn set_range(window_substr: &str, name_substr: &str, value: f64) -> anyhow::
 }
 
 /// Set a CheckBox/toggle to `on` (toggles only if it isn't already there). Returns the new state.
-pub fn set_toggle(window_substr: &str, name_substr: &str, on: bool) -> anyhow::Result<Option<bool>> {
+pub fn set_toggle(
+    window_substr: &str,
+    name_substr: &str,
+    on: bool,
+) -> anyhow::Result<Option<bool>> {
     #[cfg(windows)]
     {
         imp::set_toggle(window_substr, name_substr, on)
@@ -231,6 +239,7 @@ mod imp {
     use super::{control_type_name, UiElement, WindowInfo};
     use anyhow::{Context, Result};
     use windows::core::{Interface, BOOL};
+    use windows::Win32::Foundation::POINT;
     use windows::Win32::Foundation::{HWND, LPARAM, RECT};
     use windows::Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_MULTITHREADED,
@@ -242,7 +251,6 @@ mod imp {
         UIA_InvokePatternId, UIA_RangeValuePatternId, UIA_SelectionItemPatternId,
         UIA_TogglePatternId, UIA_ValuePatternId,
     };
-    use windows::Win32::Foundation::POINT;
     use windows::Win32::UI::WindowsAndMessaging::{
         EnumWindows, GetAncestor, GetForegroundWindow, GetWindowTextLengthW, GetWindowTextW,
         IsWindowVisible, RealGetWindowClassW, WindowFromPoint, GA_ROOT,
@@ -266,7 +274,11 @@ mod imp {
                     let mut cbuf = [0u16; 256];
                     let clen = RealGetWindowClassW(hwnd, &mut cbuf);
                     let class_name = String::from_utf16_lossy(&cbuf[..clen as usize]);
-                    out.push(WindowInfo { hwnd: hwnd.0 as isize, title, class_name });
+                    out.push(WindowInfo {
+                        hwnd: hwnd.0 as isize,
+                        title,
+                        class_name,
+                    });
                 }
             }
             BOOL(1)
@@ -338,13 +350,25 @@ mod imp {
                     Ok(a) => a,
                     Err(_) => continue,
                 };
-            let Ok(root) = automation.ElementFromHandle(HWND(hwnd as *mut _)) else { continue };
-            let Ok(cond) = automation.CreateTrueCondition() else { continue };
-            let Ok(array) = root.FindAll(TreeScope_Subtree, &cond) else { continue };
+            let Ok(root) = automation.ElementFromHandle(HWND(hwnd as *mut _)) else {
+                continue;
+            };
+            let Ok(cond) = automation.CreateTrueCondition() else {
+                continue;
+            };
+            let Ok(array) = root.FindAll(TreeScope_Subtree, &cond) else {
+                continue;
+            };
             let n = array.Length().unwrap_or(0);
             for i in 0..n {
-                let Ok(el) = array.GetElement(i) else { continue };
-                let name = el.CurrentName().map(|b| b.to_string()).unwrap_or_default().to_lowercase();
+                let Ok(el) = array.GetElement(i) else {
+                    continue;
+                };
+                let name = el
+                    .CurrentName()
+                    .map(|b| b.to_string())
+                    .unwrap_or_default()
+                    .to_lowercase();
                 if !name.contains(&needle) {
                     continue;
                 }
@@ -410,7 +434,9 @@ mod imp {
 
             let mut out = Vec::with_capacity(n as usize);
             for i in 0..n {
-                let Ok(el) = array.GetElement(i) else { continue };
+                let Ok(el) = array.GetElement(i) else {
+                    continue;
+                };
                 out.push(read_element(&el, &root_rect));
             }
             Ok(out)

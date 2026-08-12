@@ -3,15 +3,15 @@
 //! This is the surface an LLM/agent drives (DESIGN.md §8a.1, §11). Handlers are stubs
 //! in this scaffold; the flag set is complete so `--help` documents the intended tool.
 
+mod annotate;
 mod elevate;
+mod frame;
 #[cfg(windows)]
 mod hv;
+mod monitor;
 #[cfg(windows)]
 mod notes_ui;
-mod annotate;
-mod monitor;
 mod query;
-mod frame;
 mod record;
 mod record_usb;
 mod solve;
@@ -24,7 +24,11 @@ use reveng_core::clock::Clock;
 use std::path::PathBuf;
 
 #[derive(Parser)]
-#[command(name = "reveng-rec", version, about = "Reverse-engineering recorder + query tool")]
+#[command(
+    name = "reveng-rec",
+    version,
+    about = "Reverse-engineering recorder + query tool"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -248,6 +252,14 @@ enum Cmd {
         #[arg(long)]
         max_seconds: Option<u64>,
     },
+    /// Ask a running `record` to finalize, from outside it. The out-of-band stop for
+    /// callers that cannot press Ctrl+Alt+Pause — a script, another process, or an agent
+    /// driving the bench — so a capture can run open-ended and be ended exactly when the
+    /// interesting part is over, instead of guessing `--max-seconds` beforehand
+    Stop {
+        /// Session directory the recorder is writing to.
+        session: PathBuf,
+    },
     /// Interactive/scripted control transfers + queued bulk reads against a live USB device (the
     /// device oracle): probe determinism, replay a `ctrl --json` capture, bring up streaming.
     UsbPoke {
@@ -400,7 +412,11 @@ enum MemCmd {
         max: usize,
     },
     /// Find a value's encodings in a snapshot (seed with the on-screen number/string).
-    Scan { session: PathBuf, id: u64, value: String },
+    Scan {
+        session: PathBuf,
+        id: u64,
+        value: String,
+    },
     /// Hex/auto-render a slice of a snapshot at a target address (hex `0x…` or decimal).
     Read {
         session: PathBuf,
@@ -433,6 +449,22 @@ enum Source {
 enum PciBackend {
     Drv,
     Etw,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, ValueEnum)]
+enum UsbBackendArg {
+    /// USBPcap kernel driver (Windows, needs admin) — whole transfers.
+    Usbpcap,
+    /// Cynthion hardware analyzer (any OS, no driver) — raw wire packets.
+    Cynthion,
+}
+
+/// Capture speed for the analyzer. No `auto`: it misdetects, and the failure is silent.
+#[derive(Copy, Clone, ValueEnum)]
+enum CynthionSpeedArg {
+    Low,
+    Full,
+    High,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -608,6 +640,40 @@ struct RecordArgs {
     #[arg(long)]
     headless: bool,
 
+    /// Which USB capture backend to record with.
+    ///
+    /// `usbpcap` (default) is the Windows kernel driver and needs Administrator; it records
+    /// whole transfers. `cynthion` is a hardware analyzer that taps the bus itself — no
+    /// kernel driver, no elevation, works on Linux/macOS/Windows — and records raw wire
+    /// packets. They are mutually exclusive: pointing both at one device would report its
+    /// traffic twice into the same file, at two different abstraction levels.
+    #[arg(long, value_enum, default_value_t = UsbBackendArg::Usbpcap)]
+    usb_backend: UsbBackendArg,
+
+    /// Bus speed for `--usb-backend cynthion`. Required, and deliberately has no default:
+    /// the analyzer's auto-detect misreports a Low-speed device as Full, and the resulting
+    /// capture contains bus events and no packets while appearing to succeed.
+    #[arg(long, value_enum)]
+    cynthion_speed: Option<CynthionSpeedArg>,
+
+    /// Keep Start-of-Frame packets in a wire capture. They carry no data and arrive every
+    /// 125 µs at high speed, so they are dropped by default (and counted). Keep them for
+    /// bus-timing work.
+    #[arg(long)]
+    keep_sof: bool,
+
+    /// Record bus traffic and notes only: no input hooks, no screenshots, no UI-Automation.
+    ///
+    /// For the remote-target setup a hardware analyzer makes normal — the machine being
+    /// driven is not this one, so the host-side correlation features would record the
+    /// operator's own desktop while appearing to capture the target. Notes stay, and the
+    /// window's consent banner says which mode is active.
+    ///
+    /// Not the same as --headless: this one still shows the window. It changes what is
+    /// recorded, not whether there is a UI.
+    #[arg(long)]
+    traffic_only: bool,
+
     /// Stop once total captured traffic (USB + PCIe) reaches this many bytes (size budget).
     #[arg(long)]
     max_bytes: Option<u64>,
@@ -661,7 +727,10 @@ fn run() -> anyhow::Result<()> {
         Cmd::PciDevices { format } => run_pci_devices(format),
         Cmd::Ls { session } => query::ls(&session, false),
         Cmd::Notes { session } => query::notes(&session),
-        Cmd::Show { session, checkpoint } => query::show(&session, checkpoint),
+        Cmd::Show {
+            session,
+            checkpoint,
+        } => query::show(&session, checkpoint),
         Cmd::Frames {
             session,
             around,
@@ -684,7 +753,14 @@ fn run() -> anyhow::Result<()> {
             range,
             req_type,
             json,
-        } => query::ctrl(&session, around, window, range.as_deref(), req_type.as_deref(), json),
+        } => query::ctrl(
+            &session,
+            around,
+            window,
+            range.as_deref(),
+            req_type.as_deref(),
+            json,
+        ),
         Cmd::CtrlDiff {
             session_a,
             session_b,
@@ -720,7 +796,12 @@ fn run() -> anyhow::Result<()> {
             ep,
             frame_bytes,
             out,
-        } => frame::extract(&session, parse_bar(Some(&ep)).unwrap_or(0x81), frame_bytes, &out),
+        } => frame::extract(
+            &session,
+            parse_bar(Some(&ep)).unwrap_or(0x81),
+            frame_bytes,
+            &out,
+        ),
         Cmd::FrameGuess { session, ep } => {
             frame::guess(&session, parse_bar(Some(&ep)).unwrap_or(0x81))
         }
@@ -738,11 +819,19 @@ fn run() -> anyhow::Result<()> {
             bytes,
             filter,
         } => {
-            let byte_cols: Vec<usize> =
-                bytes.split(',').filter_map(|s| s.trim().parse().ok()).collect();
-            let f = filter.as_ref().and_then(|s| s.split_once('=')).and_then(|(c, v)| {
-                c.trim().parse::<usize>().ok().map(|c| (c, v.trim().to_string()))
-            });
+            let byte_cols: Vec<usize> = bytes
+                .split(',')
+                .filter_map(|s| s.trim().parse().ok())
+                .collect();
+            let f = filter
+                .as_ref()
+                .and_then(|s| s.split_once('='))
+                .and_then(|(c, v)| {
+                    c.trim()
+                        .parse::<usize>()
+                        .ok()
+                        .map(|c| (c, v.trim().to_string()))
+                });
             solve::run(&csv, var, &byte_cols, f)
         }
         Cmd::Sweep {
@@ -756,7 +845,16 @@ fn run() -> anyhow::Result<()> {
             field,
         } => {
             let vals = parse_f64_list(&values);
-            sweep::run(&device_vidpid, &window, &control, &vals, pause, out, req_type.as_deref(), &field)
+            sweep::run(
+                &device_vidpid,
+                &window,
+                &control,
+                &vals,
+                pause,
+                out,
+                req_type.as_deref(),
+                &field,
+            )
         }
         Cmd::SweepCorrelate {
             session,
@@ -775,6 +873,18 @@ fn run() -> anyhow::Result<()> {
             device_vidpid,
             max_seconds,
         } => monitor::run(device_vidpid.as_deref(), max_seconds),
+        Cmd::Stop { session } => {
+            if !session.is_dir() {
+                anyhow::bail!("{} is not a session directory", session.display());
+            }
+            let marker = session.join(record_usb::STOP_FILE);
+            std::fs::write(&marker, b"stop\n")?;
+            eprintln!(
+                "asked the capture in {} to stop (poll interval is sub-second)",
+                session.display()
+            );
+            Ok(())
+        }
         Cmd::UsbPoke {
             vidpid,
             script,
@@ -822,7 +932,12 @@ fn run() -> anyhow::Result<()> {
             with,
             ksy,
             ep,
-        } => query::decode(&session, with.as_deref(), ksy.as_deref(), parse_bar(ep.as_deref())),
+        } => query::decode(
+            &session,
+            with.as_deref(),
+            ksy.as_deref(),
+            parse_bar(ep.as_deref()),
+        ),
         // note: Decode.with is a command string (see below)
         Cmd::Grep {
             session,
@@ -848,7 +963,12 @@ fn run() -> anyhow::Result<()> {
             MemCmd::Regions { session, id } => query::mem_regions(&session, id),
             MemCmd::Diff { session, a, b, max } => query::mem_diff(&session, a, b, max),
             MemCmd::Scan { session, id, value } => query::mem_scan(&session, id, &value),
-            MemCmd::Read { session, id, addr, len } => query::mem_read(&session, id, &addr, len),
+            MemCmd::Read {
+                session,
+                id,
+                addr,
+                len,
+            } => query::mem_read(&session, id, &addr, len),
         },
     }
 }
@@ -984,7 +1104,11 @@ fn run_export(
     if wireshark {
         // Wireshark packet numbers are 1-based; our frame indices are 0-based.
         reveng_export::open_in_wireshark(&pcapng, primary + 1)?;
-        eprintln!("opened Wireshark on {} at packet {}", pcapng.display(), primary + 1);
+        eprintln!(
+            "opened Wireshark on {} at packet {}",
+            pcapng.display(),
+            primary + 1
+        );
         return Ok(());
     }
 
@@ -1028,8 +1152,7 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             // the portable minimal loop (`record.rs`), which is cross-platform and captures no input.
             #[cfg(windows)]
             {
-                let headless =
-                    args.headless || std::env::var_os("REVENG_NO_NOTES_UI").is_some();
+                let headless = args.headless || std::env::var_os("REVENG_NO_NOTES_UI").is_some();
                 // drv/etw/replay all stop cleanly now, so all can drive the input engine.
                 if !headless {
                     return run_pcie_engine_session(&args, cfg.clone());
@@ -1063,7 +1186,12 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                         let target = resolve_pci_target(&args)?;
                         let max = args.max_seconds.map(std::time::Duration::from_secs);
                         record::run_pcie_live(
-                            &out, target, max, args.trace_mmio, args.trace_dma, &cfg,
+                            &out,
+                            target,
+                            max,
+                            args.trace_mmio,
+                            args.trace_dma,
+                            &cfg,
                         )?
                     }
                     PciBackend::Etw => {
@@ -1093,12 +1221,15 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
             // needed) — the relaunched process has explicit devices and skips the picker.
             #[cfg(windows)]
             {
+                // The picker enumerates USBPcap control devices, which a wire capture does not
+                // use — the analyzer taps whatever is physically routed through it.
                 let bare = args.usbpcap_device.is_none()
                     && args.device_vidpid.is_empty()
                     && args.device_address.is_empty()
                     && !args.all_devices
                     && !args.no_capture
                     && !args.with_pcie
+                    && args.usb_backend != UsbBackendArg::Cynthion
                     && args.pcie_replay.is_none();
                 let interactive = !args.headless
                     && std::env::var_os("REVENG_NO_NOTES_UI").is_none()
@@ -1123,7 +1254,11 @@ fn run_record(args: RecordArgs) -> anyhow::Result<()> {
                 // A live PCIe co-capture (drv backend, not replay) also opens a kernel device that
                 // needs admin.
                 let pcie_live = args.with_pcie && args.pcie_replay.is_none();
-                if (!opts.selections.is_empty() || pcie_live)
+                // A Cynthion is a plain USB device opened through `nusb` — no kernel driver,
+                // so no elevation. Prompting for UAC anyway would be a needless barrier on
+                // the one backend that does not need it.
+                let usb_live = !opts.selections.is_empty() && opts.backend.needs_admin();
+                if (usb_live || pcie_live)
                     && !elevate::is_elevated()
                     && std::env::var_os("REVENG_NO_ELEVATE").is_none()
                 {
@@ -1166,6 +1301,8 @@ fn run_engine_session(
     let pcie_active = pcie.is_some();
     let mem_active = opts.mem_pid.is_some() || opts.mem_process.is_some();
     let headless = opts.headless;
+    // Read before `opts` moves into the capture closure; only needed for the summary line.
+    let opts_traffic_only = opts.traffic_only;
 
     let summary = if headless {
         record_usb::run_usb_capture(clock, out, opts, None, pcie)?
@@ -1175,13 +1312,22 @@ fn run_engine_session(
             let worker_clock = clock.clone();
             let out2 = out.to_path_buf();
             // Live MMIO/DMA toggles reach the window only for the drv backend (both handles set).
-            let trace = pcie.as_ref().and_then(|p| match (&p.trace_mmio, &p.trace_dma) {
-                (Some(m), Some(d)) => Some((m.clone(), d.clone())),
-                _ => None,
-            });
-            notes_ui::run_recording_window(clock, out.to_path_buf(), usb_active, pcie_active, mem_active, trace, move |ui| {
-                record_usb::run_usb_capture(worker_clock, &out2, opts, Some(ui), pcie)
-            })?
+            let trace = pcie
+                .as_ref()
+                .and_then(|p| match (&p.trace_mmio, &p.trace_dma) {
+                    (Some(m), Some(d)) => Some((m.clone(), d.clone())),
+                    _ => None,
+                });
+            notes_ui::run_recording_window(
+                clock,
+                out.to_path_buf(),
+                usb_active,
+                pcie_active,
+                mem_active,
+                opts.traffic_only,
+                trace,
+                move |ui| record_usb::run_usb_capture(worker_clock, &out2, opts, Some(ui), pcie),
+            )?
         }
         #[cfg(not(windows))]
         {
@@ -1196,11 +1342,22 @@ fn run_engine_session(
             out.display()
         );
     } else if pcie_active {
-        eprintln!("recorded PCIe session, {} checkpoints -> {}", summary.checkpoints, out.display());
-    } else {
         eprintln!(
-            "recorded {} checkpoints (input + notes only) -> {}",
+            "recorded PCIe session, {} checkpoints -> {}",
             summary.checkpoints,
+            out.display()
+        );
+    } else {
+        // Say which it was: in --traffic-only there are no input events, and reporting
+        // "input + notes" would describe a session that does not contain any.
+        eprintln!(
+            "recorded {} checkpoints ({}) -> {}",
+            summary.checkpoints,
+            if opts_traffic_only {
+                "notes only — no traffic device, and --traffic-only records no input"
+            } else {
+                "input + notes only"
+            },
             out.display()
         );
     }
@@ -1276,7 +1433,10 @@ fn run_device_picker_and_relaunch() -> anyhow::Result<Option<i32>> {
         .filter(|d| !d.usbpcap.is_empty())
         .map(|d| {
             (
-                format!("{}:{} {}  (bus {} addr {})", d.vid, d.pid, d.product, d.bus, d.address),
+                format!(
+                    "{}:{} {}  (bus {} addr {})",
+                    d.vid, d.pid, d.product, d.bus, d.address
+                ),
                 format!("{}:{}", d.vid, d.pid),
             )
         })
@@ -1285,7 +1445,12 @@ fn run_device_picker_and_relaunch() -> anyhow::Result<Option<i32>> {
         .unwrap_or_default()
         .iter()
         .filter(|d| !d.vid.is_empty())
-        .map(|d| (format!("{}  {}:{}  {}", d.bdf, d.vid, d.pid, d.description), d.bdf.clone()))
+        .map(|d| {
+            (
+                format!("{}  {}:{}  {}", d.bdf, d.vid, d.pid, d.description),
+                d.bdf.clone(),
+            )
+        })
         .collect();
 
     if usb.is_empty() && pci.is_empty() {
@@ -1382,19 +1547,80 @@ fn build_usb_opts(
         if !drop_transfers.contains(&reveng_usbcap::XFER_ISO) {
             drop_transfers.push(reveng_usbcap::XFER_ISO);
         }
-        eprintln!("--auto-truncate: snaplen {snaplen} B + dropping isoc (control/interrupt kept full)");
+        eprintln!(
+            "--auto-truncate: snaplen {snaplen} B + dropping isoc (control/interrupt kept full)"
+        );
     }
 
+    let backend = match args.usb_backend {
+        UsbBackendArg::Usbpcap => record_usb::UsbBackend::UsbPcap,
+        UsbBackendArg::Cynthion => {
+            let speed = match args.cynthion_speed {
+                Some(CynthionSpeedArg::Low) => reveng_cynthion::Speed::Low,
+                Some(CynthionSpeedArg::Full) => reveng_cynthion::Speed::Full,
+                Some(CynthionSpeedArg::High) => reveng_cynthion::Speed::High,
+                None => anyhow::bail!(
+                    "--usb-backend cynthion needs --cynthion-speed (low|full|high). There is no \
+                     default because the analyzer's auto-detect misreports a Low-speed device as \
+                     Full, and the capture then contains bus events and no packets while \
+                     appearing to have succeeded."
+                ),
+            };
+            // Packet-level filtering breaks reassembly: a control transfer needs its tokens
+            // and handshakes, and dropping a token strands every packet attributed to it.
+            // Refuse rather than produce a capture that silently will not reassemble.
+            if !drop_transfers.is_empty() || args.endpoints.is_some() {
+                anyhow::bail!(
+                    "--drop-isoc/--drop-bulk/--endpoints cannot be used with a wire capture: \
+                     dropping tokens or handshakes breaks transfer reassembly. Use --keep-sof \
+                     to control the only wire packet that is safe to filter."
+                );
+            }
+            record_usb::UsbBackend::Cynthion { speed }
+        }
+    };
+
+    // A wire capture has nothing to select: the analyzer records whatever is physically
+    // routed through it, so there is no hub to enumerate and no address to filter on. One
+    // placeholder selection means "capture is on" — the same thing an empty list means "off".
+    let selections = match backend {
+        record_usb::UsbBackend::UsbPcap => build_usb_selections(args)?,
+        record_usb::UsbBackend::Cynthion { .. } => {
+            if args.usbpcap_device.is_some()
+                || !args.device_vidpid.is_empty()
+                || !args.device_address.is_empty()
+                || args.all_devices
+            {
+                eprintln!(
+                    "note: --device-* / --all-devices select a USBPcap hub and do nothing for a \
+                     wire capture — the Cynthion records whatever is routed through it."
+                );
+            }
+            if args.no_capture {
+                Vec::new()
+            } else {
+                vec![reveng_usbcap::UsbSelection::default()]
+            }
+        }
+    };
+
     Ok(record_usb::UsbRecordOpts {
-        selections: build_usb_selections(args)?,
+        selections,
+        backend,
+        keep_sof: args.keep_sof,
         cfg,
-        screenshot_on: match args.screenshot_on {
-            ScreenshotOn::Mousedown => record_usb::ScreenshotWhen::Mousedown,
-            ScreenshotOn::Mouseup => record_usb::ScreenshotWhen::Mouseup,
-            ScreenshotOn::Both => record_usb::ScreenshotWhen::Both,
-            ScreenshotOn::None => record_usb::ScreenshotWhen::None,
+        // --traffic-only wins over the screenshot flags rather than conflicting with them:
+        // asking for screenshots in a mode that captures none should not half-enable a
+        // worker that then has nothing to send to.
+        screenshot_on: match (args.traffic_only, args.screenshot_on) {
+            (true, _) => record_usb::ScreenshotWhen::None,
+            (_, ScreenshotOn::Mousedown) => record_usb::ScreenshotWhen::Mousedown,
+            (_, ScreenshotOn::Mouseup) => record_usb::ScreenshotWhen::Mouseup,
+            (_, ScreenshotOn::Both) => record_usb::ScreenshotWhen::Both,
+            (_, ScreenshotOn::None) => record_usb::ScreenshotWhen::None,
         },
-        screenshot_on_keys: !args.no_screenshot_on_keys,
+        screenshot_on_keys: !args.no_screenshot_on_keys && !args.traffic_only,
+        traffic_only: args.traffic_only,
         scope: match args.screenshot_scope {
             ScreenshotScope::CursorMonitor => reveng_winshot::Scope::CursorMonitor,
             ScreenshotScope::All => reveng_winshot::Scope::All,
@@ -1410,6 +1636,8 @@ fn build_usb_opts(
         endpoints: parse_endpoints(args.endpoints.as_deref()),
         max_bytes: args.max_bytes,
         abort_if_idle: args.abort_if_idle.map(std::time::Duration::from_secs),
+        // Defaulted to `<session>/.stop` by run_usb_capture, which knows the path.
+        stop_file: None,
         stop_after_frames: args.stop_after_frames,
         mem_pid: args.mem_pid,
         mem_process: args.mem_process.clone(),
@@ -1477,7 +1705,10 @@ fn build_usb_selections(args: &RecordArgs) -> anyhow::Result<Vec<reveng_usbcap::
                         && d.pid.eq_ignore_ascii_case(wp)
                         && !d.usbpcap.is_empty()
                     {
-                        hubs.entry(d.usbpcap.clone()).or_default().addresses.insert(d.address);
+                        hubs.entry(d.usbpcap.clone())
+                            .or_default()
+                            .addresses
+                            .insert(d.address);
                     }
                 }
             }
@@ -1714,7 +1945,9 @@ fn parse_irq_vectors(s: Option<&str>) -> anyhow::Result<Vec<u16>> {
         } else {
             tok.parse::<u16>()
         }
-        .map_err(|_| anyhow::anyhow!("bad --irq-vectors entry '{tok}' (use hex 0x81 or decimal)"))?;
+        .map_err(|_| {
+            anyhow::anyhow!("bad --irq-vectors entry '{tok}' (use hex 0x81 or decimal)")
+        })?;
         out.push(v);
     }
     Ok(out)
@@ -1769,7 +2002,11 @@ fn run_pci_devices(format: OutFormat) -> anyhow::Result<()> {
                     d.bdf,
                     if d.vid.is_empty() { "----" } else { &d.vid },
                     if d.pid.is_empty() { "----" } else { &d.pid },
-                    if d.class.is_empty() { "------" } else { &d.class },
+                    if d.class.is_empty() {
+                        "------"
+                    } else {
+                        &d.class
+                    },
                     d.description
                 );
             }
@@ -1806,7 +2043,9 @@ fn parse_bar(ep: Option<&str>) -> Option<u8> {
 /// Map the CLI's output format onto the payload renderer.
 /// Parse a comma-separated list of numbers (for `--values`).
 fn parse_f64_list(s: &str) -> Vec<f64> {
-    s.split(',').filter_map(|x| x.trim().parse::<f64>().ok()).collect()
+    s.split(',')
+        .filter_map(|x| x.trim().parse::<f64>().ok())
+        .collect()
 }
 
 fn payload_fmt(f: OutFormat) -> query::PayloadFmt {
@@ -1817,5 +2056,100 @@ fn payload_fmt(f: OutFormat) -> query::PayloadFmt {
         OutFormat::Text => query::PayloadFmt::Text,
         OutFormat::Auto => query::PayloadFmt::Auto,
         OutFormat::Json => query::PayloadFmt::Json,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use reveng_core::checkpoint::CheckpointConfig;
+
+    fn opts_from(argv: &[&str]) -> record_usb::UsbRecordOpts {
+        let mut full = vec!["record", "--no-capture"];
+        full.extend_from_slice(argv);
+        let args = RecordArgs::parse_from(full);
+        build_usb_opts(&args, CheckpointConfig::default()).unwrap()
+    }
+
+    /// `--traffic-only` must win over the screenshot flags rather than sitting alongside
+    /// them. Asking for screenshots in a mode that captures none would otherwise leave the
+    /// engine believing it should request them.
+    #[test]
+    fn traffic_only_overrides_the_screenshot_flags() {
+        let o = opts_from(&["--traffic-only", "--screenshot-on", "both"]);
+        assert!(o.traffic_only);
+        assert!(matches!(o.screenshot_on, record_usb::ScreenshotWhen::None));
+        assert!(!o.screenshot_on_keys);
+    }
+
+    /// And it must not leak into a normal run: this is the mode that decides whether the
+    /// tool is a keylogger, so the default has to stay unambiguous in both directions.
+    #[test]
+    fn a_normal_run_is_unaffected() {
+        let o = opts_from(&[]);
+        assert!(!o.traffic_only);
+        assert!(o.screenshot_on_keys);
+        assert!(matches!(
+            o.screenshot_on,
+            record_usb::ScreenshotWhen::Mousedown
+        ));
+    }
+
+    /// The analyzer has no usable auto-detect, so a speed must be named. Defaulting to one
+    /// would silently produce empty captures whenever it guessed wrong.
+    #[test]
+    fn cynthion_requires_an_explicit_speed() {
+        let args = RecordArgs::parse_from(["record", "--no-capture", "--usb-backend", "cynthion"]);
+        let err = match build_usb_opts(&args, CheckpointConfig::default()) {
+            Err(e) => e,
+            Ok(_) => panic!("expected --cynthion-speed to be required"),
+        };
+        assert!(err.to_string().contains("--cynthion-speed"), "got: {err}");
+    }
+
+    /// Packet-level filtering must be refused on a wire capture: a control transfer needs its
+    /// tokens and handshakes, so dropping them yields a capture that will not reassemble —
+    /// and would look merely sparse rather than broken.
+    #[test]
+    fn wire_capture_refuses_packet_filtering() {
+        for flag in ["--drop-isoc", "--drop-bulk"] {
+            let args = RecordArgs::parse_from([
+                "record",
+                "--no-capture",
+                "--usb-backend",
+                "cynthion",
+                "--cynthion-speed",
+                "low",
+                flag,
+            ]);
+            let err = match build_usb_opts(&args, CheckpointConfig::default()) {
+                Err(e) => e,
+                Ok(_) => panic!("{flag} should be refused on a wire capture"),
+            };
+            assert!(
+                err.to_string().contains("breaks transfer reassembly"),
+                "{flag}: {err}"
+            );
+        }
+    }
+
+    /// Only the USBPcap kernel driver needs elevation. Prompting for UAC on a backend that
+    /// opens a plain USB device would be a barrier with nothing behind it.
+    #[test]
+    fn only_usbpcap_needs_admin() {
+        let cyn = opts_from(&["--usb-backend", "cynthion", "--cynthion-speed", "high"]);
+        assert!(!cyn.backend.needs_admin());
+        assert!(opts_from(&[]).backend.needs_admin());
+    }
+
+    /// `--traffic-only` changes *what* is recorded; `--headless` changes whether there is a
+    /// window. They are independent, and conflating them would either hide the consent
+    /// banner or capture input that the mode promised not to.
+    #[test]
+    fn traffic_only_is_independent_of_headless() {
+        assert!(!opts_from(&["--traffic-only"]).headless);
+        assert!(opts_from(&["--headless"]).traffic_only == false);
+        let both = opts_from(&["--traffic-only", "--headless"]);
+        assert!(both.traffic_only && both.headless);
     }
 }

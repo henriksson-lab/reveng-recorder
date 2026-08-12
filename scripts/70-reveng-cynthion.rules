@@ -1,0 +1,30 @@
+# udev rule granting non-root access to a Cynthion USB analyzer.
+#
+# Install:
+#   sudo cp scripts/70-reveng-cynthion.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload-rules && sudo udevadm trigger
+#   # then unplug and replug the Cynthion
+#
+# Without this, `reveng-rec record --usb-backend cynthion` fails when it opens the device.
+# The error is a permission failure, which reads like a *missing* device — so if enumeration
+# seems to find nothing on Linux, check this first.
+#
+# The device is Great Scott Gadgets' Cynthion, which ships under the OpenMoko shared vendor
+# ID. `615b` is the analyzer gateware, confirmed by reading the descriptors off the board.
+# Other gateware (Facedancer/Moondancer, the bootloader) presents a different product ID; add
+# a line for it if you switch the board's role — we have only verified the analyzer.
+#
+# This file is ours, not the vendor's. If you have installed Great Scott Gadgets' own rules
+# (from the `cynthion` Python package or their docs) you do not need this one, and having both
+# is harmless — udev applies every matching rule.
+
+# TAG+="uaccess" hands the device to whoever is logged in at the seat, via systemd-logind.
+# Preferred over MODE="0666", which grants every account on the machine access to a device
+# that can passively record another machine's USB traffic.
+SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="615b", TAG+="uaccess"
+
+# Fallback for systems without systemd-logind (or where uaccess does not take effect):
+# uncomment ONE of these instead. The group form is the safer of the two — it limits access
+# to members of `plugdev` rather than to everyone.
+#SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="615b", GROUP="plugdev", MODE="0660"
+#SUBSYSTEM=="usb", ATTR{idVendor}=="1d50", ATTR{idProduct}=="615b", MODE="0666"

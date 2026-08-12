@@ -10,6 +10,7 @@ members = [
     "crates/winui",
     "crates/memcap",
     "crates/export",
+    "crates/cynthion",
     "crates/recorder",
     "crates/viewer",
 ]
@@ -28,6 +29,7 @@ clap = { version = "4", features = ["derive"] }
 reveng-core = { path = "crates/core" }
 reveng-usbcap = { path = "crates/usbcap" }
 reveng-pcicap = { path = "crates/pcicap" }
+reveng-cynthion = { path = "crates/cynthion" }
 reveng-winput = { path = "crates/winput" }
 reveng-winshot = { path = "crates/winshot" }
 reveng-winocr = { path = "crates/winocr" }

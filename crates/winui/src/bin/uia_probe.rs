@@ -39,9 +39,18 @@ fn main() -> Result<()> {
     for w in matches {
         let els = reveng_winui::snapshot_hwnd(w.hwnd).unwrap_or_default();
         if !json {
-            println!("  candidate [{}] {:?} -> {} elements", w.class_name, w.title, els.len());
+            println!(
+                "  candidate [{}] {:?} -> {} elements",
+                w.class_name,
+                w.title,
+                els.len()
+            );
         }
-        if best.as_ref().map(|(_, b)| els.len() > b.len()).unwrap_or(true) {
+        if best
+            .as_ref()
+            .map(|(_, b)| els.len() > b.len())
+            .unwrap_or(true)
+        {
             best = Some((w, els));
         }
     }

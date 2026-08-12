@@ -1,14 +1,23 @@
 # reveng-recorder — Design
 
-A Windows tool for reverse-engineering USB devices by **correlating USB bus traffic with what
-the user was doing on screen**. It records USB traffic (via USBPcap), global mouse/keyboard
-input, and event-triggered screenshots into a single time-synchronized session, then lets you
-seek through the USB stream using mouse clicks and key events as natural checkpoints.
+A tool for reverse-engineering devices by **correlating bus traffic with what the user was doing
+on screen**. It records traffic, global mouse/keyboard input, and event-triggered screenshots into
+a single time-synchronized session, then lets you seek through the traffic using clicks and key
+events as natural checkpoints.
 
-- **Platform:** Windows only (x64). Everything else out of scope.
+- **Platform:** Windows-first (x64). Traffic capture and the whole read side are cross-platform
+  with the analyzer backend; the correlation half (input hooks, screenshots, UIA, OCR, viewer) is
+  Windows-only, which is what `--traffic-only` (§4.4) switches off cleanly.
 - **Stack:** Rust. Recorder is a CLI/service binary; viewer is an [egui](https://github.com/emilk/egui) desktop app.
-- **USB capture:** [USBPcap](https://desowin.org/usbpcap/) (free kernel driver, pcap-compatible). No extra hardware.
+- **USB capture, two backends:** [USBPcap](https://desowin.org/usbpcap/) (free kernel driver, no
+  extra hardware, Windows, whole transfers) or a [Cynthion](https://greatscottgadgets.com/cynthion/)
+  hardware analyzer (any OS, no driver, raw wire packets) — §4 and §4.1.
 - **Wireshark:** raw capture stays Wireshark-openable; viewer can hand off to Wireshark at a specific frame.
+
+> **Reading this doc.** It is the cross-crate contract and the *why*: decisions that span crates,
+> and the measurements behind them. Mechanism lives in the code's own doc comments, which cannot
+> drift from what they describe — prefer those for "how does X work". If the two disagree, the
+> code is right and this file has a bug.
 
 ---
 
@@ -19,7 +28,7 @@ seek through the USB stream using mouse clicks and key events as natural checkpo
 3. Every mouse-button press (and selected special keys) drops a **checkpoint** and grabs a
    **screenshot**. Long stretches of continuous USB traffic also get periodic checkpoints.
 4. Stop with a global hotkey. The session is written to disk (USB as `.pcapng`, events as an
-   append-only log, screenshots as files, plus a rebuildable SQLite index).
+   append-only log, screenshots as files, plus rebuildable seek indexes).
 5. Open the session in the **viewer**: a timeline of checkpoints. Jump between clicks, see the
    screenshot at that instant, and inspect the USB frames in a window around it. Export a slice
    or open it in Wireshark at that frame.
@@ -58,23 +67,24 @@ ft0      = GetSystemTimePreciseAsFileTime()         // wall clock at t=0 (100ns 
 ```
                           ┌──────────────────────────────────────────────┐
                           │                 recorder                     │
-                          │                                              │
-  USBPcapCMD.exe  ──pipe──▶  usbcap reader ──▶ pcapng writer (usb.pcapng)│
-  (\\.\USBPcapN)          │        │           frame index (ts,offset)   │
-                          │        └──▶ bytes_since_ckpt (atomic) ──┐    │
+  \\.\USBPcapN  ─IOCTL─┐  │                                              │
+  (kernel driver)      ├──▶  reader thread ──▶ pcapng writer (usb.pcapng)│
+  Cynthion  ─nusb──────┘  │        │           frames.idx (ts,offset,…)  │
+  (wire packets)          │        └──▶ bytes_since_ckpt (atomic) ──┐    │
                           │                                          │    │
   WH_MOUSE_LL   ─┐        │  input thread ──▶ InputEvent channel ──┐ │    │
-  WH_KEYBOARD_LL ┘ hooks  │  (msg loop)                            │ │    │
-                          │                                        ▼ ▼    │
+  WH_KEYBOARD_LL ┘ hooks  │  (msg loop)          [off in           │ │    │
+                          │                       --traffic-only]  ▼ ▼    │
                           │                          checkpoint engine    │
                           │                          - click → ckpt+shot  │
                           │                          - special key → ckpt │
                           │                          - interval timer     │
+                          │                          - typed note → ckpt  │
                           │                                │   │          │
                           │                     screenshot ▼   ▼ session   │
-                          │                     worker (GDI/DXGI) writer   │
-                          │                        │        events.ndjson  │
-                          │                        ▼        index.sqlite   │
+                          │                     worker (GDI)   writer      │
+                          │                     [off in        events.ndjson
+                          │                      --traffic-only]           │
                           │                  screenshots/*.png             │
                           └──────────────────────────────────────────────┘
                                               │
@@ -87,15 +97,18 @@ ft0      = GetSystemTimePreciseAsFileTime()         // wall clock at t=0 (100ns 
                           └────────────────────────────────────────┘
 ```
 
+Both USB backends are `CaptureSource`s feeding the same reader thread, so everything right of it
+is backend-agnostic. What differs is the *abstraction level* of what arrives — see §4.1.
+
 ### Thread model (recorder)
 
 | Thread | Job | Constraint |
 |---|---|---|
-| **usbcap reader** | drain USBPcap pipe, write-through to `usb.pcapng`, parse header-only for index, bump `bytes_since_ckpt` | Highest priority. Must never block — USBPcap's kernel buffer drops if we stall. |
+| **traffic reader** (one per source) | drain the `CaptureSource`, write through to `usb.pcapng`, derive the index record, bump `bytes_since_ckpt` | Highest priority. Must never block — the USBPcap kernel buffer and the analyzer's own buffer both drop if we stall. |
 | **input** | owns the LL hooks + `GetMessage` loop; timestamps events and pushes to a channel | Hook callback does *only* timestamp+enqueue. LL hooks are dropped/removed by Windows if a callback exceeds `LowLevelHooksTimeout` (~300 ms). |
 | **checkpoint engine** | consumes input events, interval timer, and traffic counter; emits `Checkpoint`s; resolves nearest USB frame; requests screenshots | — |
 | **screenshot worker** | on request, grabs + encodes PNG off the hot path | Bounded queue; coalesces bursts (see §6). |
-| **session writer** | serializes `events.ndjson`, updates `index.sqlite` | Single writer = simple ordering. |
+| **session writer** | serializes `events.ndjson` and the `*.idx` sidecars | Single writer = simple ordering. |
 | **control** | global stop hotkey, Ctrl+C, clean flush/finalize | — |
 
 Channels: `crossbeam-channel`. Shutdown via a `CancellationToken`-style atomic + channel close.
@@ -105,13 +118,15 @@ Channels: `crossbeam-channel`. Shutdown via a `CancellationToken`-style atomic +
 ```
 reveng-recorder/
   crates/
-    core/        # shared types, clock anchor, session schema, ndjson + sqlite IO, CaptureSource trait
-    usbcap/      # USB CaptureSource: spawn USBPcapCMD, parse frames, pcapng writer w/ comments
+    core/        # shared types, clock anchor, session schema, ndjson IO, CaptureSource trait
+    usbcap/      # USBPcap CaptureSource (IOCTL), pcapng writer w/ comments, frames.idx;
+                 #   `wire` (USB 2.0 packet decode + CRC), `reassemble` (wire → transfers)
+    cynthion/    # Cynthion analyzer CaptureSource over nusb + the bus-event sidecar (§4.1)
     pcicap/      # PCIe CaptureSource: talks to reveng-hv, emits Mmio/Dma/Irq/Config events (§4a)
     winput/      # LL mouse/keyboard hooks, InputEvent
-    winshot/     # screen capture (GDI default, DXGI Desktop Duplication optional) + PNG encode
+    winshot/     # screen capture (GDI) + PNG encode
     memcap/      # process-memory snapshot capture (Windows) + before/after diff/scan (portable) (§6a)
-    recorder/    # bin: orchestration, checkpoint engine, control/hotkey
+    recorder/    # bin: orchestration, checkpoint engine, control/hotkey, the query CLI
     viewer/      # bin: egui app — timeline, inspector, seek, export
     export/      # pcapng slicing + Wireshark handoff (shared by viewer)
   driver/
@@ -119,27 +134,29 @@ reveng-recorder/
 ```
 
 All acquisition backends implement one `CaptureSource` trait (emit timestamped events onto the
-shared timeline); USB and PCIe differ only in acquisition, not in anything downstream. `memcap` is
-the exception — not a traffic backend but a manual-trigger **checkpoint attachment** (like
-screenshots): it hangs a decoded-memory snapshot off a checkpoint rather than streaming events. See §6a.
+shared timeline). USB and PCIe differ only in acquisition; the two *USB* backends differ in
+acquisition **and** in the abstraction level of what they record, which is why §4.1 exists.
+`memcap` is the exception — not a traffic backend but a manual-trigger **checkpoint attachment**
+(like screenshots): it hangs a decoded-memory snapshot off a checkpoint rather than streaming
+events. See §6a.
 
-Key deps: `windows` (windows-rs) for hooks/capture/clock, `crossbeam-channel`, `rusqlite`,
-`serde`/`serde_json`, `image` (PNG), `eframe`/`egui` for the viewer, `clap` for the CLI.
+Key deps: `windows` (windows-rs) for hooks/capture/clock, `nusb` (the analyzer, and `usb-poke`),
+`serde`/`serde_json`, `image` (PNG), `eframe`/`egui` for the viewer, `slint` for the recording
+window, `clap` for the CLI.
 
 ---
 
 ## 4. USB capture (USBPcap backend)
 
-- Spawn `USBPcapCMD.exe -d \\.\USBPcapN -o -` and read the pcap stream from its **stdout**.
-  Requires **Administrator** (kernel driver). We detect and prompt for elevation.
-- **Device selection:** run USBPcapCMD's device enumeration first, present the tree
-  (hub → device → interfaces) to the user, and pass `--devices <addr,addr>` to filter to just the
-  target device address. Filtering at the source dramatically cuts volume (isochronous/bulk
-  devices can be very chatty).
-- **Parsing:** each record = pcap record header (ts) + `USBPCAP_BUFFER_PACKET_HEADER`
-  (irpId, status, function, info, bus, device, endpoint, transfer type, dataLength) + payload.
-  The reader parses the fixed header only (cheap) to build the index; payloads are written
-  straight to disk.
+- **Talks to `\\.\USBPcapN` directly over its IOCTL interface** (`usbcap::ioctl`) rather than
+  shelling out to `USBPcapCMD.exe`; the subprocess path survives only as a fallback behind
+  `REVENG_USBPCAP_CLI=1`. Requires **Administrator** (kernel driver), and `record` self-elevates.
+- **Device selection:** enumerate with SetupAPI/CfgMgr (`usbcap::devs`), present the tree, and
+  filter to the target device address. Filtering at the source dramatically cuts volume
+  (isochronous/bulk devices can be very chatty). See §11.1.
+- **Parsing:** each record is a `USBPCAP_BUFFER_PACKET_HEADER` (irpId, status, function, info,
+  bus, device, endpoint, transfer type, dataLength) + payload. The reader parses the fixed header
+  only (cheap) to build the index; payloads are written straight to disk.
 - **Storage — we own the pcapng writer.** Instead of dumping USBPcap's raw pcap verbatim, we
   re-emit frames into a **pcapng** with `LINKTYPE_USBPCAP` (249):
   - Preserves original per-frame timestamps.
@@ -147,14 +164,191 @@ Key deps: `windows` (windows-rs) for hooks/capture/clock, `crossbeam-channel`, `
     (`"CHECKPOINT #12 — click @ (842,391) in Vendor.exe"`). Those show up natively in Wireshark,
     so checkpoints are visible even outside our viewer.
   - Fully Wireshark-openable.
-- **Frame index** (written to `index.sqlite`, header-only — payloads stay in the pcapng):
+- **Frame index** — `frames.idx`, a fixed-width sidecar of 24-byte `UsbIdxRecord`s
+  (ts, byte_offset, endpoint, dir, xfer, status, data_length), giving O(1) get by index and
+  binary search by time. `byte_offset` is the frame's block offset in `usb.pcapng`, so a payload
+  read is one seek. Field *meanings* differ per backend — see the table in §4.1.
 
-  ```
-  usb_frame(frame_index PK, ts_ns, byte_offset, bus, device, endpoint,
-            transfer_type, direction, data_length, status, function)
-  ```
+### 4.1. USB capture (hardware-analyzer backend)
 
-  `byte_offset` = offset of the frame's block in `usb.pcapng`, enabling O(1) seek + partial reads.
+A Cynthion taps the bus itself rather than the host's driver stack, so capture needs no kernel
+driver and works on Linux, macOS and Windows alike. What it records is one level lower: **wire
+packets** — tokens, DATA, handshakes and SOF — not whole transfers.
+
+```sh
+reveng-rec record --usb-backend cynthion --cynthion-speed low --traffic-only
+```
+
+- **The backends are mutually exclusive**, which settles by construction the hazard of a USBPcap
+  source and a Cynthion source double-reporting one device into one `usb.pcapng`.
+- **`--cynthion-speed` is required** and has no default. Auto-detect misreports a Low-speed device
+  as Full, and the capture then contains bus events and no packets while appearing to succeed.
+- **No elevation.** The analyzer is a plain USB device opened through `nusb`, so the UAC
+  self-elevation is skipped — unlike USBPcap, whose kernel driver needs it.
+- **Device selection does not apply.** There is no hub to enumerate: the analyzer records whatever
+  is physically routed through it, so `--device-*` warns and the picker is skipped.
+- **Packet-level filtering is refused.** `--drop-isoc` / `--drop-bulk` / `--endpoints` would drop
+  tokens and handshakes, and a transfer missing those will not reassemble — a capture that looks
+  merely sparse rather than broken. **SOF is the exception** and is dropped by default (counted,
+  never silently): it belongs to no transaction, and at high speed one arrives every 125 µs.
+  `--keep-sof` retains them for bus-timing work.
+- **The reader thread must know the format.** Running the USBPcap header parser over a wire packet
+  reads the PID byte and CRC as an endpoint and a length. It does not fail — it produces
+  mis-filtered packets and a dashboard full of endpoints that were never on the bus.
+
+- **Storage** is the same `usb.pcapng` + `frames.idx` pair, under a `LINKTYPE_USB_2_0*` link
+  type that also records the **capture speed** (a wire packet's meaning depends on the bit rate
+  it was sampled at, and nothing in the bytes recovers it). Timestamps are nanoseconds
+  (`if_tsresol = 9`); sub-microsecond bus timing is the reason to use such hardware at all.
+- **The link type is how a session says which backend wrote it.** `UsbReader::open` reads it out
+  of the interface block and picks a `CaptureFormat`, so every consumer of the reader — `frames`,
+  `payload`, `grep`, `diff`, `decode`, `stream`, the viewer, `export` — works on either kind of
+  session without knowing which it has.
+- **Index derivation differs, and some fields change meaning** (`usbcap::wire`):
+
+  | field | USBPcap | wire |
+  |---|---|---|
+  | `endpoint` | from the record header | from the transaction's **token**, carried forward |
+  | `dir` | endpoint bit 7 | the transaction's direction, from the token PID |
+  | `xfer` | the URB's transfer type | control on EP0/after SETUP, else **unknown** — bulk, interrupt and iso are indistinguishable on the wire without the descriptors |
+  | `status` | `USBD_STATUS` | the **PID**; a wire capture has no host status, and the outcome of a transaction is its final handshake |
+  | `data_length` | the URB's reported length | the DATA field, CRC excluded |
+
+- **Only a token carries an address and endpoint.** The DATA and handshake packets after it
+  identify themselves by nothing, so indexing is a small state machine. A capture that starts
+  mid-transaction attributes its first packets to address 0 endpoint 0.
+- **Reassembly is a read-side view** (§8b), so the stored packets stay exactly as captured.
+  Commands built on host-transfer semantics that have no wire equivalent yet say so rather than
+  degrading quietly: `verify` prints which of its checks do not apply, and `frame-guess` refuses
+  outright — its whole model is the URB chunk, which on the wire is just `wMaxPacketSize`.
+
+### 4.2. Control reassembly (`usbcap::reassemble`)
+
+`ctrl`, `ctrl-diff`, `sweep`, `reg-state` and `annotate` all reason about control transfers, so
+wire packets are rebuilt into them behind `collect_ctrl`. Three things make this more than a
+filter over DATA packets:
+
+- **There is no IRP id to pair on.** The transfer ends at its *status stage*, recognised by a
+  token whose direction is opposite the SETUP's — uniformly, including for a zero-length request
+  that has no data stage at all.
+- **A NAK is a retry, not an outcome.** On an OUT transaction the host re-sends identical DATA
+  after a NAK, so data is held until its handshake and committed only on ACK. Counting every
+  DATA packet would duplicate the payload of every retried transfer. The NAK count is kept and
+  reported — it is real information a host-stack capture cannot show.
+- **The outcome is a handshake, not a status code.** ACK/STALL/incomplete are carried in their
+  own field; rendering them as a `USBD_STATUS`-shaped `ERR 0x…` would be a lie in a familiar
+  format.
+
+The same NAK rule applies outside control transfers. `DataStream` yields only **acknowledged**
+DATA payloads, and `frame-extract` uses it on a wire session — concatenating every DATA packet on
+a bulk endpoint would duplicate every retried one, producing a frame of exactly the right length
+that is silently wrong.
+
+**Split transactions are out of scope** — a low/full-speed device behind a high-speed hub has its
+traffic wrapped in SPLIT tokens, which are not modelled. Deferred until a target needs it rather
+than guessed at.
+
+### 4.3. What `verify` checks, per backend
+
+USBPcap's failure mode is the kernel buffer overflowing and dropping whole transfers, caught by
+SETUPs left unpaired. A wire capture cannot lose a transfer that way; it can mis-sample, corrupt
+or lose individual packets. So `verify` asks different questions of each, and the endpoint
+histogram takes its direction from the index rather than bit 7 of the endpoint (which on the wire
+is not a direction bit at all, and previously labelled every wire frame OUT).
+
+Wire checks: undecodable packets, CRC failures, DATA with no handshake, data-toggle anomalies,
+incomplete control transfers. The toggle check only advances on ACK, so a legitimate
+retransmission after a NAK is not flagged.
+
+**The toggle check needs the bus events, not just the packets.** A bus reset returns every
+endpoint's toggle to DATA0 (USB 2.0 §8.6.1) and a SETUP restarts its endpoint's sequence — so
+resets are merged into the scan by timestamp from the sidecar. Without that, one replug reported
+**13 toggle anomalies**, every one a false positive; with it, zero on the same capture. This is
+the reason `check_wire_integrity` takes a `StreamItem` rather than a plain packet iterator.
+
+**An empty wire capture is never reported as OK.** Setting the wrong capture speed produces
+exactly one: measured, 3 s of a Low-speed keyboard captured as Full gave **0 packets and 42112
+bus events**. The analyzer emits line-state events rather than malformed packets, so the failure
+is not visible as framing garbage — and since the events are not stored in the pcapng, the file
+that survives is indistinguishable from a clean recording of an idle bus.
+
+**Bus events go to a sidecar**, `bus_events.ndjson` beside `usb.pcapng` (`<stem>.events.ndjson`
+for a standalone capture). They have no representation in a USB 2.0 pcapng, and pcapng custom
+blocks would need a registered enterprise number while remaining invisible in Wireshark anyway —
+so they live where the session's other sidecars live, in a form a person can grep and a decoder
+can read:
+
+```text
+{"ts_ns":2772400,"code":6,"name":"CaptureStart(Low)"}
+{"ts_ns":3577633,"code":30,"name":"LsKeepalive"}
+```
+
+The code table is Packetry's `EventType::code`; six entries are confirmed against this hardware.
+Keeping them buys two things nothing in the packet file can provide:
+
+- **Telling an idle bus from a mis-sampled one.** Measured on the same keyboard, 4 s each:
+  correct speed → 2174 packets and 4011 events, *none* of them line-state changes. Wrong speed →
+  0 packets and 56448 events, 56447 of them line-state churn. `verify` now names the cause and
+  exits 1, instead of shrugging at two empty files that looked identical.
+- **Detecting an analyzer-side gap.** `CaptureStop(BufferFull)` is the analyzer saying it dropped
+  data before it ever reached us. `verify` reports it as an integrity failure.
+
+A summary is folded into `meta.json` (`bus_events`: totals, per-name counts, resets, speed
+changes, line-state changes, overflows) so the headline questions are answerable without opening
+the sidecar.
+
+### 4.4. `--traffic-only` — the remote-target mode
+
+With a hardware analyzer the capture host is usually **not** the machine being driven. Every
+host-side correlation feature then records the wrong computer: the operator's own keystrokes,
+their desktop, their foreground window — faithfully, and while looking like it is capturing the
+target. `--traffic-only` turns all of it off:
+
+| | normal | `--traffic-only` |
+|---|---|---|
+| bus traffic | ✓ | ✓ |
+| notes | ✓ | ✓ |
+| input hooks (`winput`) | ✓ | **not installed** |
+| screenshots (`winshot`) | ✓ | **worker not spawned** |
+| UI-Automation / OCR | ✓ | **not spawned** |
+| `displays.json` | ✓ | not written |
+| foreground-window context | ✓ | not read |
+| checkpoint triggers | clicks, keys, interval, bytes, notes | interval, bytes, notes |
+
+**Notes stay.** They were the single most valuable correlation signal in the Lumenera work
+("usb is in", "starting software", "inserting uv tray"), and they matter *more* when the operator
+is driving a second machine — nothing else on this host knows what is happening over there.
+
+It is **independent of `--headless`**: that decides whether there is a window, this decides what
+gets recorded. A `--traffic-only` run still shows the window, and its consent banner changes to
+say traffic and notes only. Suppressing the banner would be the wrong move — the point is that
+this mode captures less, so it should claim less. `meta.json` records `traffic_only` so a later
+reader does not assume a session contains input events just because the schema has room for them.
+
+Two implementation notes that cost a debugging session each: shadowing a channel sender does not
+drop it (the original lives to end of scope, so the worker's `recv()` never returns and the join
+hangs), and the input channel being closed from the start is *not* end-of-run — without a special
+case, every traffic-only session finished the instant it began.
+
+### 4.5. Host access to the analyzer, per OS
+
+The Cynthion needs no kernel driver — `nusb` talks to it directly — but each OS still gates who
+may open a USB device.
+
+- **Linux** — needs a udev rule, or `root`. Ship-and-copy: `scripts/70-reveng-cynthion.rules`
+  into `/etc/udev/rules.d/`, then `udevadm control --reload-rules && udevadm trigger`, then
+  replug. It uses `TAG+="uaccess"` (the device goes to whoever is logged in at the seat) rather
+  than `MODE="0666"`, which would let every account on the machine open a device capable of
+  passively recording another machine's USB traffic; a `plugdev` group form is commented in the
+  file for systems without logind. Without any rule, opening the interface fails with a
+  permission error **that looks like a missing device** — the first thing to check when Linux
+  enumeration appears to find nothing.
+- **macOS** — nothing special. No driver, no entitlement, no elevation.
+- **Windows** — the interface must be bound to WinUSB. numanager's `winusb_access` is the
+  existing pattern for doing that from code (generated INF + self-signed catalog + `newdev`,
+  behind an approval gate). Note that **capture itself needs no Administrator** — unlike the
+  USBPcap backend, whose kernel driver does, so the UAC self-elevation should be skipped for a
+  Cynthion-only run.
 
 ---
 
@@ -438,30 +632,37 @@ O(1) in the viewer, and it's also what we use to inject the Wireshark packet com
 
 ```
 session_2026-07-11_1030/
-  meta.json          # clock anchor, USBPcap device+filter, config, tool/OS versions, monitor layout
-  usb.pcapng         # USB truth — Wireshark-openable, checkpoint comments injected
-  frames.idx         # fixed-width binary seek index, one 24-byte record per USB frame
+  meta.json          # clock anchor, backend + capture speed, config, tool/OS versions, monitor
+                     #   layout, traffic_only, folded bus-event summary
+  usb.pcapng         # traffic truth — Wireshark-openable, checkpoint comments injected
+  frames.idx         # fixed-width binary seek index, one 24-byte record per frame — DERIVED
   events.ndjson      # append-only truth: every InputEvent + Checkpoint, in ts order
-  index.sqlite       # DERIVED, rebuildable: checkpoint, screenshot, decoded-field tables
-  screenshots/
+  bus_events.ndjson  # analyzer bus events (§4.1) — wire captures only
+  screenshots/       # absent under --traffic-only
     000001.png ...
+  displays.json      #   "
+  ui/                #   " UI-Automation widget snapshots
   memsnaps/          # process-memory snapshots (§6a), when armed — side files like screenshots/
     000000/{manifest.json, regions.bin} ...
 ```
 
-- **Sources of truth:** `usb.pcapng` (USB) and `events.ndjson` (input/checkpoints). Both are
+- **Sources of truth:** `usb.pcapng` (traffic) and `events.ndjson` (input/checkpoints). Both are
   append-only and flushed — crash-safe. If the recorder dies mid-session, the data is intact.
-- **`index.sqlite`** is a query accelerator for the viewer and can be **fully rebuilt** from the
-  pcapng + `frames.idx` + ndjson (`reveng-rec reindex <session>`). This keeps the hot recording path
-  from depending on transactional DB writes.
+- **`*.idx` are derived** and fully rebuildable from the truth files with
+  `reveng-rec reindex <session>`, which keeps the hot recording path free of anything
+  transactional.
+
+> A relational `index.sqlite` was specified here for the viewer and decoded-field tables. It was
+> never built — `frames.idx` plus in-memory scanning proved sufficient at the sizes reached, and
+> `rusqlite` is not a dependency. Two code comments still mention it aspirationally.
 
 ### 8.2 Seeking at scale
 
 None of the *container* formats are self-seekable — `usb.pcapng` is a stream of variable-length
 blocks and `events.ndjson` must be scanned line by line. Seeking is provided entirely by the
-**index layer**, in two parts:
+**index layer**:
 
-- **`frames.idx` — fixed-width binary sidecar, the primary USB seek structure.** One record per USB
+- **`frames.idx` — fixed-width binary sidecar, the primary seek structure.** One record per
   frame, appended cheaply on the hot recording path (crash-safe, no transactions):
 
   ```
@@ -477,11 +678,11 @@ blocks and `events.ndjson` must be scanned line by line. Seeking is provided ent
   - **Seek to time T** = binary search over the monotonic `ts_ns` column — O(log n).
   - The file is `mmap`'d, so both are memory-speed. At 20M frames it's ~480 MB.
 
-- **`index.sqlite` — relational seek** for checkpoints, screenshots, and decoded fields (B-tree,
-  O(log n)). Checkpoints number in the hundreds/thousands regardless of capture size, so these
-  queries are trivial. Input events live in `events.ndjson` but are indexed here for range queries.
+- **Checkpoints and screenshots need no index.** They number in the hundreds or thousands
+  regardless of capture size, so scanning `events.ndjson` is trivial — which is why the
+  relational index above never became necessary.
 
-**Reading a USB window is independent of session size:** one index lookup → one `fseek` into the
+**Reading a traffic window is independent of session size:** one index lookup → one `fseek` into the
 pcapng at `byte_offset` → sequential read of K frames. Nothing parses the capture from the start.
 
 **Scale check.** A worst-case bulk-streaming session (~10 MB/s for 10 min) ≈ 6 GB pcapng / ~20M
@@ -504,7 +705,7 @@ the text ones are directly consumable:
 | `meta.json` | small JSON | ✅ |
 | `screenshots/*.png` | binary PNG | ✅ **via vision** (image Read) |
 | `usb.pcapng` | binary pcapng | ❌ binary, and large |
-| `index.sqlite` | binary SQLite | ❌ not directly — needs the query CLI |
+| `frames.idx` | fixed-width binary | ❌ not directly — needs the query CLI |
 
 The main signal (`usb.pcapng`) is precisely the part an LLM can't read. **The rule: an agent never
 *reads* a session, it *queries* it** — checkpoints are the index, screenshots go in via vision, USB
@@ -571,7 +772,7 @@ reassembles an endpoint by newlines (the serial shape) instead of the binary log
 `grep --text` matches a UTF-8 substring instead of a hex byte pattern.
 
 Output is bounded, decoded text (add `--format json|text|hex|auto`). These commands are backed by
-`index.sqlite` + byte-offset seeks into `usb.pcapng`, so they're O(1)-ish and never stream the whole
+`frames.idx` + byte-offset seeks into `usb.pcapng`, so they're O(1)-ish and never stream the whole
 capture. The viewer and the CLI share the same `export`/decode code path.
 
 ---
@@ -663,74 +864,40 @@ byte 4 is `0x50`." That correlation is what makes the decode loop converge inste
 
 ## 9. Viewer (egui desktop app)
 
-- **Timeline** — horizontal track of checkpoints, color-coded by type (click / key / interval /
-  manual). Zoom + pan. Overlaid USB-traffic density so you can *see* the busy regions.
-- **Seek** — click a marker, or `←/→` to step prev/next checkpoint. Screenshot pane + USB inspector
-  update together.
-- **Screenshot pane** — the grab at that checkpoint, with the cursor position drawn on it.
-- **USB inspector** — the frames in a window around the checkpoint (±K frames or ±T ms, from the
-  index). Decoded header (dev/endpoint/transfer/dir/len/status) + hex/ASCII payload (seeked from
-  `byte_offset` in the pcapng). Filter by endpoint/direction/transfer type.
-- **Notes** — captured live during recording, not after. The `record` USB path opens a small
-  Slint window (the primary recording surface: red REC indicator, elapsed clock + growing session
-  size, a live **per-source rate/volume dashboard** — USB frames/s + PCIe events/s, MB, with a
-  "hot"/size warning so a PCIe firehose is visible and can't fill the disk unnoticed, plus a
-  per-source breakdown line (USB: top endpoints by volume; PCIe: events by kind `cfg/mmio/dma/irq`)
-  — a scrollback log of notes, input box, Stop button). The dashboard shows *aggregates only, never contents*: the
-  window samples shared counters every 250 ms; the raw events stay in the logs, queried offline.
-  Each logged note also records where in the stream it landed (`usb <n> · pcie <n>`). Typing a note + Enter stamps it on the master clock the instant
-  the key is pressed and stores it as a `Manual` checkpoint (`note` field) anchored to the frame
-  live at that moment — so an agent can later correlate "what I said" against "what was on the wire"
-  (`reveng-rec notes` / `ls`). While the notes window is focused, the global input hook suppresses
-  keystroke/click checkpoints (the note itself is the record; Return/Tab/Esc don't trip triggers).
-  Headless automation (`--max-seconds`, `REVENG_NO_NOTES_UI=1`) skips the window. The viewer renders
-  the stored `note` on its checkpoint card.
-- **Device picker.** `record` launched with no device specified (and interactively) opens a Slint
-  checkbox picker listing enumerated USB + PCIe devices. The user ticks targets and clicks Start;
-  the recorder then relaunches itself (elevated via UAC if needed) with the chosen devices as
-  explicit args (`--device-vidpid …`, `--with-pcie --pci-bdf …`), so the relaunched process skips
-  the picker and records normally. Leaving everything unchecked records input + notes only. One
-  PCIe device can be co-logged. Bypass with an explicit device flag, `--no-capture`, headless mode
-  (`--max-seconds`/`REVENG_NO_NOTES_UI`), or `REVENG_NO_PICKER`. The picker also surfaces driver
-  status — if USBPcap isn't attached, or `reveng-pcidrv` (the `RevengPciCap` service backing live
-  PCIe) isn't loaded, it says so; and when a PCIe device is recorded the elevated recorder
-  **auto-starts** the `RevengPciCap` service (`sc start`) if it's registered but stopped.
-- **Parallel multi-device capture.** The USB `record` path opens one capture per USBPcap control
-  device (root hub), each on its own reader thread, all folding into the single `usb.pcapng` on the
-  shared clock (arrival-order merged index, timestamps clamped non-decreasing so `frames.idx` stays
-  binary-searchable). A VID:PID / `--all-devices` selection that spans several root hubs opens
-  several sources at once. **Zero sources is just the empty case:** `--no-capture` (or no matching
-  device) runs the whole pipeline — input, screenshots, notes, the window — with no USB capture and
-  no admin, e.g. to exercise the UI or take an input/note-only recording.
-- **USB data-volume reduction (default lossless).** A camera's isochronous video endpoint (or a
-  bulk mass-storage stream) is a firehose, while the *protocol* lives on tiny control/interrupt
-  endpoints. Reduction is per-transfer-type/endpoint, opt-in: `--usb-snaplen <bytes>` truncates big
-  transfers in the kernel (control/interrupt untouched; the index keeps the original on-wire
-  length); `--drop-isoc`/`--drop-bulk` skip those transfer types entirely (the checkpoint
-  screenshots already capture a camera's output); `--endpoints 0x81,0x02` restricts to an
-  endpoint allow-list (direction-agnostic); `--usb-bufsize` enlarges the kernel buffer for bursts.
-  Dropped packets are counted and reported — never silent. Default (no flags) is byte-exact.
-- **Source-agnostic engine.** The input-driven engine — mouse clicks (and selected keys) forming
-  checkpoints + screenshots, plus notes — is the *primary event driver* (the oracle), and traffic is
-  just what gets anchored to it (DESIGN §7). It runs the same for USB, PCIe, or both: interactive
-  `--source pcie` (drv/replay) records clicks→checkpoint+screenshot anchored to PCIe events, exactly
-  like USB. `Checkpoint.anchor` (the primary) is USB when a USB source is active, else PCIe; other
-  concurrently-captured sources go in `anchors`. So a PCIe-only session behaves like a USB-only one
-  (`ls` shows `anchor=N`; `diff`/`export`/`frames` work). Headless/automation, the ETW backend, and
-  non-Windows use the portable `record.rs` loop (no input/screen capture).
-- **USB + PCIe co-logging.** `record --with-pcie` captures a PCIe device *concurrently* with USB in
-  one session: a PCIe reader thread writes `pcie.bin`/`pcie.idx` on the same clock while the USB
-  hubs write `usb.pcapng`. Every checkpoint then gets a **secondary anchor** — `Checkpoint.anchors`
-  (a `Vec<TrafficAnchor>`, each source-tagged) holds the nearest preceding PCIe event, while
-  `anchor` stays the USB frame — so one click/note reaches *both* wires. `reveng-rec show` decodes
-  each anchor against its own log; `ls` hints the PCIe anchor; the viewer renders the co-logged
-  PCIe event under the checkpoint card. Live PCIe capture stops promptly on window-Stop / max-seconds
-  (the `drv` reader honors a stop flag even with no deadline). The secondary source is a live device (`--pci-backend drv`,
-  `--pci-bdf`/`--pci-vidpid`) or, portably, `--pcie-replay <events.jsonl>`. PCIe traffic also drives
-  interval checkpoints, and `--max-bytes` caps total captured bytes.
-  Single-source sessions serialize identically to before (`anchors` omitted when empty).
-- **Diff aid** — select two click checkpoints and diff the USB frames between them (great for
-  "what's different between pressing button A vs button B").
+- **Timeline** — checkpoints color-coded by type (click / key / interval / manual / note), with
+  traffic density overlaid so busy regions are visible. Click a marker or `←/→` to step; the
+  screenshot pane and traffic inspector move together.
+- **Inspector** — frames in a window around the checkpoint, decoded header plus hex/ASCII payload,
+  seeked by `byte_offset`. Filter by endpoint / direction / transfer type.
+- **Diff aid** — select two checkpoints and diff the frames between them. This is the "what's
+  different between button A and button B" question, which is most of the RE loop.
+
+### 9.1 Recorder surfaces that are not the viewer
+
+These accreted into §9 historically. Mechanism is in `crates/recorder/src/notes_ui.rs` and
+`main.rs`; what matters at the design level:
+
+- **The recording window is the primary surface, and notes are captured live, not after.** Typing
+  a note stamps it on the master clock *at the keypress* and stores it as a `Manual` checkpoint
+  anchored to the frame live at that instant — which is what lets an agent later correlate "what
+  the operator said" against "what was on the wire". While that window is focused the input hook
+  suppresses keystroke/click checkpoints, so writing the note does not litter the timeline.
+- **The dashboard shows aggregates only, never contents** — counters sampled every 250 ms. Raw
+  events stay in the logs and are queried offline. This is a deliberate boundary, not an
+  optimisation.
+- **The device picker relaunches the process** with the chosen devices as explicit args (elevated
+  via UAC if needed), so the child skips the picker. Leaving everything unticked records
+  input + notes only.
+- **Zero capture sources is a supported case**, not an error: the whole pipeline runs with no
+  device and no admin.
+- **Volume reduction is opt-in and never silent.** Defaults are byte-exact; `--usb-snaplen`,
+  `--drop-isoc`/`--drop-bulk` and `--endpoints` trade fidelity for size, and every dropped packet
+  is counted and reported. On the wire backend most of these are refused outright because they
+  break reassembly (§4.1).
+- **The engine is source-agnostic**, and input is the *primary* driver: traffic is what gets
+  anchored to a click, not the other way round (§7). A PCIe-only session behaves exactly like a
+  USB-only one. With `--with-pcie`, one click reaches both wires — `Checkpoint.anchor` stays the
+  USB frame and `anchors` carries the nearest preceding PCIe event, each source-tagged.
 
 ---
 
@@ -786,39 +953,33 @@ If nothing matches at startup the recorder errors out rather than silently captu
 
 ### 11.2 Checkpoint-control flags
 
-Checkpoints default to: mouse button-down, a special-key set, and interval-during-traffic
-(see §7). These flags tune what generates a checkpoint:
+Checkpoints default to: mouse button-down, a special-key set, and interval-during-traffic (§7).
+**The flag list itself lives in `reveng-rec record --help`**, which cannot drift, and in README's
+CLI reference. What is worth recording here is why two of the defaults are shaped as they are:
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--checkpoint-on-any-key` | off | **every** key-down is a checkpoint, not just special keys |
-| `--checkpoint-keys Return,Escape,Tab,F1..F12` | see §7 | override the special-key set |
-| `--no-checkpoint-keys` | — | disable key-triggered checkpoints entirely |
-| `--checkpoint-key-combos Ctrl+S,Ctrl+Enter` | off | modifier combos that trigger a checkpoint |
-| `--checkpoint-mouse-buttons L,R,M,X1,X2` | `L,R,M` | which buttons trigger a checkpoint |
-| `--checkpoint-on-mouseup` | off | also checkpoint on button **release** (captures the result) |
-| `--checkpoint-on-wheel` | off | mouse-wheel scroll triggers a checkpoint |
-| `--no-checkpoint-clicks` | — | disable mouse-triggered checkpoints |
-| `--interval-checkpoint-ms N` | `1000` | period for interval checkpoints; `0` disables |
-| `--interval-bytes N` | `4096` | min USB bytes since last checkpoint to emit an interval one |
-| `--manual-checkpoint-hotkey Ctrl+Alt+M` | set | hotkey to drop a manual checkpoint on demand |
+- **Interval checkpoints are gated on bytes as well as time** (`--interval-bytes`, default 4096).
+  A pure timer would litter an idle capture with anchors that all point at the same frame; the
+  byte gate means an interval checkpoint only appears where traffic actually moved.
+- **Mouse-*down* is the default, not mouse-up.** The screenshot then shows the UI in the state
+  that *caused* the traffic. `--checkpoint-on-mouseup` captures the result instead, which is the
+  right choice when you care about what the click produced on screen rather than what it sent.
 
 ### 11.3 Screenshot & control flags
 
-| Flag | Default | Meaning |
-|---|---|---|
-| `--screenshot-on mousedown\|mouseup\|both\|none` | `mousedown` | when to grab |
-| `--screenshot-on-keys` | on | also grab on key-triggered checkpoints |
-| `--screenshot-scope cursor-monitor\|all\|foreground-window` | `cursor-monitor` | capture area |
-| `--screenshot-min-interval-ms N` | `150` | burst coalescing floor |
-| `--screenshot-format png\|webp-lossless` | `png` | encoding |
-| `--out <dir>` | `./session_<ts>` | session output directory |
-| `--stop-hotkey Ctrl+Alt+Pause` | set | clean-stop hotkey |
-| `--rotate-mb N` | off | rotate `usb.pcapng` into segments every N MB (see §8.2) |
-| `--mem-pid N` / `--mem-process name.exe` | off | arm process-memory snapshots against a target (§6a); the window shows a 📸 Snapshot button (needs admin + SeDebugPrivilege) |
-| `--mem-compress` | off | store each memory-snapshot region deflate-compressed (§6a) |
+Again, `--help` is the reference. The non-obvious ones:
 
-### 11.4 Equivalent TOML
+- **`--screenshot-min-interval-ms` (default 150) is burst coalescing**, not throttling for its own
+  sake — a double-click or a drag would otherwise queue several near-identical grabs onto the hot
+  path. Skipped grabs are recorded on the checkpoint so the gap is visible (§6).
+- **`--screenshot-scope` defaults to the cursor's monitor**, because a multi-monitor `all` grab is
+  several times the pixels for no extra evidence about the click that triggered it.
+- **`--traffic-only` overrides all of the above** (§4.4) — no hooks, no screenshots, no UIA.
+
+### 11.4 Config file — not implemented
+
+A TOML config was specified here as an alternative to the flags. It was never built: `record` is
+flags-only, and nothing reads a recorder config file. TOML is used in the codebase, but only for
+`annotate`'s decoder specs. The shape it *would* have taken, kept only as a sketch:
 
 ```toml
 [usb]
@@ -865,25 +1026,38 @@ reveng-rec record --device-vidpid 1234:abcd \
 - **LL-hook latency budget** — the single most likely footgun. Callbacks must stay trivial or
   Windows silently drops input. Enforced by design (timestamp+enqueue only) and worth a startup
   self-test.
-- **USB throughput** — a busy device can flood the pipe. Mitigations: device-address filtering at
+- **USB throughput** — a busy device can flood the reader. Mitigations: device-address filtering at
   the source, a high-priority non-blocking reader, write-through to disk. USBPcap's own kernel
-  buffer is the real backstop; if we can't keep up, *it* drops and we log a gap marker.
+  buffer is the real backstop; if we can't keep up, *it* drops and we log a gap marker. The
+  analyzer backend has the harder version of this problem — its uplink is itself USB 2.0, so a
+  saturating high-speed target can outrun it. That overflow is at least reported rather than
+  silent (§4.1).
 - **Clock skew** between USB (system-time) and input (QPC) is a few ms — fine for click-seeking,
   called out for anyone needing bus-accurate timing.
 - **This is, functionally, a keylogger + screen recorder** — and, with `--mem-pid`/`--mem-process`
   (§6a), a **process-memory reader** (admin + SeDebugPrivilege). It's legitimate RE/defensive tooling,
   but it must only be run on a machine the operator owns/is authorized to instrument. Sessions stay
   local; no network egress. Worth a consent banner + a visible "RECORDING" indicator.
-- **Non-goals (for now):** non-Windows platforms; **raw PCIe TLP / hardware analyzers** (the
-  `CaptureSource` seam could host one later, but software capture is TLP-free — see §4a); live
-  real-time decode; automated protocol reverse-engineering. PCIe DMA is best-effort in software.
+- **Non-goals (for now):** **raw PCIe TLP capture** (hardware-only; software capture is TLP-free —
+  see §4a); live real-time decode; automated protocol reverse-engineering; USB 3 / SuperSpeed.
+  PCIe DMA is best-effort in software.
+
+  > Two of these used to be non-goals and no longer are. *Hardware analyzers* were ruled out; the
+  > `CaptureSource` seam did host one, and §4.1 is the result. *Non-Windows platforms* were ruled
+  > out; traffic capture and the whole read side are now OS-agnostic, though only the correlation
+  > half remains genuinely Windows-bound. The seam earned its keep.
 
 ---
 
-## 13. Suggested build order
+## 13. Build order (historical)
+
+The order this was actually built in, kept because the dependency reasoning still holds for anyone
+restructuring it. Steps 1–7 are done; the analyzer backend (§4.1) slotted in behind step 2's
+`CaptureSource` without touching 3–7, which is the strongest evidence the seam was drawn in the
+right place.
 
 1. **`core` + clock anchor + session schema + `CaptureSource` trait** — the timeline foundation.
-2. **`usbcap`** — spawn USBPcapCMD, parse frames, pcapng writer + index. Verify against Wireshark.
+2. **`usbcap`** — parse frames, pcapng writer + index. Verify against Wireshark.
 3. **`winput`** — hooks + InputEvent; prove the latency budget holds.
 4. **Checkpoint engine + `winshot`** — clicks → checkpoint + screenshot; interval logic.
 5. **`recorder` bin** — wire the threads, stop hotkey, finalize + comment injection.

@@ -17,6 +17,7 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 reveng-core.workspace = true
 reveng-usbcap.workspace = true
 reveng-pcicap.workspace = true
+reveng-cynthion.workspace = true
 reveng-winput.workspace = true
 reveng-winshot.workspace = true
 reveng-winocr.workspace = true

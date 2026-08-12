@@ -79,7 +79,10 @@ impl SessionWriter {
 
     /// Write `meta.json` (clock anchor, config, device info, versions).
     pub fn write_meta<T: Serialize>(&self, meta: &T) -> anyhow::Result<()> {
-        fs::write(self.root.join("meta.json"), serde_json::to_string_pretty(meta)?)?;
+        fs::write(
+            self.root.join("meta.json"),
+            serde_json::to_string_pretty(meta)?,
+        )?;
         Ok(())
     }
 
@@ -243,10 +246,8 @@ mod tests {
 
     #[test]
     fn records_ignore_only_an_unterminated_crash_tail() {
-        let dir = std::env::temp_dir().join(format!(
-            "reveng_session_tail_test_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("reveng_session_tail_test_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let mut writer = SessionWriter::create(&dir).unwrap();
         writer
@@ -270,7 +271,10 @@ mod tests {
         file.write_all(br#"{"rec":"checkpoint""#).unwrap();
         drop(file);
 
-        assert_eq!(SessionReader::open(&dir).unwrap().records().unwrap().len(), 1);
+        assert_eq!(
+            SessionReader::open(&dir).unwrap().records().unwrap().len(),
+            1
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

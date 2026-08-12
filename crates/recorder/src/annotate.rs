@@ -147,7 +147,9 @@ pub fn annotate(
         w,
         "{title} decoded from {}{}:",
         session_dir.display(),
-        at_ckpt.map(|c| format!(" as of checkpoint {c}")).unwrap_or_default()
+        at_ckpt
+            .map(|c| format!(" as of checkpoint {c}"))
+            .unwrap_or_default()
     )?;
 
     if spec.fields.is_empty() {
@@ -156,17 +158,33 @@ pub fn annotate(
     for f in &spec.fields {
         match compute(f, &regs) {
             Some((raw, val)) => {
-                let unit = if f.unit.is_empty() { String::new() } else { format!(" {}", f.unit) };
-                writeln!(w, "  {:<18} = {:>12.4}{unit}   (raw 0x{raw:x})", f.name, val)?;
+                let unit = if f.unit.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", f.unit)
+                };
+                writeln!(
+                    w,
+                    "  {:<18} = {:>12.4}{unit}   (raw 0x{raw:x})",
+                    f.name, val
+                )?;
             }
-            None => writeln!(w, "  {:<18} = <registers not yet written in this capture>", f.name)?,
+            None => writeln!(
+                w,
+                "  {:<18} = <registers not yet written in this capture>",
+                f.name
+            )?,
         }
     }
 
     if log {
         writeln!(w, "\nlabeled register state ({} registers):", regs.len())?;
         for ((req, idx), (v, ts)) in &regs {
-            let rname = spec.registers.get(&format!("{req}:{idx}")).map(String::as_str).unwrap_or("");
+            let rname = spec
+                .registers
+                .get(&format!("{req}:{idx}"))
+                .map(String::as_str)
+                .unwrap_or("");
             let reqname = spec.requests.get(req).map(String::as_str).unwrap_or("");
             writeln!(
                 w,
@@ -221,7 +239,13 @@ mod tests {
     fn reciprocal_field_form() {
         // Obfuscated (0x5A, 0x66) XOR 0x5A → 0x00, 0x3C → raw 60; reciprocal 1000/(100-60) = 25.
         let regs = regmap(&[("0x40", "0x2000", 0x5A), ("0x40", "0x2002", 0x66)]);
-        let f = field("reciprocal", &["0x40:0x2000", "0x40:0x2002"], 1.0, 1000.0, 100.0);
+        let f = field(
+            "reciprocal",
+            &["0x40:0x2000", "0x40:0x2002"],
+            1.0,
+            1000.0,
+            100.0,
+        );
         let (raw, val) = compute(&f, &regs).unwrap();
         assert_eq!(raw, 60);
         assert!((val - 25.0).abs() < 0.01, "reciprocal value = {val}");
@@ -255,10 +279,24 @@ mod tests {
         .unwrap();
         let mut merged = base;
         merged.merge(device);
-        assert_eq!(merged.device.name, "Example Device", "later device name wins");
-        assert_eq!(merged.requests.get("0x41").unwrap(), "vendor_channel", "later overrides");
-        assert_eq!(merged.requests.get("0x40").unwrap(), "register_write", "base kept");
-        assert!(merged.registers.contains_key("0x51:0x3012"), "base register kept");
+        assert_eq!(
+            merged.device.name, "Example Device",
+            "later device name wins"
+        );
+        assert_eq!(
+            merged.requests.get("0x41").unwrap(),
+            "vendor_channel",
+            "later overrides"
+        );
+        assert_eq!(
+            merged.requests.get("0x40").unwrap(),
+            "register_write",
+            "base kept"
+        );
+        assert!(
+            merged.registers.contains_key("0x51:0x3012"),
+            "base register kept"
+        );
         assert_eq!(merged.fields.len(), 1, "device fields appended");
     }
 

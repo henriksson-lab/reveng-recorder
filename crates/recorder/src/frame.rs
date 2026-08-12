@@ -17,9 +17,33 @@ pub fn extract(session_dir: &Path, ep: u8, frame_bytes: usize, out: &Path) -> Re
     }
     let mut r = UsbReader::open(s.usb_pcapng(), s.frames_idx())?;
     let n = r.len();
+    let wire_capture = r.format() == reveng_usbcap::CaptureFormat::Wire;
     let mut acc: Vec<u8> = Vec::with_capacity(frame_bytes + (1 << 20));
     let (mut seen, mut truncated) = (0u64, false);
+    // On the wire a NAKed transaction is retried with identical bytes, so concatenating
+    // every DATA packet on the endpoint would duplicate them — and the result would be the
+    // right length while being wrong, which is the worst way for this to fail. Gate on the
+    // handshake instead.
+    let mut stream = reveng_usbcap::reassemble::DataStream::new();
     for i in 0..n {
+        if wire_capture {
+            let packet = r.raw_packet_bytes(i)?;
+            let Some(acked) = stream.push(&packet) else {
+                continue;
+            };
+            if acked.endpoint != ep & 0x0f {
+                continue;
+            }
+            seen += 1;
+            if acked.data.is_empty() {
+                continue;
+            }
+            acc.extend_from_slice(&acked.data);
+            if acc.len() >= frame_bytes {
+                break;
+            }
+            continue;
+        }
         if r.endpoint_at(i)? != ep {
             continue;
         }
@@ -66,6 +90,18 @@ pub fn guess(session_dir: &Path, ep: u8) -> Result<()> {
         bail!("{}: not a USB session", session_dir.display());
     }
     let mut r = UsbReader::open(s.usb_pcapng(), s.frames_idx())?;
+    // Every inference below is built on the URB chunk: "the dominant transfer length is the
+    // host's DMA chunk, and a shorter one ends a frame". On the wire there are no URBs —
+    // the dominant length is just `wMaxPacketSize`, so the analysis returns a confident
+    // frame size and fps that mean nothing. Refuse rather than mislead; teaching this to
+    // segment on wire packets is its own piece of work.
+    if r.format() == reveng_usbcap::CaptureFormat::Wire {
+        bail!(
+            "frame-guess models host URB transfers and this is a wire capture. On the wire \
+             the dominant transfer length is wMaxPacketSize, not a DMA chunk, so the frame \
+             size and fps it would report are meaningless."
+        );
+    }
     let n = r.len();
 
     // Per-transfer (ts, reported_len) for this endpoint. Segmentation uses the *reported* on-wire
@@ -84,7 +120,11 @@ pub fn guess(session_dir: &Path, ep: u8) -> Result<()> {
 
     // The DMA/URB chunk size is the dominant (max) transfer length; a shorter transfer ends a frame.
     let chunk = xfers.iter().map(|x| x.1).max().unwrap_or(0);
-    println!("ep 0x{ep:02x}: {} transfers, URB chunk {} bytes", xfers.len(), chunk);
+    println!(
+        "ep 0x{ep:02x}: {} transfers, URB chunk {} bytes",
+        xfers.len(),
+        chunk
+    );
 
     // Estimate 1 — short-packet boundaries. Correct on a clean capture, but a lossy capture
     // (dropped packets) sprays spurious short transfers and over-segments.
@@ -108,17 +148,26 @@ pub fn guess(session_dir: &Path, ep: u8) -> Result<()> {
         gaps.sort_unstable();
         let med = gaps[gaps.len() / 2] as f64 / 1e9;
         if med > 0.0 {
-            println!("median frame period: {:.1} ms  (~{:.1} fps)", med * 1e3, 1.0 / med);
+            println!(
+                "median frame period: {:.1} ms  (~{:.1} fps)",
+                med * 1e3,
+                1.0 / med
+            );
         }
     }
 
     // Factor the more self-consistent estimate (higher agreement fraction), preferring the larger
     // frame when they tie — a real frame is many URBs, not a single chunk.
-    let frac = |m: &Option<(usize, u32, usize)>| m.map(|(_, v, n)| v as f64 / n as f64).unwrap_or(0.0);
+    let frac =
+        |m: &Option<(usize, u32, usize)>| m.map(|(_, v, n)| v as f64 / n as f64).unwrap_or(0.0);
     let pick = match (sp, tg) {
         (Some(a), Some(b)) => {
             if (frac(&sp) - frac(&tg)).abs() < 0.05 {
-                if a.0 >= b.0 { a.0 } else { b.0 }
+                if a.0 >= b.0 {
+                    a.0
+                } else {
+                    b.0
+                }
             } else if frac(&sp) > frac(&tg) {
                 a.0
             } else {
@@ -142,11 +191,31 @@ pub fn guess(session_dir: &Path, ep: u8) -> Result<()> {
         return Ok(());
     }
     println!("\ncandidate formats (feed the winner to `frame-extract --frame-bytes {best}` + `frame-decode`):");
-    println!("  {:>5} x {:<5}  {:<7} {:<6} {}", "W", "H", "pix", "ratio", "note");
+    println!(
+        "  {:>5} x {:<5}  {:<7} {:<6} {}",
+        "W", "H", "pix", "ratio", "note"
+    );
     for c in cands.iter().take(10) {
-        let mult = if c.w % 16 == 0 { "W%16=0" } else if c.w % 8 == 0 { "W%8=0" } else { "" };
-        println!("  {:>5} x {:<5}  {:<7} {:<6} {} {}", c.w, c.h, c.pix, c.ratio, mult,
-            if (c.ar - c.ideal).abs() < 1e-6 { "exact" } else { "≈" });
+        let mult = if c.w % 16 == 0 {
+            "W%16=0"
+        } else if c.w % 8 == 0 {
+            "W%8=0"
+        } else {
+            ""
+        };
+        println!(
+            "  {:>5} x {:<5}  {:<7} {:<6} {} {}",
+            c.w,
+            c.h,
+            c.pix,
+            c.ratio,
+            mult,
+            if (c.ar - c.ideal).abs() < 1e-6 {
+                "exact"
+            } else {
+                "≈"
+            }
+        );
     }
     Ok(())
 }
@@ -177,7 +246,10 @@ fn segment_short_packet(xfers: &[(i64, usize)], chunk: usize) -> (Vec<usize>, Ve
 fn segment_time_gap(xfers: &[(i64, usize)]) -> (Vec<usize>, Vec<i64>) {
     if xfers.len() < 3 {
         let total: usize = xfers.iter().map(|x| x.1).sum();
-        return (vec![total], xfers.first().map(|x| vec![x.0]).unwrap_or_default());
+        return (
+            vec![total],
+            xfers.first().map(|x| vec![x.0]).unwrap_or_default(),
+        );
     }
     let mut gaps: Vec<i64> = xfers.windows(2).map(|w| w[1].0 - w[0].0).collect();
     let mut sorted = gaps.clone();
@@ -216,7 +288,10 @@ fn modal(frames: &[usize]) -> Option<(usize, u32, usize)> {
     for &f in frames {
         *counts.entry(f).or_default() += 1;
     }
-    counts.iter().max_by_key(|(_, c)| **c).map(|(k, c)| (*k, *c, frames.len()))
+    counts
+        .iter()
+        .max_by_key(|(_, c)| **c)
+        .map(|(k, c)| (*k, *c, frames.len()))
 }
 
 struct Cand {
@@ -261,7 +336,16 @@ fn factor_candidates(nbytes: usize) -> Vec<Cand> {
                 .filter(|(_, _, e)| *e < 0.05)
                 .min_by(|a, b| a.2.total_cmp(&b.2))
             {
-                out.push(Cand { w, h, bpp, pix, ar, ideal, ratio, err });
+                out.push(Cand {
+                    w,
+                    h,
+                    bpp,
+                    pix,
+                    ar,
+                    ideal,
+                    ratio,
+                    err,
+                });
             }
         }
     }
@@ -325,15 +409,29 @@ pub fn decode(
     bayer: bool,
     out_prefix: &str,
 ) -> Result<()> {
-    let data = std::fs::read(raw_path).with_context(|| format!("reading {}", raw_path.display()))?;
+    let data =
+        std::fs::read(raw_path).with_context(|| format!("reading {}", raw_path.display()))?;
     let gray: Vec<u8> = match pix {
         "raw8" => {
-            anyhow::ensure!(data.len() >= width * height, "raw8 needs {} bytes, got {}", width * height, data.len());
+            anyhow::ensure!(
+                data.len() >= width * height,
+                "raw8 needs {} bytes, got {}",
+                width * height,
+                data.len()
+            );
             data[..width * height].to_vec()
         }
         "raw16le" | "raw16" => {
-            anyhow::ensure!(data.len() >= width * height * 2, "raw16 needs {} bytes, got {}", width * height * 2, data.len());
-            data.chunks_exact(2).take(width * height).map(|c| (u16::from_le_bytes([c[0], c[1]]) >> 8) as u8).collect()
+            anyhow::ensure!(
+                data.len() >= width * height * 2,
+                "raw16 needs {} bytes, got {}",
+                width * height * 2,
+                data.len()
+            );
+            data.chunks_exact(2)
+                .take(width * height)
+                .map(|c| (u16::from_le_bytes([c[0], c[1]]) >> 8) as u8)
+                .collect()
         }
         other => bail!("unknown --pix '{other}' (raw8 | raw16le)"),
     };
@@ -374,7 +472,10 @@ mod tests {
         // 1280x720 RAW8 is an exact 16:9 candidate (note 921600 also factors as 960x960 1:1, so
         // several exact-ratio candidates tie — frame-guess ranks, the human/scene picks).
         let c = factor_candidates(1280 * 720);
-        let hit = c.iter().find(|x| x.w == 1280 && x.h == 720 && x.bpp == 1).expect("1280x720 present");
+        let hit = c
+            .iter()
+            .find(|x| x.w == 1280 && x.h == 720 && x.bpp == 1)
+            .expect("1280x720 present");
         assert!(hit.err < 1e-9, "16:9 should be an exact match");
         assert_eq!(hit.ratio, "16:9");
     }
@@ -384,8 +485,12 @@ mod tests {
         // 3 URBs per frame, then a big inter-frame gap. ts in ns, 1ms intra, 100ms inter.
         let mk = |t: i64| (t, 100usize);
         let xf = vec![
-            mk(0), mk(1_000_000), mk(2_000_000),        // frame 1
-            mk(102_000_000), mk(103_000_000), mk(104_000_000), // frame 2 after 100ms gap
+            mk(0),
+            mk(1_000_000),
+            mk(2_000_000), // frame 1
+            mk(102_000_000),
+            mk(103_000_000),
+            mk(104_000_000), // frame 2 after 100ms gap
         ];
         let (frames, starts) = segment_time_gap(&xf);
         assert_eq!(frames, vec![300, 300], "two 3-URB frames of 300 bytes");

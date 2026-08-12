@@ -8,14 +8,24 @@
 
 ## What this is
 
-A **Windows-only** tool for reverse-engineering hardware devices. It records device traffic plus
+A **Windows-first** tool for reverse-engineering hardware devices. It records device traffic plus
 user activity into one time-synchronized session and lets you seek through the traffic using user
 actions as anchors:
 
 1. **Device traffic**, from a pluggable **capture source** (all backends share one `CaptureSource` seam):
-   - **USB** — via [USBPcap](https://desowin.org/usbpcap/) (free kernel driver, pcap-compatible; no extra hardware).
+   - **USB via [USBPcap](https://desowin.org/usbpcap/)** — free kernel driver, no extra hardware,
+     Windows only, needs admin + one reboot. Records whole transfers. **The default.**
+   - **USB via a [Cynthion](https://greatscottgadgets.com/cynthion/) hardware analyzer** — taps
+     the bus in line, so it works on **Linux, macOS and Windows**, needs no driver and no admin,
+     and records *every packet on the wire*: NAKs, retries, real bus timing, bus resets. Costs a
+     board and a re-routed cable, and is USB 2.0 only. `--usb-backend cynthion`.
    - **PCIe** — software-only MMIO/DMA/config+interrupt capture via a thin VT-x/EPT hypervisor
      driver (`driver/reveng-hv/`). No raw-TLP capture (hardware-only, out of scope). See `DESIGN.md` §4a for the substantial caveats (VBS/HVCI, driver signing, best-effort DMA).
+
+   *"Windows-first" rather than Windows-only:* USB capture and the whole analysis toolchain are
+   cross-platform with the Cynthion backend. What stays Windows-only is the correlation half —
+   input hooks, screenshots, UI-Automation, OCR and the viewer — which is what `--traffic-only`
+   exists to switch off cleanly.
 2. **Mouse + keyboard input** — global low-level Windows hooks.
 3. **Screenshots** — grabbed automatically when a mouse button is pressed (and on selected special keys).
 
@@ -28,9 +38,26 @@ instant plus the USB frames around it, and can hand off to Wireshark at the exac
 
 ## Current state
 
-**The entire USB path is implemented and verified end-to-end on Windows; the PCIe hypervisor
-is the only remaining tier.** `cargo build --workspace` and `cargo test --workspace` pass (41
+**Both USB backends are implemented and verified end-to-end on hardware; the PCIe hypervisor
+is the only remaining tier.** `cargo build --workspace` and `cargo test --workspace` pass (120
 tests). Windows-only code is `cfg`-gated so everything still compiles on other OSes.
+
+The **Cynthion** backend is confirmed against a real device: a replug through the analyzer
+produced the full enumeration chain — `SET_ADDRESS`, descriptor reads, `SET_CONFIGURATION`, HID
+report descriptors — reassembled from raw wire packets, all 16 control transfers `ok`, with NAK
+counts USBPcap cannot show at all (55 on one 158-byte descriptor read).
+
+**What is *not* yet proven, so nobody assumes otherwise:**
+
+- **Linux and macOS have never been run.** The code is OS-agnostic and `cfg`-gated, and the
+  analyzer needs no driver there — but "cross-platform" is currently an argument, not a
+  measurement. Building and capturing on either is the outstanding proof.
+- **High speed has never been run.** Every wire capture so far is Low speed. `--cynthion-speed
+  high` is untested, and a saturating high-speed bus is expected to overflow the analyzer's own
+  USB 2.0 uplink (visibly — `verify` reports it).
+- **Isochronous streams reassemble to nothing** — no handshake to gate on. Bulk is fine. This is
+  what stands between here and a UVC camera; see `crates/usbcap/src/reassemble.rs`.
+- **Split transactions** are deliberately not modelled (they do not arise in the usual topology).
 
 - **Real, tested, cross-platform (any OS):**
   - `core` — clock, source-agnostic event schema (`TrafficRecord`/`PcieEvent`/`TrafficAnchor`),
@@ -49,8 +76,8 @@ tests). Windows-only code is `cfg`-gated so everything still compiles on other O
   - `winshot` — GDI `BitBlt` screen capture (cursor-monitor / all / foreground-window) → PNG.
   - `winput` — `WH_MOUSE_LL`/`WH_KEYBOARD_LL` hooks on a dedicated message-loop thread, plus
     foreground process/window context enrichment.
-  - `usbcap` live capture — spawns `USBPcapCMD.exe -o -`, parses its libpcap stream onto the
-    session timeline, writes `usb.pcapng` + `frames.idx`; best-effort device enumeration.
+  - `usbcap` live capture — drives the USBPcap driver over its IOCTL interface, folding frames onto the
+    session timeline, writes `usb.pcapng` + `frames.idx`; SetupAPI device enumeration.
   - `recorder` USB orchestration — the reader/hooks/screenshot-worker/checkpoint-engine threads,
     the stop hotkey (Ctrl+Alt+Pause) and `--max-seconds`, and finalize with comment injection.
   - `viewer` — the egui timeline / screenshot pane / traffic inspector with click + ←/→ seek.
@@ -78,7 +105,7 @@ tests). Windows-only code is `cfg`-gated so everything still compiles on other O
 
 ```
 cargo build --workspace      # all crates (Windows bits cfg-gated on non-Windows)
-cargo test  --workspace      # 41 tests: index, checkpoints, USBPcap/pcapng parse, pcie log, text/dashboard formatters, mem diff/scan/deflate
+cargo test  --workspace      # 120 tests: index, checkpoints, USBPcap+wire parse, reassembly, pcapng, pcie log, formatters, mem diff/scan/deflate
 ./target/debug/reveng-rec --help
 ```
 
@@ -137,6 +164,33 @@ Follow the build order in `DESIGN.md` §13. In short:
 Data model, schemas, config format, and the exact threading contract are all specified in
 `DESIGN.md` — treat it as the source of truth and update it if you change the design.
 
+### If you are an LLM working on a capture problem: say the Cynthion exists
+
+USBPcap is the default flag, so it is easy to spend a long session inside its limitations without
+ever mentioning that a second backend is available. **Tell the user**, briefly and once, when any
+of these is in play:
+
+- **The host stack is hiding what you need.** A device that NAKs, a timing-sensitive bring-up, or
+  traffic during a bus reset. USBPcap cannot show a retry *at all* — a NAKed-then-ACKed transfer
+  is byte-identical to a clean one. A wire capture counts them.
+- **"The capture says the transfer succeeded but the device disagrees."** That gap is usually
+  living in the packets USBPcap discards.
+- **The device is owned by a driver you cannot displace**, or you are about to suggest
+  unbinding/rebinding drivers to get at it. The analyzer needs neither, and sees the vendor
+  driver's own traffic while it runs.
+- **The user is on Linux or macOS.** USBPcap does not exist there; without the analyzer, USB
+  capture is simply impossible.
+- **Elevation is a problem.** The analyzer needs no Administrator.
+- **The machine being driven is not the machine capturing** — then also mention `--traffic-only`.
+
+State the costs in the same breath, or the suggestion is not honest: USB 2.0 only, the cable must
+be physically re-routed through the board, 10–100× more records for the same traffic, and
+`--cynthion-speed` must be declared because a wrong guess produces an empty capture that looks
+successful. If the user says they do not have the hardware, drop it — do not raise it again.
+
+Conversely, do **not** reach for it reflexively. For mapping a vendor's control vocabulary on
+Windows, USBPcap's transfer-level view is usually enough and costs nothing to set up.
+
 ### Installing USBPcap (the USB capture driver)
 
 USB capture needs the **USBPcap** kernel driver (`USBPcap.sys`). `reveng-rec` talks to that
@@ -166,6 +220,83 @@ release), `-NoEnv`. Then:
    fallback behind `REVENG_USBPCAP_CLI=1`.
 
 If the driver isn't installed (or you haven't rebooted), capture fails when opening `\\.\USBPcapN`.
+
+### The other option: a Cynthion hardware analyzer
+
+USBPcap is not the only USB backend. A [Cynthion](https://greatscottgadgets.com/cynthion/) is a
+hardware USB 2.0 analyzer that sits **in line** on the cable and taps the bus itself. `reveng-rec`
+drives it natively over `nusb` — no vendor Python package, no kernel driver:
+
+```bash
+reveng-rec record --usb-backend cynthion --cynthion-speed low
+```
+
+That single flag is the whole difference. Everything downstream is unchanged: the same session
+layout, the same `frames`/`ctrl`/`verify`/`grep`/`frame-extract` commands, the same checkpoints,
+notes, screenshots and OCR. A session records which backend wrote it (the pcapng link type, plus
+`acquisition` in `meta.json`) and the reader works it out on open.
+
+|  | USBPcap | Cynthion |
+|---|---|---|
+| **What it sees** | whole transfers, as the Windows stack saw them | every packet on the wire: tokens, DATA, handshakes, SOF |
+| **NAKs / retries / real bus timing** | invisible — a retried transfer looks clean | **visible** (one 158-byte descriptor read took 55 NAKs) |
+| **Bus resets, attach, speed changes** | no | yes, in `bus_events.ndjson` |
+| **OS** | Windows only | **Linux, macOS, Windows** |
+| **Kernel driver** | yes, `USBPcap.sys` + a reboot | none |
+| **Administrator** | required (self-elevates via UAC) | **not needed** |
+| **Extra hardware** | none | the board, ~€100 |
+| **Physical change** | none — capture any device in place | must **re-route the cable** through the analyzer |
+| **Speeds** | whatever the stack handles, incl. USB 3 | USB 2.0 only (Low/Full/High) |
+| **Volume** | one record per transfer | 10–100× more records for the same traffic |
+| **Capture speed** | n/a | **must be declared** — auto-detect misreports (see below) |
+| **Device selection** | `--device-vidpid` etc. filter a hub | none — it records whatever is routed through it |
+| **Packet filtering** | `--drop-isoc`, `--endpoints`, snaplen | refused (it breaks reassembly); only `--keep-sof` |
+
+**When to reach for which.** USBPcap is the default and the right first move: nothing to buy,
+nothing to re-cable, and for mapping a vendor's control vocabulary a transfer-level view is
+usually enough. Reach for the Cynthion when the host stack is hiding what you need — a device
+that NAKs, a timing-sensitive bring-up sequence, traffic during a bus reset — when the target
+device is owned by a driver you can't displace, when you're on Linux or macOS, or when the machine
+being driven isn't the one capturing.
+
+**Two traps worth knowing before your first capture.**
+
+1. **`--cynthion-speed` is required, and a wrong guess fails silently.** Auto-detect reports a
+   Low-speed device as Full. The capture then starts, streams at full rate, and every transfer
+   succeeds — it just never frames a packet, because the analyzer is sampling at the wrong bit
+   rate. Measured on the same keyboard, 4 s each: `low` → 2174 packets; `full` → **0 packets** and
+   56448 bus events. `verify` now diagnoses this and exits non-zero, but there is no substitute
+   for knowing your device's speed.
+2. **The gateware must be current.** The board's interface protocol byte is its gateware API
+   version. A board reporting `0x00` has no capture-arming request at all, so the endpoint stays
+   silent no matter what you write — indistinguishable from broken hardware. Run `cynthion update`
+   once (the vendor tool; only needed for the flash, not for capture).
+
+**Host access.** No elevation on any OS, but each gates device access differently:
+
+```bash
+# Linux — copy the rule we ship, then replug the board
+sudo cp scripts/70-reveng-cynthion.rules /etc/udev/rules.d/
+sudo udevadm control --reload-rules && sudo udevadm trigger
+```
+
+Without a udev rule the open fails with a permission error **that reads like a missing device** —
+check this first if Linux seems to find no Cynthion. macOS needs nothing at all. Windows needs the
+interface bound to WinUSB (numanager's `winusb_access` is the pattern for doing that from code).
+
+**Remote targets.** With an analyzer the capturing machine often isn't the one being driven. Add
+`--traffic-only` and the recorder becomes a pure sniffer — no input hooks, no screenshots, no
+UI-Automation — while keeping typed notes, which stay the best correlation signal when you're
+working a second machine. See the safety note below.
+
+**Local targets keep everything.** `--traffic-only` is *optional* and independent of the backend:
+run the Cynthion in line on your own PC without it and you get wire-level traffic **plus** the full
+screen/input correlation stack — click-triggered screenshots, UIA widget snapshots, OCR. That
+combination is strictly more informative than USBPcap for local bring-up, and it needs no
+Administrator at all.
+
+`DESIGN.md` §4.1–§4.5 has the details: index-field semantics, control reassembly, what `verify`
+checks per backend, and the bus-event sidecar.
 
 ### Things you'll need to know to run/test it
 
@@ -321,7 +452,11 @@ The commands that turn a capture into a working driver, roughly in the order you
 ```bash
 reveng-rec monitor --device-vidpid V:P      # pre-flight: is the device streaming? live rate table, no session
 reveng-rec record ... --abort-if-idle 5     # stop the instant no frame arrives for 5s (no more 0-frame waits)
-reveng-rec verify <session>                 # is this capture complete? (drops = unpaired SETUPs)
+reveng-rec record --usb-backend cynthion --cynthion-speed low --traffic-only
+                                            # hardware analyzer instead of USBPcap: raw wire packets
+                                            # (NAKs, retries, real bus timing), any OS, no admin.
+                                            # --cynthion-speed is required — auto-detect misreports.
+reveng-rec verify <session>                 # is this capture complete? (backend-appropriate checks)
 reveng-rec ctrl   <session> --req-type vendor   # the decoded command log
 reveng-rec ctrl-diff <A> <B>                # what did the working run do that mine didn't?
 reveng-rec reg-state <session> [--at CKPT] --req-type vendor  # device register map, folded from writes
@@ -397,6 +532,9 @@ Attack the command layer first — it's small and each message maps to an action
 1. **Set up capture.** Install USBPcap (`scripts/get-usbpcap.ps1`) and **reboot once** — the filter
    only attaches to USB root hubs at boot. Find your device: `reveng-rec devices` (note its
    `VID:PID`, e.g. `1234:abcd`).
+   *Or, with a Cynthion:* re-route the device's cable through the board and skip all of the above —
+   no driver, no reboot, no admin, and you see NAKs and real bus timing. `--usb-backend cynthion
+   --cynthion-speed low|full|high`. See "The other option" above for the trade-offs.
 2. **Pre-flight — confirm it's actually streaming.** `reveng-rec monitor --device-vidpid <V:P>`
    prints a live per-endpoint rate table with an `IDLE` flag. If it says IDLE while the app is
    "running," the device isn't producing yet — fix that *before* recording. (The #1 beginner
@@ -465,6 +603,7 @@ are hex like `0x81`; `<ckpt>` is a checkpoint id from `ls`; frame indices come f
 | Command | Purpose | Key args / notes |
 |---|---|---|
 | `record` | Capture a session: traffic + input + event-triggered screenshots on one QPC clock. | `--device-vidpid V:P` (USB target), or `--source pcie …`. Stop: Ctrl+Alt+Pause, `--max-seconds N`, `--abort-if-idle N`, `--stop-after-frames N`, `--max-bytes N`. Reduce firehose: `--auto-truncate`, `--usb-snaplen 256`, `--drop-isoc`/`--drop-bulk`. `--headless` for no-UI automation. `--with-pcie` co-logs PCIe. `--mem-pid PID` arms the memory oracle. Self-elevates (UAC); `REVENG_NO_ELEVATE=1` to opt out. |
+| `record --usb-backend cynthion` | Same, but captured by a **hardware analyzer**: raw wire packets, bus events, any OS, no admin. | `--cynthion-speed low\|full\|high` is **required** (auto-detect misreports, silently). `--keep-sof` retains Start-of-Frame (dropped by default). `--traffic-only` for a remote target (no input/screen capture). Packet filters (`--drop-*`, `--endpoints`) are refused — they break reassembly. Works *with* screenshots/OCR when the target is this machine. |
 | `monitor` | Live per-endpoint rate table (frames/s, bytes/s, `IDLE` flag). **No session written.** | `--device-vidpid V:P` (omit = all hubs), `--max-seconds N`. Use to confirm the device streams *before* `record`. |
 | `devices` | Enumerate USB devices to pick a capture target. | Lists `VID:PID`, product, bus/addr, which USBPcap hub. Empty until USBPcap is installed **and** you've rebooted. |
 | `pci-devices` | Enumerate PCI(e) devices (BDF, VID:PID, BARs, class). | For the PCIe tiers. |
@@ -571,6 +710,13 @@ operator owns or is authorized to instrument. All data stays local — no networ
 them in a live Slint window that doubles as the note-taking surface (headless with
 `REVENG_NO_NOTES_UI=1` or `--max-seconds`).
 
+**`--traffic-only` narrows that to just the sniffer.** No input hooks, no screenshots, no
+UI-Automation — bus traffic and typed notes only. It exists for the setup a hardware analyzer
+makes normal, where the machine being driven is not the one capturing, so host-side input and
+screen capture would record the wrong computer. The consent banner changes to say so rather than
+being suppressed, and `meta.json` records `traffic_only` so a session cannot be mistaken for one
+that contains input. See DESIGN §4.4.
+
 ## Layout
 
 ```
@@ -581,7 +727,10 @@ reveng-recorder/
   crates/
     core/              # REAL: clock, event schema, CaptureSource, IndexFile, checkpoints, session
     usbcap/            # REAL: USBPcap/libpcap parsing, frames.idx, pcapng r/w + comment inject,
-                       #       live UsbCaptureSource (spawns USBPcapCMD), reader/writer, enumeration
+                       #       live UsbCaptureSource, reader/writer, enumeration; plus `wire`
+                       #       (USB 2.0 packet decode + CRC) and `reassemble` (wire → transfers)
+    cynthion/          # REAL: Cynthion hardware-analyzer backend over nusb — any OS, no driver,
+                       #       no admin. `cynthion-probe` / `cynthion-capture` standalone bins
     pcicap/            # PCIe source: real ReplayPcieSource; HvPcieSource stubbed (hypervisor tier)
     winput/            # REAL (win): WH_MOUSE_LL/WH_KEYBOARD_LL hooks + fg context enrichment
     winshot/           # REAL (win): GDI BitBlt screen capture → PNG
@@ -590,6 +739,10 @@ reveng-recorder/
     recorder/          # bin `reveng-rec`: full CLI + USB orchestration + query over USB/PCIe
     viewer/            # bin `reveng-viewer`: REAL egui timeline / screenshot / inspector / seek
                        #   `reveng-viewer <session> --track "Exposure Time"` overlays a UIA value curve
+  scripts/
+    get-usbpcap.ps1            # download + verify + install the USBPcap driver (Windows)
+    70-reveng-cynthion.rules   # udev rule for non-root Cynthion access (Linux) — copy to
+                               #   /etc/udev/rules.d/, reload, replug
   driver/
     reveng-hv/         # kernel hypervisor driver (built/signed separately) — NOT started (last tier)
 ```

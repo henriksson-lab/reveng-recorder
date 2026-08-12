@@ -33,8 +33,12 @@ pub fn list() -> anyhow::Result<Vec<UsbDevice>> {
     let mut out = Vec::new();
 
     unsafe {
-        let hdev =
-            SetupDiGetClassDevsW(None, PCWSTR(usb.as_ptr()), None, DIGCF_PRESENT | DIGCF_ALLCLASSES)?;
+        let hdev = SetupDiGetClassDevsW(
+            None,
+            PCWSTR(usb.as_ptr()),
+            None,
+            DIGCF_PRESENT | DIGCF_ALLCLASSES,
+        )?;
 
         let mut idx = 0u32;
         loop {
@@ -131,9 +135,8 @@ fn hub_interface_path(hub_devinst: u32) -> Option<String> {
 
     let mut len = 0u32;
     let flags = CM_GET_DEVICE_INTERFACE_LIST_PRESENT;
-    if unsafe {
-        CM_Get_Device_Interface_List_SizeW(&mut len, &guid, PCWSTR(idw.as_ptr()), flags)
-    } != CR_SUCCESS
+    if unsafe { CM_Get_Device_Interface_List_SizeW(&mut len, &guid, PCWSTR(idw.as_ptr()), flags) }
+        != CR_SUCCESS
         || len == 0
     {
         return None;
@@ -189,13 +192,21 @@ fn bus_of(usbpcap: &str) -> u16 {
 
 // --- SetupAPI property helpers (mirror pcicap::pci::imp) ---------------------------------
 
-fn get_string(hdev: HDEVINFO, info: &SP_DEVINFO_DATA, prop: SETUP_DI_REGISTRY_PROPERTY) -> Option<String> {
+fn get_string(
+    hdev: HDEVINFO,
+    info: &SP_DEVINFO_DATA,
+    prop: SETUP_DI_REGISTRY_PROPERTY,
+) -> Option<String> {
     let raw = get_raw(hdev, info, prop)?;
     let u16s = bytes_to_u16(&raw);
     u16s.split(|&c| c == 0).next().map(String::from_utf16_lossy)
 }
 
-fn get_multi_sz(hdev: HDEVINFO, info: &SP_DEVINFO_DATA, prop: SETUP_DI_REGISTRY_PROPERTY) -> Vec<String> {
+fn get_multi_sz(
+    hdev: HDEVINFO,
+    info: &SP_DEVINFO_DATA,
+    prop: SETUP_DI_REGISTRY_PROPERTY,
+) -> Vec<String> {
     let Some(raw) = get_raw(hdev, info, prop) else {
         return Vec::new();
     };
@@ -206,12 +217,20 @@ fn get_multi_sz(hdev: HDEVINFO, info: &SP_DEVINFO_DATA, prop: SETUP_DI_REGISTRY_
         .collect()
 }
 
-fn get_u32(hdev: HDEVINFO, info: &SP_DEVINFO_DATA, prop: SETUP_DI_REGISTRY_PROPERTY) -> Option<u32> {
+fn get_u32(
+    hdev: HDEVINFO,
+    info: &SP_DEVINFO_DATA,
+    prop: SETUP_DI_REGISTRY_PROPERTY,
+) -> Option<u32> {
     let raw = get_raw(hdev, info, prop)?;
     (raw.len() >= 4).then(|| u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]))
 }
 
-fn get_raw(hdev: HDEVINFO, info: &SP_DEVINFO_DATA, prop: SETUP_DI_REGISTRY_PROPERTY) -> Option<Vec<u8>> {
+fn get_raw(
+    hdev: HDEVINFO,
+    info: &SP_DEVINFO_DATA,
+    prop: SETUP_DI_REGISTRY_PROPERTY,
+) -> Option<Vec<u8>> {
     unsafe {
         let mut needed = 0u32;
         let _ = SetupDiGetDeviceRegistryPropertyW(hdev, info, prop, None, None, Some(&mut needed));
@@ -219,15 +238,24 @@ fn get_raw(hdev: HDEVINFO, info: &SP_DEVINFO_DATA, prop: SETUP_DI_REGISTRY_PROPE
             return None;
         }
         let mut buf = vec![0u8; needed as usize];
-        SetupDiGetDeviceRegistryPropertyW(hdev, info, prop, None, Some(&mut buf), Some(&mut needed))
-            .ok()?;
+        SetupDiGetDeviceRegistryPropertyW(
+            hdev,
+            info,
+            prop,
+            None,
+            Some(&mut buf),
+            Some(&mut needed),
+        )
+        .ok()?;
         buf.truncate(needed as usize);
         Some(buf)
     }
 }
 
 fn bytes_to_u16(b: &[u8]) -> Vec<u16> {
-    b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+    b.chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .collect()
 }
 
 #[cfg(test)]

@@ -7,7 +7,10 @@ fn main() {
     let mut out = std::io::stdout();
     let _ = writeln!(out, "Following filter control devices are available:");
     let _ = writeln!(out, "1 \\\\.\\USBPcap1");
-    let _ = writeln!(out, "  [Port 5] USB Composite Device VID_1234&PID_ABCD : \"Acme Widget\"");
+    let _ = writeln!(
+        out,
+        "  [Port 5] USB Composite Device VID_1234&PID_ABCD : \"Acme Widget\""
+    );
     let _ = out.flush();
     // Block "forever" (well past the 5s watchdog).
     std::thread::sleep(std::time::Duration::from_secs(120));

@@ -113,11 +113,20 @@ export component RecordWindow inherits Window {
     in property <bool> recording: true;
     in property <[NoteRow]> notes;
 
+    // Pin the note log to its last row. Called from Rust after a note is
+    // pushed; `viewport-y` is negative-up, so the bottom is the negated
+    // overflow, clamped at 0 for a log shorter than the viewport.
+    public function scroll-notes-to-bottom() {
+        notes-list.viewport-y = min(0, notes-list.visible-height - notes-list.viewport-height);
+    }
+
     // Live capture-health dashboard (sampled by a Rust timer).
     in property <string> size_text: "0 B";
     in property <bool> size_warn: false;
     in property <bool> usb_active: false;
     in property <string> usb_stats: "";
+    /// What this run is actually recording — see the banner below.
+    in property <string> consent_text: "Recording keyboard, mouse, screen and device traffic on this machine. Notes you type here are timestamped onto the capture for later correlation.";
     in property <string> usb_endpoints: ""; // top endpoints by volume ("0x81 iso 1.2M · …")
     in property <bool> pcie_active: false;
     in property <string> pcie_stats: "";
@@ -222,16 +231,21 @@ export component RecordWindow inherits Window {
             }
         }
 
-        // Consent / what-is-recorded banner (kept visible per project policy).
+        // Consent / what-is-recorded banner (kept visible per project policy). The text is
+        // set from Rust rather than fixed here: in --traffic-only the recorder captures no
+        // input and no screen, and a banner that still claimed otherwise would be wrong in
+        // the direction that matters.
         Text {
-            text: "Recording keyboard, mouse, screen and device traffic on this machine. Notes you type here are timestamped onto the capture for later correlation.";
+            text: root.consent_text;
             wrap: word-wrap;
             font-size: 11px;
             color: #999999;
         }
 
-        // Scrollback log of notes already entered.
-        ListView {
+        // Scrollback log of notes already entered. Named so Rust can pin it to
+        // the bottom as notes arrive — a note you just typed is the one you
+        // want on screen, and the log is append-only.
+        notes-list := ListView {
             vertical-stretch: 1;
             for row in root.notes: HorizontalBox {
                 spacing: 8px;

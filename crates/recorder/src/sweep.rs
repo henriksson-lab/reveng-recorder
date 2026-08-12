@@ -46,10 +46,16 @@ pub fn run(
         .spawn()
         .context("failed to launch the recorder subprocess")?;
 
-    eprintln!("recording ~{dur}s to {}; waiting {startup}s for capture startup…", out.display());
+    eprintln!(
+        "recording ~{dur}s to {}; waiting {startup}s for capture startup…",
+        out.display()
+    );
     std::thread::sleep(Duration::from_secs(startup));
 
-    eprintln!("driving {control:?} in {window:?} through {} values:", values.len());
+    eprintln!(
+        "driving {control:?} in {window:?} through {} values:",
+        values.len()
+    );
     for v in values {
         match reveng_winui::set_range(window, control, *v)? {
             Some(actual) => eprintln!("  set {control} = {v}  (readback {actual})"),

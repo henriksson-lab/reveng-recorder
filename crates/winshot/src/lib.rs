@@ -125,8 +125,15 @@ pub fn enumerate_displays() -> anyhow::Result<Vec<Display>> {
 /// Encode a grabbed [`Frame`] to a PNG file (lossless — UI text/edges matter, §6).
 pub fn encode_png(frame: &Frame, out: &Path) -> anyhow::Result<()> {
     let img: image::RgbImage =
-        image::ImageBuffer::from_raw(frame.width, frame.height, frame.rgb.clone())
-            .ok_or_else(|| anyhow::anyhow!("frame buffer size does not match {}x{}", frame.width, frame.height))?;
+        image::ImageBuffer::from_raw(frame.width, frame.height, frame.rgb.clone()).ok_or_else(
+            || {
+                anyhow::anyhow!(
+                    "frame buffer size does not match {}x{}",
+                    frame.width,
+                    frame.height
+                )
+            },
+        )?;
     img.save_with_format(out, image::ImageFormat::Png)?;
     Ok(())
 }
@@ -140,10 +147,10 @@ mod imp {
     /// `MONITORINFO::dwFlags` primary-monitor bit (winuser.h `MONITORINFOF_PRIMARY`).
     const MONITORINFOF_PRIMARY: u32 = 0x0000_0001;
     use windows::Win32::Graphics::Gdi::{
-        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject, GetDC,
-        EnumDisplayMonitors, GetDIBits, GetMonitorInfoW, MonitorFromPoint, ReleaseDC, SelectObject,
-        BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HDC, HGDIOBJ, HMONITOR,
-        MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
+        BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DeleteDC, DeleteObject,
+        EnumDisplayMonitors, GetDC, GetDIBits, GetMonitorInfoW, MonitorFromPoint, ReleaseDC,
+        SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, CAPTUREBLT, DIB_RGB_COLORS, HDC,
+        HGDIOBJ, HMONITOR, MONITORINFO, MONITOR_DEFAULTTONEAREST, SRCCOPY,
     };
     use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -215,8 +222,10 @@ mod imp {
                 Scope::All => Ok(RECT {
                     left: GetSystemMetrics(SM_XVIRTUALSCREEN),
                     top: GetSystemMetrics(SM_YVIRTUALSCREEN),
-                    right: GetSystemMetrics(SM_XVIRTUALSCREEN) + GetSystemMetrics(SM_CXVIRTUALSCREEN),
-                    bottom: GetSystemMetrics(SM_YVIRTUALSCREEN) + GetSystemMetrics(SM_CYVIRTUALSCREEN),
+                    right: GetSystemMetrics(SM_XVIRTUALSCREEN)
+                        + GetSystemMetrics(SM_CXVIRTUALSCREEN),
+                    bottom: GetSystemMetrics(SM_YVIRTUALSCREEN)
+                        + GetSystemMetrics(SM_CYVIRTUALSCREEN),
                 }),
                 Scope::CursorMonitor => {
                     let mut pt = POINT::default();
@@ -248,7 +257,11 @@ mod imp {
         let rect = scope_rect(scope)?;
         let width64 = i64::from(rect.right) - i64::from(rect.left);
         let height64 = i64::from(rect.bottom) - i64::from(rect.top);
-        if width64 <= 0 || height64 <= 0 || width64 > i64::from(i32::MAX) || height64 > i64::from(i32::MAX) {
+        if width64 <= 0
+            || height64 <= 0
+            || width64 > i64::from(i32::MAX)
+            || height64 > i64::from(i32::MAX)
+        {
             anyhow::bail!("invalid capture rectangle {rect:?}");
         }
         let width = width64 as i32;
@@ -285,7 +298,14 @@ mod imp {
             // cannot be deleted while selected into a DC, so returning directly from
             // `BitBlt(...)?` would leak the bitmap on this error path.
             let blit = BitBlt(
-                mem, 0, 0, width, height, Some(screen), rect.left, rect.top,
+                mem,
+                0,
+                0,
+                width,
+                height,
+                Some(screen),
+                rect.left,
+                rect.top,
                 SRCCOPY | CAPTUREBLT,
             );
             SelectObject(mem, old);

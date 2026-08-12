@@ -12,9 +12,12 @@ pub mod parse;
 pub mod pcap;
 pub mod pcapng;
 pub mod reader;
+pub mod reassemble;
+pub mod wire;
 pub mod writer;
 
 pub use reader::{UsbFrame, UsbReader};
+pub use reassemble::{ControlOutcome, ControlReassembler, ControlTransfer};
 pub use writer::UsbWriter;
 
 /// USBPcap transfer-type codes, as stored in [`reveng_core::event::UsbFrameHeader::transfer`]
@@ -23,6 +26,38 @@ pub const XFER_ISO: u8 = 0;
 pub const XFER_INTERRUPT: u8 = 1;
 pub const XFER_CONTROL: u8 = 2;
 pub const XFER_BULK: u8 = 3;
+/// Transfer type not determinable. Used by the wire backend, where bulk, interrupt and
+/// isochronous are indistinguishable without the endpoint descriptors — see [`wire`].
+pub const XFER_UNKNOWN: u8 = 0xff;
+
+/// How a session's `usb.pcapng` stores its records. Chosen by the capture backend and
+/// recovered on read from the pcapng interface's link type.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaptureFormat {
+    /// Whole transfers as the Windows USB stack saw them: a `USBPCAP_BUFFER_PACKET_HEADER`
+    /// followed by the payload.
+    UsbPcap,
+    /// Raw USB 2.0 wire packets from a hardware analyzer: tokens, data and handshakes.
+    Wire,
+}
+
+impl CaptureFormat {
+    /// The format a pcapng link type implies. Unknown link types are treated as USBPcap,
+    /// which is what every capture written before this distinction existed is.
+    pub fn from_link_type(link_type: u16) -> Self {
+        use pcapng::{
+            LINKTYPE_USB_2_0, LINKTYPE_USB_2_0_FULL_SPEED, LINKTYPE_USB_2_0_HIGH_SPEED,
+            LINKTYPE_USB_2_0_LOW_SPEED,
+        };
+        match link_type {
+            LINKTYPE_USB_2_0
+            | LINKTYPE_USB_2_0_LOW_SPEED
+            | LINKTYPE_USB_2_0_FULL_SPEED
+            | LINKTYPE_USB_2_0_HIGH_SPEED => CaptureFormat::Wire,
+            _ => CaptureFormat::UsbPcap,
+        }
+    }
+}
 
 use reveng_core::clock::Clock;
 use reveng_core::event::{SourceKind, TrafficKind, TrafficRecord, UsbFrameHeader};
@@ -131,9 +166,21 @@ fn extract_vidpid(s: &str) -> (String, String) {
     }
     // Fall back to a `1234:abcd` form.
     if let Some((a, b)) = s.split_once(':') {
-        let v: String = a.trim().chars().rev().take(4).collect::<Vec<_>>().into_iter().rev().collect();
+        let v: String = a
+            .trim()
+            .chars()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
         let p: String = b.trim().chars().take(4).collect();
-        if v.chars().all(|c| c.is_ascii_hexdigit()) && p.chars().all(|c| c.is_ascii_hexdigit()) && v.len() == 4 && p.len() == 4 {
+        if v.chars().all(|c| c.is_ascii_hexdigit())
+            && p.chars().all(|c| c.is_ascii_hexdigit())
+            && v.len() == 4
+            && p.len() == 4
+        {
             return (v.to_ascii_uppercase(), p.to_ascii_uppercase());
         }
     }
@@ -224,14 +271,24 @@ impl UsbCaptureSource {
         let dev = self.require_device()?.to_string();
         // No explicit address filter → capture the whole hub; else filter to the resolved set.
         let filter_all = self.selection.all_devices || self.selection.address.is_empty();
-        let snaplen = if self.snaplen == 0 { ioctl::DEFAULT_SNAPLEN } else { self.snaplen };
-        let buffer = if self.buffer == 0 { ioctl::DEFAULT_BUFFER } else { self.buffer };
+        let snaplen = if self.snaplen == 0 {
+            ioctl::DEFAULT_SNAPLEN
+        } else {
+            self.snaplen
+        };
+        let buffer = if self.buffer == 0 {
+            ioctl::DEFAULT_BUFFER
+        } else {
+            self.buffer
+        };
         let cap = ioctl::open_capture(&dev, &self.selection.address, filter_all, snaplen, buffer)?;
         let k = cap.killer;
         self.killer = Killer(std::sync::Arc::new(move || k.kill()));
         // Buffer at the driver's granularity so each ReadFile drains a full kernel buffer.
-        let stream: Box<dyn std::io::Read + Send> =
-            Box::new(std::io::BufReader::with_capacity(buffer as usize, cap.reader));
+        let stream: Box<dyn std::io::Read + Send> = Box::new(std::io::BufReader::with_capacity(
+            buffer as usize,
+            cap.reader,
+        ));
         self.set_reader(stream)
     }
 
@@ -250,11 +307,16 @@ impl UsbCaptureSource {
                 .join(",");
             cmd.arg("--devices").arg(list);
         }
-        cmd.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
 
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| anyhow::anyhow!("failed to spawn {} ({e}); USBPcap installed? admin?", usbpcapcmd()))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            anyhow::anyhow!(
+                "failed to spawn {} ({e}); USBPcap installed? admin?",
+                usbpcapcmd()
+            )
+        })?;
         let stdout = child
             .stdout
             .take()

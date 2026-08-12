@@ -29,7 +29,9 @@ fn hx8(s: &str) -> Result<u8> {
     u8::from_str_radix(s.trim_start_matches("0x"), 16).with_context(|| format!("bad hex: {s}"))
 }
 fn hexbytes(s: &str) -> Vec<u8> {
-    (0..s.len() / 2).map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap_or(0)).collect()
+    (0..s.len() / 2)
+        .map(|i| u8::from_str_radix(&s[i * 2..i * 2 + 2], 16).unwrap_or(0))
+        .collect()
 }
 fn hexs(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -123,8 +125,7 @@ fn exec(dev: &Device, iface: &Interface, line: &str) -> Result<bool> {
             "stream" => {
                 let ep = hx8(t[1])?;
                 let nframes: usize = t.get(2).and_then(|s| s.parse().ok()).unwrap_or(1);
-                let framebytes: usize =
-                    t.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
+                let framebytes: usize = t.get(3).and_then(|s| s.parse().ok()).unwrap_or(0);
                 stream(iface, ep, nframes, framebytes)?;
             }
             "replay" => {
@@ -200,7 +201,10 @@ fn stream(iface: &Interface, ep: u8, nframes: usize, framebytes: usize) -> Resul
                 } else {
                     frame.extend_from_slice(&d);
                     if frame.len() >= framebytes {
-                        let (mn, mx) = (*frame[..framebytes].iter().min().unwrap(), *frame[..framebytes].iter().max().unwrap());
+                        let (mn, mx) = (
+                            *frame[..framebytes].iter().min().unwrap(),
+                            *frame[..framebytes].iter().max().unwrap(),
+                        );
                         println!("  frame {got_frames}: {framebytes} bytes (min={mn} max={mx})");
                         frame.drain(..framebytes);
                         got_frames += 1;
@@ -279,7 +283,10 @@ enum InCmp {
 /// Compare a captured IN response to the live one (pure — the heart of the determinism check).
 fn compare_in(cap: &[u8], live: &[u8]) -> InCmp {
     if cap.len() != live.len() {
-        return InCmp::LenDiff { cap: cap.len(), live: live.len() };
+        return InCmp::LenDiff {
+            cap: cap.len(),
+            live: live.len(),
+        };
     }
     let positions: Vec<usize> = cap
         .iter()
@@ -331,7 +338,10 @@ pub fn check(vidpid: &str, path: &Path) -> Result<()> {
         }
         // IN — reissue and compare to the captured response.
         ins += 1;
-        let wlen = v.get("wLength").and_then(|x| x.as_u64()).unwrap_or(data.len() as u64) as u16;
+        let wlen = v
+            .get("wLength")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(data.len() as u64) as u16;
         let live = match block_on(iface.control_in(ControlIn {
             control_type: ControlType::Vendor,
             recipient: Recipient::Device,
@@ -458,7 +468,9 @@ pub fn doctor(vidpid: &str, ep: u8, do_reset: bool) -> Result<()> {
             println!("    the device needs sustained IN tokens — use a 16-deep bulk_in_queue in the driver.");
         }
         (Diag::Stall, false) => {
-            println!("  ✗ endpoint STALLs and the queue is dry — send the stream-start control write");
+            println!(
+                "  ✗ endpoint STALLs and the queue is dry — send the stream-start control write"
+            );
             println!("    first (e.g. the 0x0003 start), or clear_halt, then retry.");
         }
         (Diag::NakTimeout, false) => {
@@ -466,7 +478,9 @@ pub fn doctor(vidpid: &str, ep: u8, do_reset: bool) -> Result<()> {
             println!("    It likely needs its init sequence (try --init / replay a capture) or a replug;");
             println!("    an aborted prior attempt can wedge FX3 until reset/replug.");
         }
-        (Diag::Error(e), false) => println!("  ✗ transfer error: {e} (permissions? wrong endpoint?)"),
+        (Diag::Error(e), false) => {
+            println!("  ✗ transfer error: {e} (permissions? wrong endpoint?)")
+        }
     }
     Ok(())
 }
@@ -482,7 +496,9 @@ impl Diag {
         match self {
             Diag::Data(n) => format!("DATA: {n} bytes (endpoint is streaming)"),
             Diag::Stall => "STALL: endpoint halted (needs start command / clear_halt)".into(),
-            Diag::NakTimeout => "NAK/timeout: no data within deadline (device not producing)".into(),
+            Diag::NakTimeout => {
+                "NAK/timeout: no data within deadline (device not producing)".into()
+            }
             Diag::Error(e) => format!("error: {e}"),
         }
     }
@@ -499,7 +515,10 @@ mod tests {
 
     #[test]
     fn length_divergence_flagged() {
-        assert_eq!(compare_in(&[1, 2], &[1, 2, 3]), InCmp::LenDiff { cap: 2, live: 3 });
+        assert_eq!(
+            compare_in(&[1, 2], &[1, 2, 3]),
+            InCmp::LenDiff { cap: 2, live: 3 }
+        );
     }
 
     #[test]
@@ -507,7 +526,9 @@ mod tests {
         // A nonce/challenge changes some bytes but not length — the auth-red-herring signature.
         assert_eq!(
             compare_in(&[0xaa, 0xbb, 0xcc, 0xdd], &[0xaa, 0x00, 0xcc, 0x11]),
-            InCmp::ByteDiff { positions: vec![1, 3] }
+            InCmp::ByteDiff {
+                positions: vec![1, 3]
+            }
         );
     }
 }

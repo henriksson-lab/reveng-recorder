@@ -4704,6 +4704,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "reveng-cynthion"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "futures-channel",
+ "futures-lite",
+ "nusb",
+ "reveng-core",
+ "reveng-usbcap",
+ "serde",
+]
+
+[[package]]
 name = "reveng-export"
 version = "0.0.1"
 dependencies = [
@@ -4746,6 +4759,7 @@ dependencies = [
  "image",
  "nusb",
  "reveng-core",
+ "reveng-cynthion",
  "reveng-export",
  "reveng-memcap",
  "reveng-pcicap",

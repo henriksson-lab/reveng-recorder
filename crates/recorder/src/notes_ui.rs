@@ -39,8 +39,18 @@ pub fn run_device_picker(
 ) -> Result<Option<PickerChoice>> {
     let window = DevicePicker::new().map_err(|e| anyhow::anyhow!("create picker: {e}"))?;
 
-    let usb_rows: Vec<DevItem> = usb.iter().map(|(l, _)| DevItem { label: l.as_str().into() }).collect();
-    let pci_rows: Vec<DevItem> = pci.iter().map(|(l, _)| DevItem { label: l.as_str().into() }).collect();
+    let usb_rows: Vec<DevItem> = usb
+        .iter()
+        .map(|(l, _)| DevItem {
+            label: l.as_str().into(),
+        })
+        .collect();
+    let pci_rows: Vec<DevItem> = pci
+        .iter()
+        .map(|(l, _)| DevItem {
+            label: l.as_str().into(),
+        })
+        .collect();
     window.set_usb_devices(ModelRc::from(Rc::new(VecModel::from(usb_rows))));
     window.set_pci_devices(ModelRc::from(Rc::new(VecModel::from(pci_rows))));
     window.set_usb_note(usb_note.into());
@@ -74,7 +84,9 @@ pub fn run_device_picker(
         });
     }
 
-    window.run().map_err(|e| anyhow::anyhow!("run picker: {e}"))?;
+    window
+        .run()
+        .map_err(|e| anyhow::anyhow!("run picker: {e}"))?;
 
     if !started.get() {
         return Ok(None); // closed without starting
@@ -91,7 +103,10 @@ pub fn run_device_picker(
         .zip(pci_checked.borrow().iter())
         .find(|(_, &c)| c)
         .map(|((_, bdf), _)| bdf.clone());
-    Ok(Some(PickerChoice { usb_vidpids, pci_bdf }))
+    Ok(Some(PickerChoice {
+        usb_vidpids,
+        pci_bdf,
+    }))
 }
 
 /// PCIe rate (events/sec) above which the dashboard flags the stream as "hot".
@@ -109,6 +124,9 @@ pub fn run_recording_window<F>(
     usb_active: bool,
     pcie_active: bool,
     mem_active: bool, // memory snapshots armed (--mem-pid/--mem-process) → show the Snapshot button
+    // Traffic-only mode: no input hooks, no screenshots. Changes what the consent banner
+    // claims, which must match what the run actually does.
+    traffic_only: bool,
     trace: Option<(Arc<AtomicBool>, Arc<AtomicBool>)>, // (mmio, dma) live toggles, drv only
     record: F,
 ) -> Result<RecordSummary>
@@ -144,6 +162,16 @@ where
     window.set_usb_active(usb_active);
     window.set_pcie_active(pcie_active);
     window.set_mem_active(mem_active);
+    // State plainly what is being recorded. Suppressing the banner in traffic-only mode
+    // would be the wrong fix: the point is that this run captures less, so say less.
+    window.set_consent_text(
+        if traffic_only {
+            "Recording the selected device traffic only — no keyboard, mouse or screen capture. Notes you type here are timestamped onto the capture for later correlation."
+        } else {
+            "Recording keyboard, mouse, screen and device traffic on this machine. Notes you type here are timestamped onto the capture for later correlation."
+        }
+        .into(),
+    );
     let notes_model: Rc<VecModel<NoteRow>> = Rc::new(VecModel::default());
     window.set_notes(ModelRc::from(notes_model.clone()));
 
@@ -175,6 +203,7 @@ where
         let clock = clock.clone();
         let model = notes_model.clone();
         let stats = stats.clone();
+        let weak = window.as_weak();
         window.on_submit(move |text| {
             let text = text.trim().to_string();
             if text.is_empty() {
@@ -190,6 +219,10 @@ where
                 text: text.as_str().into(),
                 pos: pos.as_str().into(),
             });
+            // Follow the tail: the note just typed is the one worth seeing.
+            if let Some(window) = weak.upgrade() {
+                window.invoke_scroll_notes_to_bottom();
+            }
             let _ = note_tx.send((ts, text));
         });
     }
@@ -264,22 +297,40 @@ where
                     )
                 };
                 let dt = (now - last_ns) as f64 / 1e9;
-                let usb_rate = if dt > 0.0 { (uf - last_usb) as f64 / dt } else { 0.0 };
-                let pcie_rate = if dt > 0.0 { (pe - last_pcie) as f64 / dt } else { 0.0 };
+                let usb_rate = if dt > 0.0 {
+                    (uf - last_usb) as f64 / dt
+                } else {
+                    0.0
+                };
+                let pcie_rate = if dt > 0.0 {
+                    (pe - last_pcie) as f64 / dt
+                } else {
+                    0.0
+                };
                 last_ns = now;
                 last_usb = uf;
                 last_pcie = pe;
 
                 w.set_usb_stats(
-                    format!("{} fr · {} · {}", fmt_count(uf), fmt_bytes(ub), fmt_rate(usb_rate))
-                        .as_str()
-                        .into(),
+                    format!(
+                        "{} fr · {} · {}",
+                        fmt_count(uf),
+                        fmt_bytes(ub),
+                        fmt_rate(usb_rate)
+                    )
+                    .as_str()
+                    .into(),
                 );
                 w.set_usb_endpoints(fmt_top_endpoints(&by_ep).as_str().into());
                 w.set_pcie_stats(
-                    format!("{} ev · {} · {}", fmt_count(pe), fmt_bytes(pb), fmt_rate(pcie_rate))
-                        .as_str()
-                        .into(),
+                    format!(
+                        "{} ev · {} · {}",
+                        fmt_count(pe),
+                        fmt_bytes(pb),
+                        fmt_rate(pcie_rate)
+                    )
+                    .as_str()
+                    .into(),
                 );
                 w.set_pcie_kinds(fmt_pcie_kinds(pk.0, pk.1, pk.2, pk.3).as_str().into());
                 w.set_pcie_hot(pcie_rate >= PCIE_HOT_RATE);
@@ -289,7 +340,8 @@ where
                 if dt > 0.0 {
                     for (&ep, st) in &by_ep {
                         let prev = ep_prev.get(&ep).copied().unwrap_or(0);
-                        let mb_per_s = (st.bytes.saturating_sub(prev)) as f64 / dt / (1024.0 * 1024.0);
+                        let mb_per_s =
+                            (st.bytes.saturating_sub(prev)) as f64 / dt / (1024.0 * 1024.0);
                         if !hinted.contains(&ep) {
                             if let Some(msg) = hot_hint(ep, st.transfer, mb_per_s) {
                                 eprintln!("{msg}");
@@ -307,7 +359,9 @@ where
         );
     }
 
-    window.run().map_err(|e| anyhow::anyhow!("run window: {e}"))?;
+    window
+        .run()
+        .map_err(|e| anyhow::anyhow!("run window: {e}"))?;
 
     match handle.join() {
         Ok(r) => r,
@@ -361,7 +415,11 @@ fn fmt_bytes(b: u64) -> String {
 /// Where a note landed in the stream(s), for the log's third column.
 fn fmt_pos(usb: bool, pcie: bool, usb_frames: u64, pcie_events: u64) -> String {
     match (usb, pcie) {
-        (true, true) => format!("usb {} · pcie {}", fmt_count(usb_frames), fmt_count(pcie_events)),
+        (true, true) => format!(
+            "usb {} · pcie {}",
+            fmt_count(usb_frames),
+            fmt_count(pcie_events)
+        ),
         (true, false) => format!("usb {}", fmt_count(usb_frames)),
         (false, true) => format!("pcie {}", fmt_count(pcie_events)),
         (false, false) => String::new(),
@@ -416,18 +474,31 @@ fn fmt_top_endpoints(by_ep: &BTreeMap<u8, EpStat>) -> String {
     v.sort_by_key(|item| std::cmp::Reverse(item.1.bytes));
     v.iter()
         .take(3)
-        .map(|(ep, st)| format!("0x{:02x} {} {}", ep, xfer_short(st.transfer), fmt_bytes(st.bytes)))
+        .map(|(ep, st)| {
+            format!(
+                "0x{:02x} {} {}",
+                ep,
+                xfer_short(st.transfer),
+                fmt_bytes(st.bytes)
+            )
+        })
         .collect::<Vec<_>>()
         .join(" · ")
 }
 
 /// On-disk session size — the big traffic logs (skips the screenshots dir walk).
 fn session_size(out: &Path) -> u64 {
-    ["usb.pcapng", "pcie.bin", "frames.idx", "pcie.idx", "events.ndjson"]
-        .iter()
-        .filter_map(|f| std::fs::metadata(out.join(f)).ok())
-        .map(|m| m.len())
-        .sum()
+    [
+        "usb.pcapng",
+        "pcie.bin",
+        "frames.idx",
+        "pcie.idx",
+        "events.ndjson",
+    ]
+    .iter()
+    .filter_map(|f| std::fs::metadata(out.join(f)).ok())
+    .map(|m| m.len())
+    .sum()
 }
 
 #[cfg(test)]
@@ -445,7 +516,10 @@ mod tests {
         assert_eq!(fmt_bytes(1536), "1.5 KB");
         assert_eq!(fmt_bytes(2 * 1024 * 1024), "2.0 MB");
         assert_eq!(fmt_elapsed(83_000_000_000), "01:23");
-        assert_eq!(fmt_pos(true, true, 8_900, 900_000), "usb 8.9k · pcie 900.0k");
+        assert_eq!(
+            fmt_pos(true, true, 8_900, 900_000),
+            "usb 8.9k · pcie 900.0k"
+        );
         assert_eq!(fmt_pos(false, true, 0, 40_000), "pcie 40.0k");
         assert_eq!(fmt_pos(true, false, 1_234, 0), "usb 1.2k");
     }
@@ -465,15 +539,32 @@ mod tests {
     #[test]
     fn pcie_kinds_omits_zeros() {
         assert_eq!(fmt_pcie_kinds(64, 0, 0, 0), "cfg 64");
-        assert_eq!(fmt_pcie_kinds(64, 1200, 245, 3), "cfg 64 · mmio 1.2k · dma 245 · irq 3");
+        assert_eq!(
+            fmt_pcie_kinds(64, 1200, 245, 3),
+            "cfg 64 · mmio 1.2k · dma 245 · irq 3"
+        );
         assert_eq!(fmt_pcie_kinds(0, 0, 0, 0), "");
     }
 
     #[test]
     fn top_endpoints_sorted_by_bytes() {
         let mut m = BTreeMap::new();
-        m.insert(0x02u8, EpStat { frames: 1, bytes: 100, transfer: 3 });
-        m.insert(0x81u8, EpStat { frames: 1, bytes: 9_000_000, transfer: 0 });
+        m.insert(
+            0x02u8,
+            EpStat {
+                frames: 1,
+                bytes: 100,
+                transfer: 3,
+            },
+        );
+        m.insert(
+            0x81u8,
+            EpStat {
+                frames: 1,
+                bytes: 9_000_000,
+                transfer: 0,
+            },
+        );
         let s = fmt_top_endpoints(&m);
         assert!(s.starts_with("0x81 iso"));
     }

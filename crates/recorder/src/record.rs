@@ -45,7 +45,13 @@ pub fn run_pcie_live(
     // A bounded run polls the ring for live interrupts / MMIO / DMA snapshots (M2/M3/M4 filter);
     // an unbounded run drains the finite config-space snapshot and stops (M1).
     let source = if max_duration.is_some() || trace_mmio || trace_dma {
-        reveng_pcicap::drv::DrvPcieSource::new_live(target, clock, max_duration, trace_mmio, trace_dma)
+        reveng_pcicap::drv::DrvPcieSource::new_live(
+            target,
+            clock,
+            max_duration,
+            trace_mmio,
+            trace_dma,
+        )
     } else {
         reveng_pcicap::drv::DrvPcieSource::new(target, clock)
     };

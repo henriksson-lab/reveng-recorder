@@ -6,8 +6,8 @@
 //! callback reads the clock, builds an [`InputEvent`], and calls the sink (which the
 //! recorder wires to a non-blocking channel send).
 
-pub use reveng_core::input::{InputEvent, InputKind};
 use reveng_core::clock::Clock;
+pub use reveng_core::input::{InputEvent, InputKind};
 
 /// Handle to installed hooks; dropping it uninstalls them and joins the hook thread.
 pub struct InputHooks {
@@ -107,8 +107,8 @@ mod imp {
         CallNextHookEx, GetMessageW, SetWindowsHookExW, UnhookWindowsHookEx, KBDLLHOOKSTRUCT,
         LLKHF_INJECTED, LLMHF_INJECTED, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL,
         WM_KEYDOWN, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP,
-        WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP,
-        WM_XBUTTONDOWN, WM_XBUTTONUP, XBUTTON1,
+        WM_MOUSEWHEEL, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN, WM_SYSKEYUP, WM_XBUTTONDOWN,
+        WM_XBUTTONUP, XBUTTON1,
     };
 
     struct HookState {
@@ -148,7 +148,11 @@ mod imp {
                 injected,
             };
             // XBUTTON1/2 are distinguished by the high word of mouseData.
-            let xbtn = if (ms.mouseData >> 16) as u16 == XBUTTON1 { "X1" } else { "X2" };
+            let xbtn = if (ms.mouseData >> 16) as u16 == XBUTTON1 {
+                "X1"
+            } else {
+                "X2"
+            };
             let ev = match msg {
                 WM_LBUTTONDOWN => Some(mk(InputKind::MouseDown, Some("L"))),
                 WM_LBUTTONUP => Some(mk(InputKind::MouseUp, Some("L"))),
@@ -317,7 +321,8 @@ mod imp {
                     let mut buf = [0u16; MAX_PATH as usize];
                     let mut len = buf.len() as u32;
                     let mut pwstr = windows::core::PWSTR(buf.as_mut_ptr());
-                    if QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, pwstr, &mut len).is_ok()
+                    if QueryFullProcessImageNameW(handle, PROCESS_NAME_WIN32, pwstr, &mut len)
+                        .is_ok()
                     {
                         let full = String::from_utf16_lossy(&buf[..len as usize]);
                         process = full.rsplit(['\\', '/']).next().map(|s| s.to_string());

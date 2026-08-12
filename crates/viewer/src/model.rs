@@ -22,7 +22,15 @@ pub fn normalize_track(track: &[Option<f64>]) -> Vec<Option<f32>> {
     let span = max - min;
     track
         .iter()
-        .map(|o| o.map(|v| if span > 0.0 { ((v - min) / span) as f32 } else { 0.5 }))
+        .map(|o| {
+            o.map(|v| {
+                if span > 0.0 {
+                    ((v - min) / span) as f32
+                } else {
+                    0.5
+                }
+            })
+        })
         .collect()
 }
 
@@ -116,9 +124,8 @@ impl SessionModel {
             }
         }
         let span = (last - first).max(1) as f64;
-        let bucket = |ts: i64| {
-            (((ts - first) as f64 / span).clamp(0.0, 1.0) * buckets as f64) as usize
-        }; // yields 0..=buckets
+        let bucket =
+            |ts: i64| (((ts - first) as f64 / span).clamp(0.0, 1.0) * buckets as f64) as usize; // yields 0..=buckets
         let bin = |b: usize| b.min(buckets - 1);
 
         let mut prim = vec![0u32; buckets];
@@ -248,7 +255,7 @@ impl SessionModel {
 /// A stable display colour (RGB) for each checkpoint type, for the timeline track.
 pub fn type_color(t: CheckpointType) -> [u8; 3] {
     match t {
-        CheckpointType::Click => [66, 135, 245],       // blue
+        CheckpointType::Click => [66, 135, 245],        // blue
         CheckpointType::KeyDown => [46, 204, 113],      // green
         CheckpointType::Interval => [149, 165, 166],    // grey
         CheckpointType::Manual => [241, 196, 15],       // yellow
@@ -365,10 +372,15 @@ mod tests {
 
         // USB primary (one frame) + a co-logged PCIe event.
         let mut usb = UsbWriter::create(session.usb_pcapng(), session.frames_idx()).unwrap();
-        usb.append_packet(1_000_000, &packet(0x81, &[9, 9, 9])).unwrap();
+        usb.append_packet(1_000_000, &packet(0x81, &[9, 9, 9]))
+            .unwrap();
         usb.flush().unwrap();
         let mut pl = PcieLog::create(session.pcie_bin(), session.pcie_idx()).unwrap();
-        pl.append(&PcieEvent::Irq { ts_ns: 500_000, vector: 129 }).unwrap();
+        pl.append(&PcieEvent::Irq {
+            ts_ns: 500_000,
+            vector: 129,
+        })
+        .unwrap();
 
         session
             .append_record(&SessionRecord::Checkpoint(Checkpoint {

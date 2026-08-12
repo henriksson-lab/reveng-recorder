@@ -4,7 +4,9 @@ use reveng_memcap::{diff, LoadedSnapshot, MemSnapshotSource, RegionDelta};
 
 fn main() -> anyhow::Result<()> {
     let target = std::env::args().nth(1).unwrap_or_else(|| "self".into());
-    let out = std::env::args().nth(2).unwrap_or_else(|| "live.snaps".into());
+    let out = std::env::args()
+        .nth(2)
+        .unwrap_or_else(|| "live.snaps".into());
     let dir = std::path::Path::new(&out);
 
     let src = if target == "self" {
@@ -26,7 +28,11 @@ fn main() -> anyhow::Result<()> {
     );
     std::thread::sleep(std::time::Duration::from_millis(250));
     let b = src.snapshot(1, 1, &dir.join("000001"), compress)?;
-    println!("snap 1: {} regions, {} bytes", b.regions.len(), b.total_bytes);
+    println!(
+        "snap 1: {} regions, {} bytes",
+        b.regions.len(),
+        b.total_bytes
+    );
 
     let la = LoadedSnapshot::load(&dir.join("000000"))?;
     let lb = LoadedSnapshot::load(&dir.join("000001"))?;

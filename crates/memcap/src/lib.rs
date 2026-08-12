@@ -246,7 +246,13 @@ impl SnapshotWriter {
     }
 
     /// Convenience: write a whole in-memory region in one call (batch/fixture path).
-    pub fn push_region(&mut self, base: u64, protect: u32, mem_type: u32, bytes: &[u8]) -> Result<()> {
+    pub fn push_region(
+        &mut self,
+        base: u64,
+        protect: u32,
+        mem_type: u32,
+        bytes: &[u8],
+    ) -> Result<()> {
         self.region_begin(base, protect, mem_type);
         if !bytes.is_empty() {
             self.region_write(bytes)?;
@@ -271,10 +277,17 @@ impl SnapshotWriter {
             process: self.process,
             total_bytes,
             stored_bytes: self.stored,
-            compression: if self.compress { "deflate".into() } else { "none".into() },
+            compression: if self.compress {
+                "deflate".into()
+            } else {
+                "none".into()
+            },
             regions: self.regions,
         };
-        fs::write(self.dir.join("manifest.json"), serde_json::to_vec_pretty(&meta)?)?;
+        fs::write(
+            self.dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&meta)?,
+        )?;
         Ok(meta)
     }
 }
@@ -308,22 +321,31 @@ pub struct LoadedSnapshot {
 
 impl LoadedSnapshot {
     pub fn load(dir: &Path) -> Result<Self> {
-        let meta: MemSnapshotMeta =
-            serde_json::from_slice(&fs::read(dir.join("manifest.json")).with_context(|| {
-                format!("reading {}", dir.join("manifest.json").display())
-            })?)?;
+        let meta: MemSnapshotMeta = serde_json::from_slice(
+            &fs::read(dir.join("manifest.json"))
+                .with_context(|| format!("reading {}", dir.join("manifest.json").display()))?,
+        )?;
         let raw = fs::read(dir.join("regions.bin"))?;
         let deflate = meta.compression == "deflate";
         let mut regions = std::collections::HashMap::with_capacity(meta.regions.len());
         for r in &meta.regions {
-            let start = usize::try_from(r.file_offset).context("region offset does not fit this platform")?;
-            let stored_len = usize::try_from(r.stored_len).context("region stored length does not fit this platform")?;
-            let expected_size = usize::try_from(r.size).context("region size does not fit this platform")?;
-            let end = start.checked_add(stored_len).context("region offset overflow")?;
+            let start = usize::try_from(r.file_offset)
+                .context("region offset does not fit this platform")?;
+            let stored_len = usize::try_from(r.stored_len)
+                .context("region stored length does not fit this platform")?;
+            let expected_size =
+                usize::try_from(r.size).context("region size does not fit this platform")?;
+            let end = start
+                .checked_add(stored_len)
+                .context("region offset overflow")?;
             let stored = raw
                 .get(start..end)
                 .context("region bytes are outside regions.bin")?;
-            let bytes = if deflate { inflate(stored, expected_size)? } else { stored.to_vec() };
+            let bytes = if deflate {
+                inflate(stored, expected_size)?
+            } else {
+                stored.to_vec()
+            };
             if bytes.len() != expected_size {
                 anyhow::bail!(
                     "region at offset {} has {} bytes, expected {}",
@@ -338,7 +360,10 @@ impl LoadedSnapshot {
     }
 
     pub fn region_bytes(&self, r: &RegionMeta) -> &[u8] {
-        self.regions.get(&r.file_offset).map(Vec::as_slice).unwrap_or(&[])
+        self.regions
+            .get(&r.file_offset)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -379,13 +404,21 @@ pub struct ByteChange {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum RegionDelta {
     /// Same base+size, contents changed — the byte runs that differ.
-    Changed { base: u64, size: u64, changes: Vec<ByteChange> },
+    Changed {
+        base: u64,
+        size: u64,
+        changes: Vec<ByteChange>,
+    },
     /// A region that only exists in B — a fresh allocation during the window. Prime suspect.
     New { base: u64, size: u64 },
     /// A region that existed in A but is gone in B.
     Freed { base: u64, size: u64 },
     /// Same base, different size (realloc/grow).
-    Resized { base: u64, old_size: u64, new_size: u64 },
+    Resized {
+        base: u64,
+        old_size: u64,
+        new_size: u64,
+    },
 }
 
 /// Diff two snapshots (A = before, B = after). Regions are aligned by base address; only
@@ -401,7 +434,10 @@ pub fn diff(a: &LoadedSnapshot, b: &LoadedSnapshot) -> Vec<RegionDelta> {
     let mut out = Vec::new();
     for (base, rb) in &b_by_base {
         match a_by_base.get(base) {
-            None => out.push(RegionDelta::New { base: *base, size: rb.size }),
+            None => out.push(RegionDelta::New {
+                base: *base,
+                size: rb.size,
+            }),
             Some(ra) if ra.size != rb.size => out.push(RegionDelta::Resized {
                 base: *base,
                 old_size: ra.size,
@@ -409,14 +445,21 @@ pub fn diff(a: &LoadedSnapshot, b: &LoadedSnapshot) -> Vec<RegionDelta> {
             }),
             Some(ra) if ra.hash != rb.hash => {
                 let changes = byte_runs(*base, a.region_bytes(ra), b.region_bytes(rb));
-                out.push(RegionDelta::Changed { base: *base, size: rb.size, changes });
+                out.push(RegionDelta::Changed {
+                    base: *base,
+                    size: rb.size,
+                    changes,
+                });
             }
             Some(_) => {} // unchanged
         }
     }
     for (base, ra) in &a_by_base {
         if !b_by_base.contains_key(base) {
-            out.push(RegionDelta::Freed { base: *base, size: ra.size });
+            out.push(RegionDelta::Freed {
+                base: *base,
+                size: ra.size,
+            });
         }
     }
     out
@@ -453,10 +496,10 @@ fn byte_runs(base: u64, old: &[u8], new: &[u8]) -> Vec<ByteChange> {
 /// A location where a value's encoding was found in a snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Hit {
-    pub abs_addr: u64,     // target VA (region base + offset)
+    pub abs_addr: u64, // target VA (region base + offset)
     pub region_base: u64,
     pub offset: u64,
-    pub encoding: String,  // "u32_le", "f64_le", "ascii", "utf16le", ...
+    pub encoding: String, // "u32_le", "f64_le", "ascii", "utf16le", ...
 }
 
 /// Candidate byte encodings for a user-supplied value string. Integers yield the LE (and BE)
@@ -586,7 +629,13 @@ impl MemSnapshotSource {
     /// pieces, and **stream** them into the snapshot under `dir` (= `memsnaps/<id:06>/`). Peak
     /// memory is bounded by the chunk buffer regardless of region/target size; `compress` stores
     /// each region as deflate.
-    pub fn snapshot(&self, id: u64, ts_ns: i64, dir: &Path, compress: bool) -> Result<MemSnapshotMeta> {
+    pub fn snapshot(
+        &self,
+        id: u64,
+        ts_ns: i64,
+        dir: &Path,
+        compress: bool,
+    ) -> Result<MemSnapshotMeta> {
         #[cfg(windows)]
         {
             // Deflate is CPU-bound, so compress regions across a thread pool when we have cores.
@@ -594,7 +643,13 @@ impl MemSnapshotSource {
             let threads = if compress { compress_threads() } else { 1 };
             if threads > 1 {
                 return imp::snapshot_parallel(
-                    &self.proc, dir, id, ts_ns, self.pid, &self.process, threads,
+                    &self.proc,
+                    dir,
+                    id,
+                    ts_ns,
+                    self.pid,
+                    &self.process,
+                    threads,
                 );
             }
             let mut w = SnapshotWriter::create(dir, id, ts_ns, self.pid, &self.process, compress)?;
@@ -615,10 +670,16 @@ pub const CHUNK: usize = 4 * 1024 * 1024;
 /// Size of the compressor pool for `--mem-compress` (cores, clamped) — overridable with
 /// `REVENG_MEM_THREADS` (e.g. `1` to force the serial path).
 fn compress_threads() -> usize {
-    if let Some(n) = std::env::var("REVENG_MEM_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
+    if let Some(n) = std::env::var("REVENG_MEM_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
         return n.max(1);
     }
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 16)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 16)
 }
 
 #[cfg(windows)]
@@ -766,7 +827,9 @@ mod imp {
                     off += read;
                 }
                 if !data.is_empty()
-                    && tx.send((base as u64, mbi.Protect.0, mbi.Type.0, data)).is_err()
+                    && tx
+                        .send((base as u64, mbi.Protect.0, mbi.Type.0, data))
+                        .is_err()
                 {
                     break; // collector/pool gone
                 }
@@ -808,7 +871,9 @@ mod imp {
                 let tx = res_tx.clone();
                 s.spawn(move || loop {
                     let job = { rx.lock().unwrap().recv() };
-                    let Ok((base, protect, mt, bytes)) = job else { break };
+                    let Ok((base, protect, mt, bytes)) = job else {
+                        break;
+                    };
                     let hash = super::fnv1a64(&bytes);
                     match super::deflate(&bytes) {
                         Ok(comp) => {
@@ -842,7 +907,9 @@ mod imp {
             read_regions_into(proc, super::CHUNK, &work_tx)?; // producer on this thread
             drop(work_tx); // pool drains and exits → res closes → collector finishes
 
-            collector.join().map_err(|_| anyhow::anyhow!("memcap collector panicked"))?
+            collector
+                .join()
+                .map_err(|_| anyhow::anyhow!("memcap collector panicked"))?
         })
     }
 
@@ -860,9 +927,7 @@ mod imp {
         .map(|(pid, _)| pid)
     }
 
-    fn find_entry(
-        mut pred: impl FnMut(&PROCESSENTRY32W) -> bool,
-    ) -> Result<(u32, String)> {
+    fn find_entry(mut pred: impl FnMut(&PROCESSENTRY32W) -> bool) -> Result<(u32, String)> {
         unsafe {
             let snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)?;
             let mut e = PROCESSENTRY32W {
@@ -912,26 +977,48 @@ mod tests {
     fn diff_flags_new_changed_freed() {
         let tmp = std::env::temp_dir().join("memcap_diff_test");
         let _ = fs::remove_dir_all(&tmp);
-        let a = mk(&tmp.join("a"), 0, &[(0x1000, vec![0u8; 8]), (0x2000, vec![9u8; 4])]);
+        let a = mk(
+            &tmp.join("a"),
+            0,
+            &[(0x1000, vec![0u8; 8]), (0x2000, vec![9u8; 4])],
+        );
         // B: region 0x1000 changed at offset 4..6; 0x2000 freed; 0x3000 new.
         let b = mk(
             &tmp.join("b"),
             1,
-            &[(0x1000, vec![0, 0, 0, 0, 1, 1, 0, 0]), (0x3000, vec![7u8; 16])],
+            &[
+                (0x1000, vec![0, 0, 0, 0, 1, 1, 0, 0]),
+                (0x3000, vec![7u8; 16]),
+            ],
         );
         let d = diff(&a, &b);
-        assert!(d.contains(&RegionDelta::New { base: 0x3000, size: 16 }));
-        assert!(d.contains(&RegionDelta::Freed { base: 0x2000, size: 4 }));
+        assert!(d.contains(&RegionDelta::New {
+            base: 0x3000,
+            size: 16
+        }));
+        assert!(d.contains(&RegionDelta::Freed {
+            base: 0x2000,
+            size: 4
+        }));
         let changed = d
             .iter()
             .find_map(|x| match x {
-                RegionDelta::Changed { base: 0x1000, changes, .. } => Some(changes.clone()),
+                RegionDelta::Changed {
+                    base: 0x1000,
+                    changes,
+                    ..
+                } => Some(changes.clone()),
                 _ => None,
             })
             .expect("0x1000 changed");
         assert_eq!(
             changed,
-            vec![ByteChange { abs_addr: 0x1004, offset: 4, old: vec![0, 0], new: vec![1, 1] }]
+            vec![ByteChange {
+                abs_addr: 0x1004,
+                offset: 4,
+                old: vec![0, 0],
+                new: vec![1, 1]
+            }]
         );
     }
 
@@ -981,7 +1068,9 @@ mod tests {
             .iter()
             .any(|h| h.encoding == "u32_le" && h.abs_addr == 0x1002));
         let s = scan(&a, "Acme");
-        assert!(s.iter().any(|h| h.encoding == "ascii" && h.abs_addr == 0x2000));
+        assert!(s
+            .iter()
+            .any(|h| h.encoding == "ascii" && h.abs_addr == 0x2000));
     }
 
     #[test]

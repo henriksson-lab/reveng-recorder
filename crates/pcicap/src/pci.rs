@@ -154,14 +154,8 @@ mod imp {
         unsafe {
             let mut needed = 0u32;
             // First call: learn the required size (ignores the expected buffer-too-small error).
-            let _ = SetupDiGetDeviceRegistryPropertyW(
-                hdev,
-                info,
-                prop,
-                None,
-                None,
-                Some(&mut needed),
-            );
+            let _ =
+                SetupDiGetDeviceRegistryPropertyW(hdev, info, prop, None, None, Some(&mut needed));
             if needed == 0 {
                 return None;
             }
@@ -181,7 +175,9 @@ mod imp {
     }
 
     fn bytes_to_u16(b: &[u8]) -> Vec<u16> {
-        b.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect()
+        b.chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect()
     }
 
     fn from_u16(s: &[u16]) -> String {

@@ -49,7 +49,11 @@ pub fn render_rates(prev: &Snapshot, now: &Snapshot, dt: f64) -> String {
         now.total_bytes,
     ));
     for (ep, (f, b, xfer)) in &now.by_ep {
-        let (pf, pb) = prev.by_ep.get(ep).map(|(f, b, _)| (*f, *b)).unwrap_or((0, 0));
+        let (pf, pb) = prev
+            .by_ep
+            .get(ep)
+            .map(|(f, b, _)| (*f, *b))
+            .unwrap_or((0, 0));
         let (df, db) = (f.saturating_sub(pf), b.saturating_sub(pb));
         if df == 0 && db == 0 {
             continue; // skip endpoints with no activity this interval
@@ -76,13 +80,17 @@ fn human(bytes_per_s: f64) -> String {
 
 /// Resolve `--device-vidpid` (or all hubs) to USBPcap selections, without the full `record` arg set.
 fn selections(vidpid: Option<&str>) -> Result<Vec<UsbSelection>> {
-    let devs = reveng_usbcap::list_devices().context("enumerating USB devices (USBPcap installed?)")?;
+    let devs =
+        reveng_usbcap::list_devices().context("enumerating USB devices (USBPcap installed?)")?;
     let mut hubs: BTreeMap<String, Vec<u16>> = BTreeMap::new();
     match vidpid {
         Some(want) => {
             let (wv, wp) = want.split_once(':').unwrap_or((want, ""));
             for d in &devs {
-                if d.vid.eq_ignore_ascii_case(wv) && d.pid.eq_ignore_ascii_case(wp) && !d.usbpcap.is_empty() {
+                if d.vid.eq_ignore_ascii_case(wv)
+                    && d.pid.eq_ignore_ascii_case(wp)
+                    && !d.usbpcap.is_empty()
+                {
                     hubs.entry(d.usbpcap.clone()).or_default().push(d.address);
                 }
             }
@@ -97,7 +105,9 @@ fn selections(vidpid: Option<&str>) -> Result<Vec<UsbSelection>> {
                 }
             }
             if hubs.is_empty() {
-                anyhow::bail!("no USBPcap control devices found (install USBPcap + reboot; run as admin)");
+                anyhow::bail!(
+                    "no USBPcap control devices found (install USBPcap + reboot; run as admin)"
+                );
             }
         }
     }
@@ -129,7 +139,9 @@ pub fn run(vidpid: Option<&str>, max_seconds: Option<u64>) -> Result<()> {
 
     for sel in sels {
         let mut source = UsbCaptureSource::new(sel, clock.clone());
-        source.start().context("USBPcap start failed (admin? driver attached this boot?)")?;
+        source
+            .start()
+            .context("USBPcap start failed (admin? driver attached this boot?)")?;
         killers.push(source.killer());
         let tally = tally.clone();
         let stop = stop.clone();
@@ -226,6 +238,9 @@ mod tests {
         let b = snap(60, 600, &[(0x81, 60, 600, 3), (0x02, 0, 0, 3)]);
         let out = render_rates(&a, &b, 1.0);
         assert!(out.contains("ep 0x81"));
-        assert!(!out.contains("ep 0x02"), "an endpoint with no activity is omitted: {out}");
+        assert!(
+            !out.contains("ep 0x02"),
+            "an endpoint with no activity is omitted: {out}"
+        );
     }
 }

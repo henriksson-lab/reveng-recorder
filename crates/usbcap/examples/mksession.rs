@@ -21,7 +21,9 @@ fn packet(device: u16, ep: u8, xfer: u8, payload: &[u8]) -> Vec<u8> {
 }
 
 fn main() -> anyhow::Result<()> {
-    let out = std::env::args().nth(1).unwrap_or_else(|| "usb.session".into());
+    let out = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "usb.session".into());
     let mut session = SessionWriter::create(&out)?;
     let mut usb = UsbWriter::create(session.usb_pcapng(), session.frames_idx())?;
 
@@ -60,7 +62,13 @@ fn main() -> anyhow::Result<()> {
             note: None,
         })
     };
-    session.append_record(&mk(0, 0, CheckpointType::SessionStart, "session_start", None))?;
+    session.append_record(&mk(
+        0,
+        0,
+        CheckpointType::SessionStart,
+        "session_start",
+        None,
+    ))?;
     session.append_record(&mk(
         1,
         1_500_000,

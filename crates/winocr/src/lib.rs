@@ -118,6 +118,11 @@ mod imp {
         let text = result.Text()?.to_string_lossy();
         let text_angle = result.TextAngle().and_then(|a| a.Value()).unwrap_or(0.0);
 
-        Ok(Ocr { words, lines, text, text_angle })
+        Ok(Ocr {
+            words,
+            lines,
+            text,
+            text_angle,
+        })
     }
 }

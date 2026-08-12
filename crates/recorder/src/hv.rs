@@ -10,8 +10,8 @@ use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
 use windows::Win32::Storage::FileSystem::{
     CreateFileW, FILE_FLAGS_AND_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
 };
-use windows::Win32::System::IO::DeviceIoControl;
 use windows::Win32::System::Threading::{GetCurrentThread, SetThreadAffinityMask};
+use windows::Win32::System::IO::DeviceIoControl;
 
 const fn ctl_code(device_type: u32, function: u32, method: u32, access: u32) -> u32 {
     (device_type << 16) | (access << 14) | (function << 2) | method
@@ -61,7 +61,11 @@ impl HvHandle {
                 None,
             )
         }
-        .map_err(|e| anyhow::anyhow!("open \\\\.\\RevengHv failed: {e} (is RevengHv started? `sc start RevengHv`)"))?;
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "open \\\\.\\RevengHv failed: {e} (is RevengHv started? `sc start RevengHv`)"
+            )
+        })?;
         if handle == INVALID_HANDLE_VALUE {
             anyhow::bail!("\\\\.\\RevengHv returned an invalid handle");
         }
@@ -119,9 +123,15 @@ pub fn probe() -> anyhow::Result<()> {
     let yn = |b: u8| if b != 0 { "yes" } else { "no" };
     println!("reveng-hv VT-x probe:");
     println!("  CPUID VMX supported : {}", yn(vmx_cpuid));
-    println!("  hypervisor present  : {}  (must be 'no' — else Hyper-V/VBS still owns VT-x)", yn(hv_present));
+    println!(
+        "  hypervisor present  : {}  (must be 'no' — else Hyper-V/VBS still owns VT-x)",
+        yn(hv_present)
+    );
     println!("  FEATURE_CONTROL lock: {}", yn(feature_locked));
-    println!("  VMXON allowed       : {}  (lock=yes & this=yes → we can VMXON)", yn(vmxon_allowed));
+    println!(
+        "  VMXON allowed       : {}  (lock=yes & this=yes → we can VMXON)",
+        yn(vmxon_allowed)
+    );
     println!("  logical CPUs        : {logical_cpus}  (must VMXON all of them)");
     println!("  IA32_FEATURE_CONTROL: {feature_control:#018x}");
     println!("  IA32_VMX_BASIC      : {vmx_basic:#018x}");
@@ -231,9 +241,19 @@ pub fn selftest() -> anyhow::Result<()> {
 
     let backdoor_ok = {
         let r = std::arch::x86_64::__cpuid(HV_BACKDOOR_LEAF);
-        r.eax == HV_BACKDOOR_LEAF && r.ebx == HV_BACKDOOR_SIG_EBX && r.ecx == HV_BACKDOOR_SIG_ECX && r.edx == HV_BACKDOOR_SIG_EDX
+        r.eax == HV_BACKDOOR_LEAF
+            && r.ebx == HV_BACKDOOR_SIG_EBX
+            && r.ecx == HV_BACKDOOR_SIG_ECX
+            && r.edx == HV_BACKDOOR_SIG_EDX
     };
-    println!("  [3] CPUID backdoor leaf {HV_BACKDOOR_LEAF:#010x}: {}", if backdoor_ok { "SIGNATURE MATCHED" } else { "no match" });
+    println!(
+        "  [3] CPUID backdoor leaf {HV_BACKDOOR_LEAF:#010x}: {}",
+        if backdoor_ok {
+            "SIGNATURE MATCHED"
+        } else {
+            "no match"
+        }
+    );
 
     println!("  [4] CPUID.1 is left unmodified; this avoids making Windows consume an incomplete hypervisor CPUID ABI.");
 
